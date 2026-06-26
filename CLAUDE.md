@@ -3,6 +3,9 @@
 ## Git Commits
 - Do NOT add a "Co-Authored-By" line to commit messages.
 
+## Pull Requests
+- Do NOT add a "Generated with Claude Code" line (or any similar attribution) to PR descriptions.
+
 ## Long-running tasks
 
 If a task is estimated to take longer than 10 minutes (e.g. large downloads, model loading, extensive builds), check if the session is running inside tmux before starting. If not in tmux, ask the user if they'd like to switch to a tmux session first to avoid losing progress on disconnect.
