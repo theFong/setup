@@ -4,11 +4,30 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 
 ## What's Inside
 
+- **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
 - **CLAUDE.md** — Global instructions for Claude Code (commit conventions, long-running task handling, etc.)
 - **.agent/skills/** — Custom Claude Code skills (brev-cli, outlook-calendar, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
 
-## Installation
+## Quick Start (new machine)
+
+One line to install everything and link the Claude config:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
+```
+
+This installs **Claude Code, opencode, tmux, git, gh, jq, ripgrep, fzf, wget,
+curl, htop, and Go**, then clones this repo to `~/.setup` and symlinks the
+Claude config into `~/.claude`. It works on macOS (Homebrew) and Linux
+(apt/dnf/apk), and is safe to re-run — anything already present is skipped.
+
+After it finishes, open a new shell so PATH changes take effect, then run
+`claude` to log in.
+
+## Manual Installation
+
+If you only want the Claude config (no tooling):
 
 ```bash
 git clone https://github.com/theFong/setup ~/.setup
