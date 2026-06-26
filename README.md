@@ -18,12 +18,32 @@ curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bas
 ```
 
 This installs **Claude Code, opencode, tmux, git, gh, jq, ripgrep, fzf, wget,
-curl, htop, and Go**, then clones this repo to `~/.setup` and symlinks the
-Claude config into `~/.claude`. It works on macOS (Homebrew) and Linux
-(apt/dnf/apk), and is safe to re-run — anything already present is skipped.
+curl, htop, Go, and Ookla speedtest**, then clones this repo to `~/.setup` and
+symlinks the Claude config into `~/.claude`. It works on macOS (Homebrew) and
+Linux (apt/dnf/apk), and is safe to re-run — anything already present is
+skipped.
 
 After it finishes, open a new shell so PATH changes take effect, then run
 `claude` to log in.
+
+## North/South Internet Check
+
+Evaluate internet throughput (download/upload/latency to an external server)
+with the Ookla `speedtest` CLI installed above. One-liner:
+
+```bash
+speedtest --accept-license --accept-gdpr
+```
+
+The flags auto-accept Ookla's license/GDPR prompt on first run so it works
+non-interactively (in scripts or over SSH); after the first run plain
+`speedtest` works too. Useful extras:
+
+```bash
+speedtest --servers                       # list nearby servers
+speedtest --server-id=<id>                # pin a specific server
+speedtest --format=json                   # machine-readable output
+```
 
 ## Manual Installation
 

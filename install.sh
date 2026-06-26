@@ -150,6 +150,52 @@ install_gh() {
   esac
 }
 
+# Ookla speedtest CLI — for evaluating north/south internet throughput.
+# Not in base repos: uses Ookla's packagecloud repo on apt/dnf, the teamookla
+# Homebrew tap on macOS, and a static tarball on Alpine.
+install_speedtest() {
+  if have speedtest; then log "speedtest already present"; return; fi
+  log "installing Ookla speedtest CLI"
+  case "$PM" in
+    brew)
+      brew tap teamookla/speedtest >/dev/null 2>&1 || true
+      brew install speedtest --force || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
+      ;;
+    apt)
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | $SUDO bash || true
+      APT_UPDATED=0; pm_update_once
+      $SUDO apt-get install -y speedtest || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
+      ;;
+    dnf)
+      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | $SUDO bash || true
+      $SUDO dnf install -y speedtest || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
+      ;;
+    apk)
+      install_speedtest_tarball
+      ;;
+  esac
+}
+
+# Alpine has no Ookla repo; grab the static binary tarball instead.
+install_speedtest_tarball() {
+  local sarch ver url tmpd
+  case "$ARCH" in
+    x86_64|amd64)  sarch="x86_64" ;;
+    aarch64|arm64) sarch="aarch64" ;;
+    *) warn "no speedtest build for arch $ARCH"; FAILED="$FAILED speedtest"; return ;;
+  esac
+  ver="1.2.0"
+  url="https://install.speedtest.net/app/cli/ookla-speedtest-${ver}-linux-${sarch}.tgz"
+  tmpd=$(mktemp -d)
+  if curl -fsSL "$url" -o "$tmpd/speedtest.tgz" && tar -C "$tmpd" -xzf "$tmpd/speedtest.tgz" speedtest; then
+    $SUDO install -m 0755 "$tmpd/speedtest" /usr/local/bin/speedtest
+    add_path /usr/local/bin
+  else
+    warn "failed to install speedtest from tarball"; FAILED="$FAILED speedtest"
+  fi
+  rm -rf "$tmpd"
+}
+
 # Distro Go packages are often stale; install the current release from go.dev
 # on Linux. On macOS, Homebrew's Go is current enough.
 install_go() {
@@ -236,6 +282,7 @@ main() {
 
   install_base_tools     || warn "some base tools failed"
   install_gh             || warn "gh install failed"
+  install_speedtest      || warn "speedtest install failed"
   install_go             || warn "go install failed"
   install_claude_code    || warn "Claude Code install failed"
   install_opencode       || warn "opencode install failed"
