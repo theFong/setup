@@ -243,6 +243,32 @@ install_opencode() {
   add_path "$HOME/.local/bin"
 }
 
+# Default Claude Code to "auto mode" (auto-accept edits) on this machine by
+# writing defaultMode into ~/.claude/settings.json. Merges into any existing
+# settings (via jq) rather than overwriting. Change "acceptEdits" to
+# "bypassPermissions" for full skip-all-prompts mode, or "default" to undo.
+configure_claude() {
+  local settings="$HOME/.claude/settings.json"
+  local mode="acceptEdits"
+  mkdir -p "$HOME/.claude"
+  if [ ! -f "$settings" ]; then
+    printf '{\n  "defaultMode": "%s"\n}\n' "$mode" > "$settings"
+    log "set Claude default mode to $mode"
+    return
+  fi
+  if have jq; then
+    local tmp; tmp=$(mktemp)
+    if jq --arg m "$mode" '.defaultMode = $m' "$settings" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$settings"
+      log "set Claude default mode to $mode"
+    else
+      rm -f "$tmp"; warn "could not update $settings (invalid JSON?); leaving it unchanged"
+    fi
+  else
+    warn "jq unavailable; not modifying existing $settings"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # dotfiles / Claude config
 # ---------------------------------------------------------------------------
@@ -286,6 +312,7 @@ main() {
   install_go             || warn "go install failed"
   install_claude_code    || warn "Claude Code install failed"
   install_opencode       || warn "opencode install failed"
+  configure_claude       || warn "configuring Claude default mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
   summary
 }

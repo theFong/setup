@@ -23,6 +23,11 @@ symlinks the Claude config into `~/.claude`. It works on macOS (Homebrew) and
 Linux (apt/dnf/apk), and is safe to re-run — anything already present is
 skipped.
 
+It also sets Claude Code's default mode to **auto-accept edits** ("auto mode")
+by writing `"defaultMode": "acceptEdits"` into `~/.claude/settings.json`
+(merged, never clobbering existing settings). To undo, set it back to
+`"default"`; for full skip-all-prompts mode, use `"bypassPermissions"`.
+
 After it finishes, open a new shell so PATH changes take effect, then run
 `claude` to log in.
 
