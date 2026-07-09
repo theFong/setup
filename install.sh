@@ -2,7 +2,7 @@
 #
 # install.sh — bootstrap a new machine with a baseline dev environment.
 #
-# Installs: Claude Code, opencode, tmux, git, gh, jq, ripgrep, fzf,
+# Installs: Claude Code, Codex CLI, opencode, tmux, git, gh, jq, ripgrep, fzf,
 # wget, curl, htop, and the Go toolchain. Then links this repo's Claude
 # config (CLAUDE.md + skills) into ~/.claude.
 #
@@ -236,6 +236,13 @@ install_claude_code() {
   add_path "$HOME/.local/bin"
 }
 
+install_codex() {
+  if have codex; then log "codex already present"; return; fi
+  log "installing Codex CLI"
+  curl -fsSL https://chatgpt.com/codex/install.sh | sh || { warn "failed to install Codex CLI"; FAILED="$FAILED codex"; }
+  add_path "$HOME/.local/bin"
+}
+
 install_opencode() {
   if have opencode; then log "opencode already present"; return; fi
   log "installing opencode"
@@ -297,7 +304,7 @@ summary() {
     warn "re-run after resolving, or install them manually."
   fi
   echo "Open a new shell (or 'source' your rc) so PATH changes take effect."
-  echo "Then run 'claude' to log in."
+  echo "Then run 'claude' or 'codex' to log in."
 }
 
 main() {
@@ -311,6 +318,7 @@ main() {
   install_speedtest      || warn "speedtest install failed"
   install_go             || warn "go install failed"
   install_claude_code    || warn "Claude Code install failed"
+  install_codex          || warn "Codex CLI install failed"
   install_opencode       || warn "opencode install failed"
   configure_claude       || warn "configuring Claude default mode failed"
   link_dotfiles          || warn "linking dotfiles failed"

@@ -17,11 +17,11 @@ One line to install everything and link the Claude config:
 curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
 ```
 
-This installs **Claude Code, opencode, tmux, git, gh, jq, ripgrep, fzf, wget,
-curl, htop, Go, and Ookla speedtest**, then clones this repo to `~/.setup` and
-symlinks the Claude config into `~/.claude`. It works on macOS (Homebrew) and
-Linux (apt/dnf/apk), and is safe to re-run — anything already present is
-skipped.
+This installs **Claude Code, Codex CLI, opencode, tmux, git, gh, jq, ripgrep,
+fzf, wget, curl, htop, Go, and Ookla speedtest**, then clones this repo to
+`~/.setup` and symlinks the Claude config into `~/.claude`. It works on macOS
+(Homebrew) and Linux (apt/dnf/apk), and is safe to re-run — anything already
+present is skipped.
 
 It also sets Claude Code's default mode to **auto-accept edits** ("auto mode")
 by writing `"defaultMode": "acceptEdits"` into `~/.claude/settings.json`
@@ -29,7 +29,7 @@ by writing `"defaultMode": "acceptEdits"` into `~/.claude/settings.json`
 `"default"`; for full skip-all-prompts mode, use `"bypassPermissions"`.
 
 After it finishes, open a new shell so PATH changes take effect, then run
-`claude` to log in.
+`claude` or `codex` to log in.
 
 ## North/South Internet Check
 
