@@ -1,0 +1,90 @@
+name: Bootstrap
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu latest (x86_64)
+            runner: ubuntu-latest
+            architecture: x86_64
+          - name: Ubuntu 22.04 (x86_64)
+            runner: ubuntu-22.04
+            architecture: x86_64
+          - name: Ubuntu 24.04 (ARM64)
+            runner: ubuntu-24.04-arm
+            architecture: aarch64
+          - name: Ubuntu 22.04 (ARM64)
+            runner: ubuntu-22.04-arm
+            architecture: aarch64
+          - name: macOS latest (Apple Silicon)
+            runner: macos-latest
+            architecture: arm64
+          - name: macOS 15 (Intel)
+            runner: macos-15-intel
+            architecture: x86_64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify runner architecture
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
+
+      - name: Check shell syntax
+        run: bash -n install.sh
+
+      - name: Prepare isolated home directory
+        run: |
+          ci_home="$RUNNER_TEMP/setup-home"
+          mkdir -p "$ci_home"
+          git clone --no-hardlinks "$GITHUB_WORKSPACE" "$ci_home/.setup"
+          echo "HOME=$ci_home" >> "$GITHUB_ENV"
+
+      - name: Run bootstrap
+        run: bash install.sh
+
+      - name: Add user-installed tools to PATH
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Verify tools and Brev skill
+        run: |
+          for tool in claude codex brev opencode git gh jq rg fzf wget curl htop tmux go speedtest; do
+            command -v "$tool"
+          done
+
+          claude --version
+          codex --version
+          brev --version
+          opencode --version
+          go version
+          speedtest --version
+
+          test -e "$HOME/.claude/skills/brev-cli/SKILL.md"
+          test -e "$HOME/.codex/skills/brev-cli/SKILL.md"
+          test -e "$HOME/.agents/skills/brev-cli/SKILL.md"
+
+      - name: Verify bootstrap is safe to re-run
+        run: bash install.sh
