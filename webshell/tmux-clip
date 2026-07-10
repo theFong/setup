@@ -1,0 +1,9 @@
+#!/bin/sh
+# Copy stdin to the browser clipboard: emit OSC52 directly to every attached
+# tmux client tty (bypasses tmux's Ms/set-clipboard capability logic, which
+# fails to emit on this tmux 3.2a). Proven path: raw ESC]52 -> ttyd -> xterm.js.
+data=$(cat)
+b64=$(printf '%s' "$data" | base64 | tr -d '\n')
+for tty in $(tmux list-clients -F '#{client_tty}'); do
+  printf '\033]52;c;%s\a' "$b64" > "$tty" 2>/dev/null
+done

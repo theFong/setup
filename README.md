@@ -8,6 +8,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
+- **webshell/** — Browser terminal (ttyd + tmux) with persistent sessions, clickable tabs, and copy-to-clipboard (see below)
 - **.agent/skills/** — Custom Claude Code skills (brev-cli, outlook-calendar, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
 
@@ -40,6 +41,33 @@ by writing `"defaultMode": "acceptEdits"` into `~/.claude/settings.json`
 
 After it finishes, open a new shell so PATH changes take effect. Run `claude`
 or `codex` to sign in, and `brev login` to authenticate Brev.
+
+## Web Shell (browser terminal)
+
+A tmux-backed terminal in the browser: sessions survive refresh/disconnect,
+the status bar acts as clickable tabs (`+ new shell` / `✕ close`, double-click
+to rename), and highlight-to-copy lands on your local clipboard via OSC 52.
+
+```bash
+~/.setup/webshell/install.sh              # private (default): 127.0.0.1 + password
+~/.setup/webshell/install.sh --public     # bind wt0 (Netbird), no password — needs an auth proxy in front
+```
+
+**Private** (default) binds `127.0.0.1:7681` with a generated password
+(printed once); reach it with `ssh -L 7681:127.0.0.1:7681 <host>` →
+`http://localhost:7681`. **Public** binds a mesh/private interface (default
+`wt0`) with no password and assumes an authenticating HTTPS proxy in front —
+don't use it without one. Flags: `--iface`, `--port`, `--session`,
+`--force-build`; env: `WEBSHELL_*`.
+
+Notes baked into the setup (hard-won):
+- ttyd is **built from source** — release/apt builds bundle an xterm.js
+  without the OSC 52 clipboard handler, so copy silently fails.
+- tmux 3.2a never emits OSC 52 itself (even with `Ms`/terminal-features set);
+  copy bindings pipe through `webshell/tmux-clip`, which writes the escape
+  straight to the client tty.
+- Clipboard needs a secure context (https or localhost) and the page focused.
+- `~/.tmux.conf` is symlinked to `webshell/tmux.conf`.
 
 ## North/South Internet Check
 
