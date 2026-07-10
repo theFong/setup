@@ -85,13 +85,14 @@ jobs:
 
       - name: Verify tools and Brev skill
         run: |
-          for tool in claude codex brev opencode git gh jq rg fzf wget curl htop tmux go speedtest; do
+          for tool in claude codex brev hf opencode git gh jq rg fzf wget curl htop tmux go speedtest; do
             command -v "$tool"
           done
 
           claude --version
           codex --version
           brev --version
+          HF_HUB_DISABLE_UPDATE_CHECK=1 hf version
           opencode --version
           go version
           speedtest --version
