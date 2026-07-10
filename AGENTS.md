@@ -10,5 +10,4 @@ In particular:
 - Preserve equivalent support for Claude Code and Codex.
 - Run the validation checklist in `STYLE_GUIDE.md` and ensure the complete
   GitHub Actions matrix passes before considering work complete.
-- Do not add a `Co-Authored-By` line to commits or generated-tool attribution to
-  pull requests.
+- Do not add generated-tool attribution to pull requests.
