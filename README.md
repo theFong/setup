@@ -5,6 +5,8 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 ## What's Inside
 
 - **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
+- **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
+- **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Global instructions for Claude Code (commit conventions, long-running task handling, etc.)
 - **.agent/skills/** — Custom Claude Code skills (brev-cli, outlook-calendar, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes

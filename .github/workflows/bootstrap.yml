@@ -53,6 +53,12 @@ jobs:
       - name: Check shell syntax
         run: bash -n install.sh
 
+      - name: Verify shared agent guidance
+        run: |
+          test -s STYLE_GUIDE.md
+          grep -qF 'STYLE_GUIDE.md' AGENTS.md
+          grep -qF 'STYLE_GUIDE.md' CLAUDE.md
+
       - name: Verify failed installs return nonzero
         run: |
           export SETUP_SKIP_MAIN=1
