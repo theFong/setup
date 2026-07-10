@@ -11,11 +11,6 @@
 - [ ] Safe re-run/idempotency behavior is preserved.
 - [ ] The supported GitHub Actions matrix passes.
 
-## Agent compatibility
-
-- [ ] Claude Code and Codex remain supported, or an intentional exception is documented.
-- [ ] Shared skill or instruction changes were validated for both agent paths.
-
 ## Documentation
 
 - [ ] User-facing documentation was updated, or no documentation change is needed.
