@@ -151,26 +151,19 @@ install_gh() {
 }
 
 # Ookla speedtest CLI — for evaluating north/south internet throughput.
-# Not in base repos: uses Ookla's packagecloud repo on apt/dnf, the teamookla
-# Homebrew tap on macOS, and a static tarball on Alpine.
+# Not in base repos: uses the teamookla Homebrew tap on macOS and Ookla's
+# static tarball on Linux.
 install_speedtest() {
   if have speedtest; then log "speedtest already present"; return; fi
   log "installing Ookla speedtest CLI"
   case "$PM" in
     brew)
       brew tap teamookla/speedtest >/dev/null 2>&1 || true
-      brew install speedtest --force || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
+      # Homebrew 5 requires explicit trust for third-party tap formulae.
+      brew trust --formula teamookla/speedtest/speedtest >/dev/null 2>&1 || true
+      brew install teamookla/speedtest/speedtest --force || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
       ;;
-    apt)
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | $SUDO bash || true
-      APT_UPDATED=0; pm_update_once
-      $SUDO apt-get install -y speedtest || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
-      ;;
-    dnf)
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | $SUDO bash || true
-      $SUDO dnf install -y speedtest || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
-      ;;
-    apk)
+    apt|dnf|apk)
       install_speedtest_tarball
       ;;
   esac
@@ -239,6 +232,10 @@ install_claude_code() {
 install_codex() {
   if have codex; then log "codex already present"; return; fi
   log "installing Codex CLI"
+  if [ "$PM" = "brew" ]; then
+    brew install --cask codex || { warn "failed to install Codex CLI"; FAILED="$FAILED codex"; }
+    return
+  fi
   curl -fsSL https://chatgpt.com/codex/install.sh | sh || { warn "failed to install Codex CLI"; FAILED="$FAILED codex"; }
   add_path "$HOME/.local/bin"
 }
@@ -266,8 +263,12 @@ install_brev() {
 install_opencode() {
   if have opencode; then log "opencode already present"; return; fi
   log "installing opencode"
+  if [ "$PM" = "brew" ]; then
+    brew install anomalyco/tap/opencode || { warn "failed to install opencode"; FAILED="$FAILED opencode"; }
+    return
+  fi
   curl -fsSL https://opencode.ai/install | bash || { warn "failed to install opencode"; FAILED="$FAILED opencode"; }
-  add_path "$HOME/.local/bin"
+  add_path "$HOME/.opencode/bin"
 }
 
 # Default Claude Code to "auto mode" (auto-accept edits) on this machine by
