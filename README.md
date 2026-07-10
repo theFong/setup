@@ -58,7 +58,9 @@ to rename), and highlight-to-copy lands on your local clipboard via OSC 52.
 `http://localhost:7681`. **Public** binds a mesh/private interface (default
 `wt0`) with no password and assumes an authenticating HTTPS proxy in front —
 don't use it without one. Flags: `--iface`, `--port`, `--session`,
-`--force-build`; env: `WEBSHELL_*`.
+`--force-build`; env: `WEBSHELL_*`. `--verify-only` health-checks an existing
+install (service active, HTTP serving, auth enforced) and exits nonzero on
+failure — CI runs it, and it works as a cron/liveness probe too.
 
 Notes baked into the setup (hard-won):
 - ttyd is **built from source** — release/apt builds bundle an xterm.js

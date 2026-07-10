@@ -44,6 +44,7 @@ WSUSER="${WEBSHELL_USER:-$(id -un)}"
 PASSWORD="${WEBSHELL_PASSWORD:-}"
 SESSION="${WEBSHELL_SESSION:-main}"
 FORCE_BUILD=0
+VERIFY_ONLY=0
 SUDO=""
 [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
@@ -56,6 +57,7 @@ parse_args() {
       --port)    PORT="$2"; shift ;;
       --session) SESSION="$2"; shift ;;
       --force-build) FORCE_BUILD=1 ;;
+      --verify-only) VERIFY_ONLY=1 ;;
       -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
       *) warn "unknown argument: $1"; exit 1 ;;
     esac
@@ -113,20 +115,24 @@ install_tmux_config() {
   log "linked ~/.tmux.conf -> $WEBSHELL_DIR/tmux.conf"
 }
 
+# Populate WSUSER/PASSWORD from the credential in the installed unit, if any.
+# Returns nonzero when no credential is found.
+load_existing_credential() {
+  local unit="/etc/systemd/system/ttyd.service" existing=""
+  [ -f "$unit" ] && existing=$($SUDO sed -n 's/.*--credential \([^ ]*\).*/\1/p' "$unit" 2>/dev/null | head -1)
+  [ -n "$existing" ] || return 1
+  WSUSER="${existing%%:*}"
+  PASSWORD="${existing#*:}"
+}
+
 install_service() {
   local bind_args="" extra_unit=""
   local unit="/etc/systemd/system/ttyd.service"
   if [ "$MODE" = "private" ]; then
     # Re-runs stay idempotent: reuse the credential already in the unit
     # rather than rotating the password on every install.
-    if [ -z "$PASSWORD" ] && [ -f "$unit" ]; then
-      local existing
-      existing=$($SUDO sed -n 's/.*--credential \([^ ]*\).*/\1/p' "$unit" 2>/dev/null | head -1)
-      if [ -n "$existing" ]; then
-        WSUSER="${existing%%:*}"
-        PASSWORD="${existing#*:}"
-        log "reusing existing credential for user $WSUSER"
-      fi
+    if [ -z "$PASSWORD" ] && load_existing_credential; then
+      log "reusing existing credential for user $WSUSER"
     fi
     if [ -z "$PASSWORD" ]; then
       PASSWORD=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 20)
@@ -229,6 +235,15 @@ summary() {
 main() {
   parse_args "$@"
   check_platform
+  if [ "$VERIFY_ONLY" = 1 ]; then
+    # Standalone health check of an existing install (e.g. from CI or cron):
+    # same assertions as a fresh install, exits nonzero on any failure.
+    if [ "$MODE" = "private" ] && [ -z "$PASSWORD" ]; then
+      load_existing_credential || { warn "verify: no credential found in ttyd.service"; exit 1; }
+    fi
+    verify
+    return
+  fi
   install_ttyd
   install_tmux_config
   install_service

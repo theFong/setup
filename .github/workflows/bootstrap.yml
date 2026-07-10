@@ -51,7 +51,9 @@ jobs:
         run: test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
 
       - name: Check shell syntax
-        run: bash -n install.sh
+        run: |
+          bash -n install.sh
+          bash -n webshell/install.sh
 
       - name: Verify failed installs return nonzero
         run: |
@@ -103,48 +105,36 @@ jobs:
       - name: Verify bootstrap is safe to re-run
         run: bash install.sh
 
-  webshell:
-    name: Webshell ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Ubuntu latest (x86_64)
-            runner: ubuntu-latest
-          - name: Ubuntu 22.04 (x86_64)
-            runner: ubuntu-22.04
-          - name: Ubuntu 24.04 (ARM64)
-            runner: ubuntu-24.04-arm
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Check shell syntax
-        run: bash -n webshell/install.sh
-
-      # install.sh's built-in verify step fails nonzero unless the service is
-      # active, unauthenticated requests get 401, and the credential gets 200.
+      # Webshell (Linux-only: requires systemd). The installer's built-in
+      # verify fails nonzero unless the service is active, unauthenticated
+      # requests get 401, and the credential gets 200; the curl checks below
+      # re-assert that independently of the script under test.
       - name: Install webshell (private mode)
+        if: runner.os == 'Linux'
         run: WEBSHELL_PASSWORD=ci-test-password webshell/install.sh
 
-      - name: Verify unauthenticated requests are rejected
+      - name: Verify webshell auth enforcement
+        if: runner.os == 'Linux'
         run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7681/)
-          test "$code" = "401"
-
-      - name: Verify credentials are accepted and sessions persist
-        run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)
-          test "$code" = "200"
-          # the service's tmux session backs persistence across refreshes
           systemctl is-active ttyd
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7681/)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
+          webshell/install.sh --verify-only
 
-      - name: Verify install is safe to re-run (password not rotated)
+      - name: Verify webshell is safe to re-run (password not rotated)
+        if: runner.os == 'Linux'
         run: |
           webshell/install.sh | tee rerun.log
           grep -q "ttyd.service unchanged" rerun.log
-          code=$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)
-          test "$code" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
+
+      - name: Verify webshell refuses unsupported platforms cleanly
+        if: runner.os == 'macOS'
+        run: |
+          if webshell/install.sh; then
+            echo "webshell install unexpectedly succeeded on macOS" >&2
+            exit 1
+          fi
+          # the guard must fire before anything is installed
+          test ! -e /usr/local/bin/tmux-clip
+          test ! -e "$HOME/.tmux.conf"
