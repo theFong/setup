@@ -2,9 +2,9 @@
 #
 # install.sh — bootstrap a new machine with a baseline dev environment.
 #
-# Installs: Claude Code, Codex CLI, opencode, tmux, git, gh, jq, ripgrep, fzf,
-# wget, curl, htop, and the Go toolchain. Then links this repo's Claude
-# config (CLAUDE.md + skills) into ~/.claude.
+# Installs: Claude Code, Codex CLI, Brev CLI, opencode, tmux, git, gh, jq,
+# ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links this repo's
+# Claude config and Brev skill into the supported agent directories.
 #
 # Usage (one-liner):
 #   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
@@ -243,6 +243,26 @@ install_codex() {
   add_path "$HOME/.local/bin"
 }
 
+install_brev() {
+  if have brev; then log "brev already present"; return; fi
+  log "installing Brev CLI"
+  if [ "$PM" = "brew" ]; then
+    brew install brevdev/homebrew-brev/brev || { warn "failed to install Brev CLI"; FAILED="$FAILED brev"; }
+    return
+  fi
+
+  local tmpd installer
+  tmpd=$(mktemp -d)
+  installer="$tmpd/install-brev.sh"
+  if curl -fsSL https://raw.githubusercontent.com/brevdev/brev-cli/main/bin/install-latest.sh -o "$installer" \
+    && bash "$installer"; then
+    add_path "$HOME/.local/bin"
+  else
+    warn "failed to install Brev CLI"; FAILED="$FAILED brev"
+  fi
+  rm -rf "$tmpd"
+}
+
 install_opencode() {
   if have opencode; then log "opencode already present"; return; fi
   log "installing opencode"
@@ -294,6 +314,31 @@ link_dotfiles() {
   log "linked Claude config into ~/.claude"
 }
 
+# Make the repo-managed Brev skill available to Claude Code, Codex, and other
+# agents. Existing skill installations are preserved.
+link_brev_skill() {
+  local skill_source="$HOME/.setup/.agent/skills/brev-cli"
+  local skills_dir target
+  if [ ! -f "$skill_source/SKILL.md" ]; then
+    warn "Brev skill source not found at $skill_source"
+    FAILED="$FAILED brev-skill"
+    return 1
+  fi
+
+  for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
+    mkdir -p "$skills_dir"
+    target="$skills_dir/brev-cli"
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+      if ! ln -s "$skill_source" "$target"; then
+        warn "failed to link Brev skill into $skills_dir"
+        FAILED="$FAILED brev-skill"
+        return 1
+      fi
+    fi
+  done
+  log "linked Brev skill into Claude Code, Codex, and agent skill directories"
+}
+
 # ---------------------------------------------------------------------------
 
 summary() {
@@ -304,7 +349,7 @@ summary() {
     warn "re-run after resolving, or install them manually."
   fi
   echo "Open a new shell (or 'source' your rc) so PATH changes take effect."
-  echo "Then run 'claude' or 'codex' to log in."
+  echo "Then run 'claude' or 'codex' to sign in, and 'brev login' to authenticate Brev."
 }
 
 main() {
@@ -319,9 +364,11 @@ main() {
   install_go             || warn "go install failed"
   install_claude_code    || warn "Claude Code install failed"
   install_codex          || warn "Codex CLI install failed"
+  install_brev           || warn "Brev CLI install failed"
   install_opencode       || warn "opencode install failed"
   configure_claude       || warn "configuring Claude default mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
+  link_brev_skill        || warn "linking Brev skill failed"
   summary
 }
 
