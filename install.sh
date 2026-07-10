@@ -2,9 +2,9 @@
 #
 # install.sh — bootstrap a new machine with a baseline dev environment.
 #
-# Installs: Claude Code, Codex CLI, Brev CLI, opencode, tmux, git, gh, jq,
-# ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links this repo's
-# Claude config and Brev skill into the supported agent directories.
+# Installs: Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, tmux,
+# git, gh, jq, ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links
+# this repo's Claude config and Brev skill into the supported agent directories.
 #
 # Usage (one-liner):
 #   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
@@ -288,6 +288,17 @@ install_brev() {
   assert_installed "Brev CLI" brev
 }
 
+install_huggingface() {
+  if have hf; then log "Hugging Face CLI already present"; return; fi
+  log "installing Hugging Face CLI"
+  curl -LsSf https://hf.co/cli/install.sh | bash || {
+    warn "failed to install Hugging Face CLI"
+    record_failure huggingface-cli
+  }
+  add_path "$HOME/.local/bin"
+  assert_installed "Hugging Face CLI" hf huggingface-cli
+}
+
 install_opencode() {
   if have opencode; then log "opencode already present"; return; fi
   log "installing opencode"
@@ -398,6 +409,7 @@ main() {
   install_claude_code    || warn "Claude Code install failed"
   install_codex          || warn "Codex CLI install failed"
   install_brev           || warn "Brev CLI install failed"
+  install_huggingface    || warn "Hugging Face CLI install failed"
   install_opencode       || warn "opencode install failed"
   configure_claude       || warn "configuring Claude default mode failed"
   link_dotfiles          || warn "linking dotfiles failed"

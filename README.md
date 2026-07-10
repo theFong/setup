@@ -20,11 +20,11 @@ One line to install everything and link the Claude config:
 curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
 ```
 
-This installs **Claude Code, Codex CLI, Brev CLI, opencode, tmux, git, gh, jq,
-ripgrep, fzf, wget, curl, htop, Go, and Ookla speedtest**, then clones this repo
-to `~/.setup` and symlinks the Claude config into `~/.claude`. It works on
-macOS (Homebrew) and Linux (apt/dnf/apk), and is safe to re-run — anything
-already present is skipped.
+This installs **Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode,
+tmux, git, gh, jq, ripgrep, fzf, wget, curl, htop, Go, and Ookla speedtest**,
+then clones this repo to `~/.setup` and symlinks the Claude config into
+`~/.claude`. It works on macOS (Homebrew) and Linux (apt/dnf/apk), and is safe
+to re-run — anything already present is skipped.
 
 Each install is verified by checking that its expected command is available on
 `PATH`. The bootstrap continues attempting the remaining tools after a failure,
@@ -40,7 +40,8 @@ by writing `"defaultMode": "acceptEdits"` into `~/.claude/settings.json`
 `"default"`; for full skip-all-prompts mode, use `"bypassPermissions"`.
 
 After it finishes, open a new shell so PATH changes take effect. Run `claude`
-or `codex` to sign in, and `brev login` to authenticate Brev.
+or `codex` to sign in, `brev login` to authenticate Brev, and `hf auth login`
+to authenticate Hugging Face.
 
 ## Web Shell (browser terminal)
 
