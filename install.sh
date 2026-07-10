@@ -32,6 +32,27 @@ SUDO=""      # "" when root, else "sudo"
 APT_UPDATED=0
 FAILED=""    # space-separated list of things that failed
 
+record_failure() {
+  local item="$1"
+  case " $FAILED " in
+    *" $item "*) ;;
+    *) FAILED="$FAILED $item" ;;
+  esac
+}
+
+# assert_installed LABEL BINARY [FAILURE_NAME] — verify an install produced an
+# executable on PATH and record a failure if it did not.
+assert_installed() {
+  local label="$1" bin="$2" failure_name="${3:-$2}"
+  if have "$bin"; then
+    log "verified $label: $(command -v "$bin")"
+    return 0
+  fi
+  warn "$label is not available on PATH after installation"
+  record_failure "$failure_name"
+  return 1
+}
+
 detect_platform() {
   OS=$(uname -s | tr '[:upper:]' '[:lower:]')
   ARCH=$(uname -m)
@@ -54,6 +75,7 @@ ensure_package_manager() {
     # Make brew available on this shell (Apple Silicon vs Intel paths).
     if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
     elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
+    assert_installed "Homebrew" brew homebrew
     PM="brew"
     return
   fi
@@ -107,7 +129,8 @@ install_one() {
   local tool="$1" bin="${2:-$1}"
   if have "$bin"; then log "$tool already present"; return; fi
   log "installing $tool"
-  if ! pm_install "$tool"; then warn "failed to install $tool"; FAILED="$FAILED $tool"; fi
+  if ! pm_install "$tool"; then warn "failed to install $tool"; record_failure "$tool"; fi
+  assert_installed "$tool" "$bin" "$tool"
 }
 
 install_base_tools() {
@@ -126,7 +149,7 @@ install_gh() {
   if have gh; then log "gh already present"; return; fi
   log "installing gh (GitHub CLI)"
   case "$PM" in
-    brew) brew install gh || { warn "failed to install gh"; FAILED="$FAILED gh"; } ;;
+    brew) brew install gh || { warn "failed to install gh"; record_failure gh; } ;;
     apt)
       $SUDO install -d -m 0755 /etc/apt/keyrings
       curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -135,45 +158,40 @@ install_gh() {
       echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         | $SUDO tee /etc/apt/sources.list.d/github-cli.list >/dev/null
       APT_UPDATED=0; pm_update_once
-      $SUDO apt-get install -y gh || { warn "failed to install gh"; FAILED="$FAILED gh"; }
+      $SUDO apt-get install -y gh || { warn "failed to install gh"; record_failure gh; }
       ;;
     dnf)
       $SUDO dnf install -y gh || {
         $SUDO dnf install -y 'dnf-command(config-manager)' || true
         $SUDO dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo || true
-        $SUDO dnf install -y gh || { warn "failed to install gh"; FAILED="$FAILED gh"; }
+        $SUDO dnf install -y gh || { warn "failed to install gh"; record_failure gh; }
       }
       ;;
     apk)
-      pm_install github-cli || { warn "failed to install gh"; FAILED="$FAILED gh"; }
+      pm_install github-cli || { warn "failed to install gh"; record_failure gh; }
       ;;
   esac
+  assert_installed "GitHub CLI" gh
 }
 
 # Ookla speedtest CLI — for evaluating north/south internet throughput.
-# Not in base repos: uses Ookla's packagecloud repo on apt/dnf, the teamookla
-# Homebrew tap on macOS, and a static tarball on Alpine.
+# Not in base repos: uses the teamookla Homebrew tap on macOS and Ookla's
+# static tarball on Linux.
 install_speedtest() {
   if have speedtest; then log "speedtest already present"; return; fi
   log "installing Ookla speedtest CLI"
   case "$PM" in
     brew)
       brew tap teamookla/speedtest >/dev/null 2>&1 || true
-      brew install speedtest --force || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
+      # Homebrew 5 requires explicit trust for third-party tap formulae.
+      brew trust --formula teamookla/speedtest/speedtest >/dev/null 2>&1 || true
+      brew install teamookla/speedtest/speedtest --force || { warn "failed to install speedtest"; record_failure speedtest; }
       ;;
-    apt)
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | $SUDO bash || true
-      APT_UPDATED=0; pm_update_once
-      $SUDO apt-get install -y speedtest || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
-      ;;
-    dnf)
-      curl -fsSL https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.rpm.sh | $SUDO bash || true
-      $SUDO dnf install -y speedtest || { warn "failed to install speedtest"; FAILED="$FAILED speedtest"; }
-      ;;
-    apk)
+    apt|dnf|apk)
       install_speedtest_tarball
       ;;
   esac
+  assert_installed "Ookla speedtest CLI" speedtest
 }
 
 # Alpine has no Ookla repo; grab the static binary tarball instead.
@@ -182,7 +200,7 @@ install_speedtest_tarball() {
   case "$ARCH" in
     x86_64|amd64)  sarch="x86_64" ;;
     aarch64|arm64) sarch="aarch64" ;;
-    *) warn "no speedtest build for arch $ARCH"; FAILED="$FAILED speedtest"; return ;;
+    *) warn "no speedtest build for arch $ARCH"; record_failure speedtest; return 1 ;;
   esac
   ver="1.2.0"
   url="https://install.speedtest.net/app/cli/ookla-speedtest-${ver}-linux-${sarch}.tgz"
@@ -191,7 +209,7 @@ install_speedtest_tarball() {
     $SUDO install -m 0755 "$tmpd/speedtest" /usr/local/bin/speedtest
     add_path /usr/local/bin
   else
-    warn "failed to install speedtest from tarball"; FAILED="$FAILED speedtest"
+    warn "failed to install speedtest from tarball"; record_failure speedtest
   fi
   rm -rf "$tmpd"
 }
@@ -208,11 +226,11 @@ install_go() {
   case "$ARCH" in
     x86_64|amd64)  goarch="amd64" ;;
     aarch64|arm64) goarch="arm64" ;;
-    *) warn "unknown arch $ARCH; skipping Go"; FAILED="$FAILED go"; return ;;
+    *) warn "unknown arch $ARCH; skipping Go"; record_failure go; return 1 ;;
   esac
   local ver tarball
   ver=$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1) || true
-  if [ -z "${ver:-}" ]; then warn "could not determine latest Go version; skipping"; FAILED="$FAILED go"; return; fi
+  if [ -z "${ver:-}" ]; then warn "could not determine latest Go version; skipping"; record_failure go; return 1; fi
   tarball="${ver}.linux-${goarch}.tar.gz"
   log "installing Go ${ver}"
   if curl -fsSL "https://go.dev/dl/${tarball}" -o "/tmp/${tarball}"; then
@@ -221,8 +239,9 @@ install_go() {
     rm -f "/tmp/${tarball}"
     add_path "/usr/local/go/bin"
   else
-    warn "failed to download Go"; FAILED="$FAILED go"
+    warn "failed to download Go"; record_failure go
   fi
+  assert_installed "Go" go
 }
 
 # ---------------------------------------------------------------------------
@@ -232,42 +251,53 @@ install_go() {
 install_claude_code() {
   if have claude; then log "claude already present"; return; fi
   log "installing Claude Code"
-  curl -fsSL https://claude.ai/install.sh | bash || { warn "failed to install Claude Code"; FAILED="$FAILED claude-code"; }
+  curl -fsSL https://claude.ai/install.sh | bash || { warn "failed to install Claude Code"; record_failure claude-code; }
   add_path "$HOME/.local/bin"
+  assert_installed "Claude Code" claude claude-code
 }
 
 install_codex() {
   if have codex; then log "codex already present"; return; fi
   log "installing Codex CLI"
-  curl -fsSL https://chatgpt.com/codex/install.sh | sh || { warn "failed to install Codex CLI"; FAILED="$FAILED codex"; }
-  add_path "$HOME/.local/bin"
+  if [ "$PM" = "brew" ]; then
+    brew install --cask codex || { warn "failed to install Codex CLI"; record_failure codex; }
+  else
+    curl -fsSL https://chatgpt.com/codex/install.sh | sh || { warn "failed to install Codex CLI"; record_failure codex; }
+    add_path "$HOME/.local/bin"
+  fi
+  assert_installed "Codex CLI" codex
 }
 
 install_brev() {
   if have brev; then log "brev already present"; return; fi
   log "installing Brev CLI"
   if [ "$PM" = "brew" ]; then
-    brew install brevdev/homebrew-brev/brev || { warn "failed to install Brev CLI"; FAILED="$FAILED brev"; }
-    return
-  fi
-
-  local tmpd installer
-  tmpd=$(mktemp -d)
-  installer="$tmpd/install-brev.sh"
-  if curl -fsSL https://raw.githubusercontent.com/brevdev/brev-cli/main/bin/install-latest.sh -o "$installer" \
-    && bash "$installer"; then
-    add_path "$HOME/.local/bin"
+    brew install brevdev/homebrew-brev/brev || { warn "failed to install Brev CLI"; record_failure brev; }
   else
-    warn "failed to install Brev CLI"; FAILED="$FAILED brev"
+    local tmpd installer
+    tmpd=$(mktemp -d)
+    installer="$tmpd/install-brev.sh"
+    if curl -fsSL https://raw.githubusercontent.com/brevdev/brev-cli/main/bin/install-latest.sh -o "$installer" \
+      && bash "$installer"; then
+      add_path "$HOME/.local/bin"
+    else
+      warn "failed to install Brev CLI"; record_failure brev
+    fi
+    rm -rf "$tmpd"
   fi
-  rm -rf "$tmpd"
+  assert_installed "Brev CLI" brev
 }
 
 install_opencode() {
   if have opencode; then log "opencode already present"; return; fi
   log "installing opencode"
-  curl -fsSL https://opencode.ai/install | bash || { warn "failed to install opencode"; FAILED="$FAILED opencode"; }
-  add_path "$HOME/.local/bin"
+  if [ "$PM" = "brew" ]; then
+    brew install anomalyco/tap/opencode || { warn "failed to install opencode"; record_failure opencode; }
+  else
+    curl -fsSL https://opencode.ai/install | bash || { warn "failed to install opencode"; record_failure opencode; }
+    add_path "$HOME/.opencode/bin"
+  fi
+  assert_installed "opencode" opencode
 }
 
 # Default Claude Code to "auto mode" (auto-accept edits) on this machine by
@@ -321,7 +351,7 @@ link_brev_skill() {
   local skills_dir target
   if [ ! -f "$skill_source/SKILL.md" ]; then
     warn "Brev skill source not found at $skill_source"
-    FAILED="$FAILED brev-skill"
+    record_failure brev-skill
     return 1
   fi
 
@@ -331,7 +361,7 @@ link_brev_skill() {
     if [ ! -e "$target" ] && [ ! -L "$target" ]; then
       if ! ln -s "$skill_source" "$target"; then
         warn "failed to link Brev skill into $skills_dir"
-        FAILED="$FAILED brev-skill"
+        record_failure brev-skill
         return 1
       fi
     fi
@@ -342,14 +372,17 @@ link_brev_skill() {
 # ---------------------------------------------------------------------------
 
 summary() {
+  local exit_code=0
   echo
   log "done."
   if [ -n "${FAILED# }" ]; then
     warn "the following did not install cleanly:${FAILED}"
     warn "re-run after resolving, or install them manually."
+    exit_code=1
   fi
   echo "Open a new shell (or 'source' your rc) so PATH changes take effect."
   echo "Then run 'claude' or 'codex' to sign in, and 'brev login' to authenticate Brev."
+  return "$exit_code"
 }
 
 main() {
@@ -372,4 +405,6 @@ main() {
   summary
 }
 
-main "$@"
+if [ "${SETUP_SKIP_MAIN:-0}" != "1" ]; then
+  main "$@"
+fi

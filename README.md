@@ -23,6 +23,10 @@ to `~/.setup` and symlinks the Claude config into `~/.claude`. It works on
 macOS (Homebrew) and Linux (apt/dnf/apk), and is safe to re-run — anything
 already present is skipped.
 
+Each install is verified by checking that its expected command is available on
+`PATH`. The bootstrap continues attempting the remaining tools after a failure,
+then exits nonzero if anything is still missing.
+
 The repo-managed Brev skill is linked into Claude Code (`~/.claude/skills`),
 Codex (`~/.codex/skills`), and the shared agent skill directory
 (`~/.agents/skills`). Existing Brev skill installations are preserved.
