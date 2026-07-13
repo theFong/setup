@@ -311,6 +311,23 @@ install_opencode() {
   assert_installed "opencode" opencode
 }
 
+# assert_claude_mode SETTINGS MODE — verify Claude Code's default permission
+# mode actually landed on disk (permissions.defaultMode set, no stale
+# top-level defaultMode key) and record a failure if it did not. The in-script
+# counterpart of assert_installed for configuration.
+assert_claude_mode() {
+  local settings="$1" mode="$2"
+  if have jq && jq -e --arg m "$mode" \
+      '.permissions.defaultMode == $m and (has("defaultMode") | not)' \
+      "$settings" >/dev/null 2>&1; then
+    log "verified Claude default mode $mode in $settings"
+    return 0
+  fi
+  warn "Claude default mode is not $mode in $settings"
+  record_failure claude-default-mode
+  return 1
+}
+
 # Default Claude Code to auto mode on this machine by writing
 # permissions.defaultMode into ~/.claude/settings.json (the top-level
 # defaultMode key written by older bootstraps is not where Claude Code reads
@@ -324,20 +341,17 @@ configure_claude() {
   mkdir -p "$HOME/.claude"
   if [ ! -f "$settings" ]; then
     printf '{\n  "permissions": {\n    "defaultMode": "%s"\n  }\n}\n' "$mode" > "$settings"
-    log "set Claude default mode to $mode"
-    return
-  fi
-  if have jq; then
+  elif have jq; then
     local tmp; tmp=$(mktemp)
     if jq --arg m "$mode" 'del(.defaultMode) | .permissions.defaultMode = $m' "$settings" > "$tmp" 2>/dev/null; then
       mv "$tmp" "$settings"
-      log "set Claude default mode to $mode"
     else
       rm -f "$tmp"; warn "could not update $settings (invalid JSON?); leaving it unchanged"
     fi
   else
     warn "jq unavailable; not modifying existing $settings"
   fi
+  assert_claude_mode "$settings" "$mode"
 }
 
 # ---------------------------------------------------------------------------
