@@ -2,9 +2,9 @@
 #
 # install.sh — bootstrap a new machine with a baseline dev environment.
 #
-# Installs: Claude Code, Codex CLI, Brev CLI, opencode, tmux, git, gh, jq,
-# ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links this repo's
-# Claude config and Brev skill into the supported agent directories.
+# Installs: Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, tmux,
+# git, gh, jq, ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links
+# this repo's Claude config and Brev skill into the supported agent directories.
 #
 # Usage (one-liner):
 #   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
@@ -288,6 +288,17 @@ install_brev() {
   assert_installed "Brev CLI" brev
 }
 
+install_huggingface() {
+  if have hf; then log "Hugging Face CLI already present"; return; fi
+  log "installing Hugging Face CLI"
+  curl -LsSf https://hf.co/cli/install.sh | bash || {
+    warn "failed to install Hugging Face CLI"
+    record_failure huggingface-cli
+  }
+  add_path "$HOME/.local/bin"
+  assert_installed "Hugging Face CLI" hf huggingface-cli
+}
+
 install_opencode() {
   if have opencode; then log "opencode already present"; return; fi
   log "installing opencode"
@@ -300,30 +311,47 @@ install_opencode() {
   assert_installed "opencode" opencode
 }
 
-# Default Claude Code to "auto mode" (auto-accept edits) on this machine by
-# writing defaultMode into ~/.claude/settings.json. Merges into any existing
-# settings (via jq) rather than overwriting. Change "acceptEdits" to
-# "bypassPermissions" for full skip-all-prompts mode, or "default" to undo.
+# assert_claude_mode SETTINGS MODE — verify Claude Code's default permission
+# mode actually landed on disk (permissions.defaultMode set, no stale
+# top-level defaultMode key) and record a failure if it did not. The in-script
+# counterpart of assert_installed for configuration.
+assert_claude_mode() {
+  local settings="$1" mode="$2"
+  if have jq && jq -e --arg m "$mode" \
+      '.permissions.defaultMode == $m and (has("defaultMode") | not)' \
+      "$settings" >/dev/null 2>&1; then
+    log "verified Claude default mode $mode in $settings"
+    return 0
+  fi
+  warn "Claude default mode is not $mode in $settings"
+  record_failure claude-default-mode
+  return 1
+}
+
+# Default Claude Code to auto mode on this machine by writing
+# permissions.defaultMode into ~/.claude/settings.json (the top-level
+# defaultMode key written by older bootstraps is not where Claude Code reads
+# the mode, so it is removed if present). Merges into any existing settings
+# (via jq) rather than overwriting. Change "auto" to "acceptEdits" to only
+# auto-accept edits, "bypassPermissions" for full skip-all-prompts mode, or
+# "default" to undo.
 configure_claude() {
   local settings="$HOME/.claude/settings.json"
-  local mode="acceptEdits"
+  local mode="auto"
   mkdir -p "$HOME/.claude"
   if [ ! -f "$settings" ]; then
-    printf '{\n  "defaultMode": "%s"\n}\n' "$mode" > "$settings"
-    log "set Claude default mode to $mode"
-    return
-  fi
-  if have jq; then
+    printf '{\n  "permissions": {\n    "defaultMode": "%s"\n  }\n}\n' "$mode" > "$settings"
+  elif have jq; then
     local tmp; tmp=$(mktemp)
-    if jq --arg m "$mode" '.defaultMode = $m' "$settings" > "$tmp" 2>/dev/null; then
+    if jq --arg m "$mode" 'del(.defaultMode) | .permissions.defaultMode = $m' "$settings" > "$tmp" 2>/dev/null; then
       mv "$tmp" "$settings"
-      log "set Claude default mode to $mode"
     else
       rm -f "$tmp"; warn "could not update $settings (invalid JSON?); leaving it unchanged"
     fi
   else
     warn "jq unavailable; not modifying existing $settings"
   fi
+  assert_claude_mode "$settings" "$mode"
 }
 
 # ---------------------------------------------------------------------------
@@ -398,6 +426,7 @@ main() {
   install_claude_code    || warn "Claude Code install failed"
   install_codex          || warn "Codex CLI install failed"
   install_brev           || warn "Brev CLI install failed"
+  install_huggingface    || warn "Hugging Face CLI install failed"
   install_opencode       || warn "opencode install failed"
   configure_claude       || warn "configuring Claude default mode failed"
   link_dotfiles          || warn "linking dotfiles failed"

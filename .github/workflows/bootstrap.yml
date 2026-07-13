@@ -53,21 +53,11 @@ jobs:
       - name: Check shell syntax
         run: |
           bash -n install.sh
+          bash -n test.sh
           bash -n webshell/install.sh
 
-      - name: Verify failed installs return nonzero
-        run: |
-          export SETUP_SKIP_MAIN=1
-          source install.sh
-          FAILED=""
-          if assert_installed "missing test tool" setup-test-tool-does-not-exist; then
-            echo "missing tool assertion unexpectedly succeeded" >&2
-            exit 1
-          fi
-          if summary >/dev/null 2>&1; then
-            echo "summary unexpectedly returned zero after a failed assertion" >&2
-            exit 1
-          fi
+      - name: Run negative tests
+        run: ./test.sh
 
       - name: Prepare isolated home directory
         run: |
@@ -87,13 +77,14 @@ jobs:
 
       - name: Verify tools and Brev skill
         run: |
-          for tool in claude codex brev opencode git gh jq rg fzf wget curl htop tmux go speedtest; do
+          for tool in claude codex brev hf opencode git gh jq rg fzf wget curl htop tmux go speedtest; do
             command -v "$tool"
           done
 
           claude --version
           codex --version
           brev --version
+          HF_HUB_DISABLE_UPDATE_CHECK=1 hf version
           opencode --version
           go version
           speedtest --version

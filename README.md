@@ -5,6 +5,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 ## What's Inside
 
 - **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
+- **test.sh** — Isolated negative tests for install.sh failure paths, run by CI and safe to run locally
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
@@ -20,11 +21,11 @@ One line to install everything and link the Claude config:
 curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
 ```
 
-This installs **Claude Code, Codex CLI, Brev CLI, opencode, tmux, git, gh, jq,
-ripgrep, fzf, wget, curl, htop, Go, and Ookla speedtest**, then clones this repo
-to `~/.setup` and symlinks the Claude config into `~/.claude`. It works on
-macOS (Homebrew) and Linux (apt/dnf/apk), and is safe to re-run — anything
-already present is skipped.
+This installs **Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode,
+tmux, git, gh, jq, ripgrep, fzf, wget, curl, htop, Go, and Ookla speedtest**,
+then clones this repo to `~/.setup` and symlinks the Claude config into
+`~/.claude`. It works on macOS (Homebrew) and Linux (apt/dnf/apk), and is safe
+to re-run — anything already present is skipped.
 
 Each install is verified by checking that its expected command is available on
 `PATH`. The bootstrap continues attempting the remaining tools after a failure,
@@ -34,13 +35,18 @@ The repo-managed Brev skill is linked into Claude Code (`~/.claude/skills`),
 Codex (`~/.codex/skills`), and the shared agent skill directory
 (`~/.agents/skills`). Existing Brev skill installations are preserved.
 
-It also sets Claude Code's default mode to **auto-accept edits** ("auto mode")
-by writing `"defaultMode": "acceptEdits"` into `~/.claude/settings.json`
-(merged, never clobbering existing settings). To undo, set it back to
-`"default"`; for full skip-all-prompts mode, use `"bypassPermissions"`.
+It also sets Claude Code's default permission mode to **auto mode** by writing
+`"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`
+(merged, never clobbering other settings; the legacy top-level `defaultMode`
+key written by older bootstraps is removed since Claude Code does not read the
+mode from there). This setting is Claude Code-specific — Codex approval
+settings are not modified. To undo, set it to `"default"`; to only auto-accept
+edits, use `"acceptEdits"`; for full skip-all-prompts mode, use
+`"bypassPermissions"`.
 
 After it finishes, open a new shell so PATH changes take effect. Run `claude`
-or `codex` to sign in, and `brev login` to authenticate Brev.
+or `codex` to sign in, `brev login` to authenticate Brev, and `hf auth login`
+to authenticate Hugging Face.
 
 ## Web Shell (browser terminal)
 
