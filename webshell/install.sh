@@ -289,25 +289,43 @@ verify() {
   else
     [ "$code" = "200" ] || { warn "verify: expected HTTP 200 on $addr:$PORT, got '$code'"; fails=$((fails+1)); }
   fi
+  # a ttyd restart must never take the tmux server (all shells) down with it
+  if ! $SUDO grep -q '^KillMode=process' /etc/systemd/system/ttyd.service 2>/dev/null; then
+    warn "verify: ttyd.service missing KillMode=process (a restart would kill all shells)"
+    fails=$((fails+1))
+  fi
   verify_session_restore || fails=$((fails+1))
   [ "$fails" -eq 0 ] || return 1
   log "verified: service active and serving on $addr:$PORT ($MODE mode)"
 }
 
-# Session restore must actually engage, not just be configured: boot a scratch
-# tmux server (own socket — the real webshell server is untouched) on the
-# linked conf and require tmux-resurrect's key bindings to appear, which only
-# happens when tpm ran and loaded the plugins. The scratch conf turns
-# @continuum-restore off after sourcing the real one (tpm's `run` executes
-# after config parsing) so verification never replays saved sessions.
-# continuum only arms auto-save/auto-restore on a machine's sole tmux server,
-# so its save hook is asserted on the live server when one exists (where real
-# saves happen) and on the scratch server otherwise (CI / fresh boxes).
+# Session restore must actually work, not just be configured. Everything runs
+# on a scratch socket with its own @resurrect-dir, so the real webshell server
+# and any real saves are untouched:
+#   1. a fresh server on the linked conf must load the plugins (the reboot
+#      path — tmux-resurrect's bindings appear only when tpm ran);
+#   2. continuum's save hook must be armed where real saves happen: on the
+#      live server when one exists, else on the scratch server (continuum
+#      only arms itself on a machine's sole tmux server);
+#   3. a full save -> kill server -> fresh server -> restore cycle must bring
+#      a window layout back. resurrect's save/restore scripts are driven
+#      directly because continuum's auto-trigger depends on that machine-wide
+#      sole-server condition, which CI runners and live boxes both violate.
+# The scratch conf turns @continuum-restore off after sourcing the real one
+# (tpm's `run` executes after config parsing) so nothing is ever replayed
+# into the scratch servers from real saves.
 verify_session_restore() {
-  local sock="webshell-verify-$$" keys="" sright="" i fails=0
-  local tmpconf; tmpconf=$(mktemp)
-  printf 'source-file %s\nset -g @continuum-restore "off"\n' "$HOME/.tmux.conf" > "$tmpconf"
-  if tmux -L "$sock" -f "$tmpconf" new-session -d -s verify 2>/dev/null; then
+  # The "rebooted" server gets its own socket: reusing the first socket races
+  # the dying server's cleanup (it unlinks the socket path from under the new
+  # server -> "server exited unexpectedly"). Restore state lives in files,
+  # so a fresh socket restores identically — race-free by construction.
+  local sock="webshell-verify-$$" sock2="webshell-verify2-$$"
+  local keys="" sright="" restored="" i fails=0
+  local vdir; vdir=$(mktemp -d)
+  printf 'source-file %s\nset -g @continuum-restore "off"\nset -g @resurrect-dir "%s"\n' \
+    "$HOME/.tmux.conf" "$vdir" > "$vdir/conf"
+
+  if tmux -L "$sock" -f "$vdir/conf" new-session -d -s main 2>/dev/null; then
     for i in 1 2 3 4 5 6 7 8 9 10; do
       keys=$(tmux -L "$sock" list-keys 2>/dev/null || true)
       case "$keys" in *tmux-resurrect/scripts/save.sh*) break ;; esac
@@ -322,17 +340,29 @@ verify_session_restore() {
         sleep 1
       done
     fi
+    # save -> kill -> fresh server -> restore: the layout must come back
+    tmux -L "$sock" new-window -t main -n restoreme 2>/dev/null || true
+    tmux -L "$sock" split-window -t main:restoreme 2>/dev/null || true
+    tmux -L "$sock" run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" >/dev/null 2>&1 || true
     tmux -L "$sock" kill-server 2>/dev/null || true
+    if tmux -L "$sock2" -f "$vdir/conf" new-session -d -s main 2>/dev/null; then
+      tmux -L "$sock2" run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh" >/dev/null 2>&1 || true
+      restored=$(tmux -L "$sock2" list-windows -t main -F '#{window_name}:#{window_panes}' 2>/dev/null || true)
+      tmux -L "$sock2" kill-server 2>/dev/null || true
+    fi
   fi
-  rm -f "$tmpconf"
+  rm -rf "$vdir"
+
   case "$keys" in *tmux-resurrect/scripts/save.sh*) ;; *)
     warn "verify: tmux-resurrect did not load in a fresh tmux server"; fails=$((fails+1)) ;; esac
   case "$sright" in *continuum_save*) ;; *)
     warn "verify: continuum auto-save hook missing from status-right"; fails=$((fails+1)) ;; esac
   [ -f "$HOME/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh" ] || {
     warn "verify: tmux-continuum save script is missing"; fails=$((fails+1)); }
+  case "$restored" in *"restoreme:2"*) ;; *)
+    warn "verify: save/restore cycle did not bring the window layout back"; fails=$((fails+1)) ;; esac
   [ "$fails" -eq 0 ] || return 1
-  log "verified: session-restore plugins load and continuum auto-save is armed"
+  log "verified: session-restore plugins load, auto-save armed, save/restore cycle works"
 }
 
 summary() {
