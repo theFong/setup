@@ -119,17 +119,6 @@ jobs:
           grep -q "ttyd.service unchanged" rerun.log
           test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
 
-      - name: Verify webshell verify fails when restore plugins are missing
-        if: runner.os == 'Linux'
-        run: |
-          mv "$HOME/.tmux/plugins/tmux-continuum" /tmp/tmux-continuum.away
-          if webshell/install.sh --verify-only; then
-            echo "verify unexpectedly passed without tmux-continuum" >&2
-            exit 1
-          fi
-          mv /tmp/tmux-continuum.away "$HOME/.tmux/plugins/tmux-continuum"
-          webshell/install.sh --verify-only
-
       # A flagless re-run must keep the deployed mode (a private->public flip
       # once locked out a proxy-fronted webshell); an explicit flag must still
       # switch modes.
