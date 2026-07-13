@@ -30,8 +30,9 @@ installer, configuration path, or workflow without proving that it works.
   state from inside the script (an `assert_*` helper following the
   `assert_installed` pattern, e.g. `assert_claude_mode`) and call
   `record_failure` on mismatch. Do not add success-path assertions as CI
-  workflow steps; reserve workflow steps for running the script and for what a
-  passing run cannot prove — isolated negative tests and re-run safety checks.
+  workflow steps; reserve workflow steps for running the scripts (including
+  `test.sh`) and for re-run safety checks. Negative tests belong in `test.sh`,
+  not inline in workflow YAML.
 - Record failures with `record_failure`; do not silently turn a failed install
   into a successful bootstrap.
 - Continue best-effort installation of independent tools, then return nonzero
@@ -66,14 +67,15 @@ Run the checks relevant to the change before pushing:
 
 ```bash
 bash -n install.sh
+./test.sh
 git diff --check
 actionlint .github/workflows/bootstrap.yml
 ```
 
 For behavioral bootstrap changes, the GitHub Actions matrix must pass on every
 supported platform. New failure behavior must also include an isolated negative
-test, using `SETUP_SKIP_MAIN=1` when individual shell functions need to be
-sourced without running the full bootstrap.
+test in `test.sh`, which sources `install.sh` with `SETUP_SKIP_MAIN=1` so
+individual shell functions can be exercised without running the full bootstrap.
 
 ## Definition of Done
 

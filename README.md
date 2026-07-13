@@ -5,6 +5,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 ## What's Inside
 
 - **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
+- **test.sh** — Isolated negative tests for install.sh failure paths, run by CI and safe to run locally
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
