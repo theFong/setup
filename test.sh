@@ -41,4 +41,25 @@ if [ "$(cat "$scratch/home/.claude/settings.json")" != "not json" ]; then
   exit 1
 fi
 
+# webshell: verify_session_restore must fail when the restore plugins are
+# missing. Sourced in a subshell against a scratch HOME (a copy of the real
+# tmux.conf but no plugins installed), so the real HOME and any live tmux
+# saves are never touched; scratch tmux servers run on their own sockets and
+# are killed by the function itself. Needs tmux, which the bootstrap installs
+# before CI runs this; skip locally where it is absent.
+if command -v tmux >/dev/null 2>&1; then
+  mkdir -p "$scratch/wshome"
+  cp webshell/tmux.conf "$scratch/wshome/.tmux.conf"
+  if (
+    export HOME="$scratch/wshome" SETUP_SKIP_MAIN=1
+    source ./webshell/install.sh
+    verify_session_restore
+  ) >/dev/null 2>&1; then
+    echo "FAIL: verify_session_restore unexpectedly passed without plugins" >&2
+    exit 1
+  fi
+else
+  echo "skip: tmux not available; webshell restore negative test not run" >&2
+fi
+
 log "all negative tests passed"

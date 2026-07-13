@@ -119,6 +119,20 @@ jobs:
           grep -q "ttyd.service unchanged" rerun.log
           test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
 
+      # A flagless re-run must keep the deployed mode (a private->public flip
+      # once locked out a proxy-fronted webshell); an explicit flag must still
+      # switch modes.
+      - name: Verify webshell re-run preserves deployed mode
+        if: runner.os == 'Linux'
+        run: |
+          webshell/install.sh --public --iface eth0
+          webshell/install.sh | tee mode-rerun.log
+          grep -q "keeping installed ttyd mode (public)" mode-rerun.log
+          sudo grep -q -- "--interface eth0" /etc/systemd/system/ttyd.service
+          ! sudo grep -q -- "--credential" /etc/systemd/system/ttyd.service
+          WEBSHELL_PASSWORD=ci-test-password webshell/install.sh --private
+          sudo grep -q -- "--credential" /etc/systemd/system/ttyd.service
+
       - name: Verify webshell refuses unsupported platforms cleanly
         if: runner.os == 'macOS'
         run: |
