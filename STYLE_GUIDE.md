@@ -6,7 +6,9 @@ installer, configuration path, or workflow without proving that it works.
 
 ## Required for Every Addition
 
-1. Add a validation that would fail if the new behavior were broken.
+1. Add a validation that would fail if the new behavior were broken. Put it
+   inside the script itself so it runs on every real machine, not only in CI
+   (see Installer Conventions).
 2. Test the relevant success path and, when failure handling changes, a negative
    path that proves the script returns nonzero.
 3. Preserve safe re-runs. A second bootstrap run must skip or harmlessly repeat
@@ -24,6 +26,12 @@ installer, configuration path, or workflow without proving that it works.
 - Add user-local binary directories to both the current `PATH` and the user's
   shell profile with `add_path`.
 - Call `assert_installed` after every install attempt with the expected command.
+- Validate configuration changes the same way: assert the resulting on-disk
+  state from inside the script (an `assert_*` helper following the
+  `assert_installed` pattern, e.g. `assert_claude_mode`) and call
+  `record_failure` on mismatch. Do not add success-path assertions as CI
+  workflow steps; reserve workflow steps for running the script and for what a
+  passing run cannot prove — isolated negative tests and re-run safety checks.
 - Record failures with `record_failure`; do not silently turn a failed install
   into a successful bootstrap.
 - Continue best-effort installation of independent tools, then return nonzero
