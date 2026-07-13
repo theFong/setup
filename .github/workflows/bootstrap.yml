@@ -69,6 +69,25 @@ jobs:
             exit 1
           fi
 
+      - name: Verify Claude settings merge and legacy-key migration
+        run: |
+          export SETUP_SKIP_MAIN=1
+          source install.sh
+          scratch="$RUNNER_TEMP/claude-settings-test"
+          mkdir -p "$scratch/.claude"
+
+          # Merge path: existing settings are preserved, the legacy top-level
+          # defaultMode key is removed, and permissions.defaultMode is set.
+          printf '{"model": "opus", "defaultMode": "acceptEdits"}\n' > "$scratch/.claude/settings.json"
+          (HOME="$scratch" configure_claude)
+          jq -e '.model == "opus" and .permissions.defaultMode == "auto" and (has("defaultMode") | not)' \
+            "$scratch/.claude/settings.json"
+
+          # Invalid JSON is left untouched rather than clobbered.
+          printf 'not json\n' > "$scratch/.claude/settings.json"
+          (HOME="$scratch" configure_claude)
+          test "$(cat "$scratch/.claude/settings.json")" = "not json"
+
       - name: Prepare isolated home directory
         run: |
           ci_home="$RUNNER_TEMP/setup-home"
@@ -102,6 +121,9 @@ jobs:
           test -e "$HOME/.claude/skills/brev-cli/SKILL.md"
           test -e "$HOME/.codex/skills/brev-cli/SKILL.md"
           test -e "$HOME/.agents/skills/brev-cli/SKILL.md"
+
+          jq -e '.permissions.defaultMode == "auto" and (has("defaultMode") | not)' \
+            "$HOME/.claude/settings.json"
 
       - name: Verify bootstrap is safe to re-run
         run: bash install.sh

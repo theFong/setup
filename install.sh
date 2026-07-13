@@ -311,22 +311,25 @@ install_opencode() {
   assert_installed "opencode" opencode
 }
 
-# Default Claude Code to "auto mode" (auto-accept edits) on this machine by
-# writing defaultMode into ~/.claude/settings.json. Merges into any existing
-# settings (via jq) rather than overwriting. Change "acceptEdits" to
-# "bypassPermissions" for full skip-all-prompts mode, or "default" to undo.
+# Default Claude Code to auto mode on this machine by writing
+# permissions.defaultMode into ~/.claude/settings.json (the top-level
+# defaultMode key written by older bootstraps is not where Claude Code reads
+# the mode, so it is removed if present). Merges into any existing settings
+# (via jq) rather than overwriting. Change "auto" to "acceptEdits" to only
+# auto-accept edits, "bypassPermissions" for full skip-all-prompts mode, or
+# "default" to undo.
 configure_claude() {
   local settings="$HOME/.claude/settings.json"
-  local mode="acceptEdits"
+  local mode="auto"
   mkdir -p "$HOME/.claude"
   if [ ! -f "$settings" ]; then
-    printf '{\n  "defaultMode": "%s"\n}\n' "$mode" > "$settings"
+    printf '{\n  "permissions": {\n    "defaultMode": "%s"\n  }\n}\n' "$mode" > "$settings"
     log "set Claude default mode to $mode"
     return
   fi
   if have jq; then
     local tmp; tmp=$(mktemp)
-    if jq --arg m "$mode" '.defaultMode = $m' "$settings" > "$tmp" 2>/dev/null; then
+    if jq --arg m "$mode" 'del(.defaultMode) | .permissions.defaultMode = $m' "$settings" > "$tmp" 2>/dev/null; then
       mv "$tmp" "$settings"
       log "set Claude default mode to $mode"
     else
