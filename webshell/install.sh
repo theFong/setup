@@ -5,8 +5,10 @@
 # Installs ttyd (built from source: release/distro builds bundle an xterm.js
 # with no OSC 52 handler, so copy-to-clipboard silently fails), links this
 # directory's tmux.conf to ~/.tmux.conf, installs the tmux-clip clipboard
-# helper, and sets up a systemd service. Sessions are tmux-backed, so a
-# browser refresh (or full disconnect) reattaches to the same shells.
+# helper, installs tmux plugins (tpm + resurrect + continuum: window/pane
+# layout, cwds, and visible text survive reboots — processes do not), and
+# sets up a systemd service. Sessions are tmux-backed, so a browser refresh
+# (or full disconnect) reattaches to the same shells.
 #
 # Modes:
 #   private (default) — binds 127.0.0.1 with password auth (generated and
@@ -27,7 +29,8 @@
 # Env overrides: WEBSHELL_MODE (private|public), WEBSHELL_IFACE, WEBSHELL_PORT,
 #                WEBSHELL_USER, WEBSHELL_PASSWORD, WEBSHELL_SESSION
 #
-# Re-running is safe; the service only restarts if its config changed.
+# Re-running is safe; the service only restarts if its config changed, and a
+# flagless re-run keeps whatever mode/interface/port is already deployed.
 
 set -euo pipefail
 
@@ -40,6 +43,12 @@ WEBSHELL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${WEBSHELL_MODE:-private}"
 IFACE="${WEBSHELL_IFACE:-wt0}"
 PORT="${WEBSHELL_PORT:-7681}"
+# Track which of these the caller chose explicitly (env or flag) so re-runs
+# can keep the deployed configuration instead of silently reverting defaults.
+MODE_EXPLICIT=0; IFACE_EXPLICIT=0; PORT_EXPLICIT=0
+[ -z "${WEBSHELL_MODE:-}" ]  || MODE_EXPLICIT=1
+[ -z "${WEBSHELL_IFACE:-}" ] || IFACE_EXPLICIT=1
+[ -z "${WEBSHELL_PORT:-}" ]  || PORT_EXPLICIT=1
 WSUSER="${WEBSHELL_USER:-$(id -un)}"
 PASSWORD="${WEBSHELL_PASSWORD:-}"
 SESSION="${WEBSHELL_SESSION:-main}"
@@ -51,14 +60,14 @@ SUDO=""
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --private) MODE="private" ;;
-      --public)  MODE="public" ;;
-      --iface)   IFACE="$2"; shift ;;
-      --port)    PORT="$2"; shift ;;
+      --private) MODE="private"; MODE_EXPLICIT=1 ;;
+      --public)  MODE="public"; MODE_EXPLICIT=1 ;;
+      --iface)   IFACE="$2"; IFACE_EXPLICIT=1; shift ;;
+      --port)    PORT="$2"; PORT_EXPLICIT=1; shift ;;
       --session) SESSION="$2"; shift ;;
       --force-build) FORCE_BUILD=1 ;;
       --verify-only) VERIFY_ONLY=1 ;;
-      -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+      -h|--help) sed -n '2,32p' "${BASH_SOURCE[0]}"; exit 0 ;;
       *) warn "unknown argument: $1"; exit 1 ;;
     esac
     shift
@@ -115,6 +124,65 @@ install_tmux_config() {
   log "linked ~/.tmux.conf -> $WEBSHELL_DIR/tmux.conf"
 }
 
+# tpm + tmux-resurrect + tmux-continuum give macOS-Terminal-style persistence:
+# layout, cwds, and visible pane text are auto-saved and restored whenever the
+# tmux server starts again (e.g. first webshell connect after a reboot).
+# Processes are not resumed; panes come back as fresh shells.
+TPM_DIR="$HOME/.tmux/plugins/tpm"
+
+install_tmux_plugins() {
+  have git || { log "installing git (needed for tmux plugins)"; $SUDO apt-get install -y -qq git; }
+  if [ -d "$TPM_DIR/.git" ]; then
+    log "tpm already present"
+  else
+    log "installing tpm (tmux plugin manager)"
+    git clone -q --depth 1 https://github.com/tmux-plugins/tpm "$TPM_DIR"
+  fi
+  # tpm's CLI installer only works against a server where tpm has run (it
+  # reads TMUX_PLUGIN_MANAGER_PATH from the server environment). Reload the
+  # conf into a running server, or boot a throwaway session on a fresh box.
+  local started=0
+  if tmux has-session 2>/dev/null; then
+    tmux source-file "$HOME/.tmux.conf"
+  else
+    tmux new-session -d -s webshell-plugin-install
+    started=1
+  fi
+  # Installs the plugins declared in tmux.conf; no-op for installed ones.
+  "$TPM_DIR/bin/install_plugins" >/dev/null
+  if [ "$started" = 1 ]; then
+    tmux kill-session -t webshell-plugin-install
+  else
+    # second reload: the running server now loads the just-installed plugins
+    tmux source-file "$HOME/.tmux.conf"
+  fi
+}
+
+# Re-runs must not change a deployed webshell's exposure: unless the caller
+# explicitly chose a mode (flag or WEBSHELL_MODE), adopt the mode, interface,
+# and port of the already-installed unit. A flagless re-run once flipped a
+# public (proxy-fronted) webshell to private and locked every client out.
+adopt_installed_mode() {
+  local unit="/etc/systemd/system/ttyd.service" exec_line="" val=""
+  if [ "$MODE_EXPLICIT" = 1 ] || [ ! -f "$unit" ]; then return 0; fi
+  exec_line=$($SUDO sed -n 's/^ExecStart=//p' "$unit" 2>/dev/null | head -1)
+  if [ -z "$exec_line" ]; then return 0; fi
+  case "$exec_line" in
+    *--credential*) MODE="private" ;;
+    *--interface*)
+      MODE="public"
+      if [ "$IFACE_EXPLICIT" = 0 ]; then
+        val=$(printf '%s\n' "$exec_line" | sed -n 's/.*--interface \([^ ]*\).*/\1/p')
+        [ -z "$val" ] || IFACE="$val"
+      fi ;;
+  esac
+  if [ "$PORT_EXPLICIT" = 0 ]; then
+    val=$(printf '%s\n' "$exec_line" | sed -n 's/.*--port \([^ ]*\).*/\1/p')
+    [ -z "$val" ] || PORT="$val"
+  fi
+  log "re-run: keeping installed ttyd mode ($MODE)"
+}
+
 # Populate WSUSER/PASSWORD from the credential in the installed unit, if any.
 # Returns nonzero when no credential is found.
 load_existing_credential() {
@@ -125,9 +193,10 @@ load_existing_credential() {
   PASSWORD="${existing#*:}"
 }
 
-install_service() {
-  local bind_args="" extra_unit=""
-  local unit="/etc/systemd/system/ttyd.service"
+# Compute BIND_ARGS / EXTRA_UNIT for the current mode (may generate or reuse
+# the private-mode credential), then render the unit. Split from
+# install_service so tests can render the expected unit without installing.
+compute_service_args() {
   if [ "$MODE" = "private" ]; then
     # Re-runs stay idempotent: reuse the credential already in the unit
     # rather than rotating the password on every install.
@@ -138,35 +207,48 @@ install_service() {
       PASSWORD=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 20)
       GENERATED_PASSWORD=1
     fi
-    bind_args="--interface 127.0.0.1 --credential $WSUSER:$PASSWORD"
-    extra_unit='After=network.target'
+    BIND_ARGS="--interface 127.0.0.1 --credential $WSUSER:$PASSWORD"
+    EXTRA_UNIT='After=network.target'
   else
-    bind_args="--interface $IFACE"
+    BIND_ARGS="--interface $IFACE"
     # Netbird's wt0 comes up via netbird.service; order after it when used.
     case "$IFACE" in
-      wt0) extra_unit=$'After=network.target netbird.service\nWants=netbird.service' ;;
-      *)   extra_unit='After=network.target' ;;
+      wt0) EXTRA_UNIT=$'After=network.target netbird.service\nWants=netbird.service' ;;
+      *)   EXTRA_UNIT='After=network.target' ;;
     esac
   fi
+}
 
-  local tmp; tmp=$(mktemp)
-  cat > "$tmp" <<EOF
+render_unit() {
+  cat <<EOF
 [Unit]
 Description=ttyd browser terminal (tmux-backed, session-persistent)
-$extra_unit
+$EXTRA_UNIT
 
 [Service]
 Type=simple
 User=$WSUSER
 # tmux "new -A" attaches if the session exists, else creates it ->
 # refreshing the browser preserves your shells.
-ExecStart=/usr/local/bin/ttyd $bind_args --port $PORT --writable tmux new -A -s $SESSION
+ExecStart=/usr/local/bin/ttyd $BIND_ARGS --port $PORT --writable tmux new -A -s $SESSION
 Restart=always
 RestartSec=2
+# The tmux server is a child in this unit's cgroup; the default cgroup kill
+# would take every shell down with a ttyd restart. Kill only ttyd itself:
+# sessions survive service restarts, and reboots are covered by the
+# resurrect/continuum session restore.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+install_service() {
+  local unit="/etc/systemd/system/ttyd.service"
+  compute_service_args
+  local tmp; tmp=$(mktemp)
+  render_unit > "$tmp"
 
   if [ -f "$unit" ] && $SUDO cmp -s "$tmp" "$unit"; then
     log "ttyd.service unchanged"
@@ -207,8 +289,50 @@ verify() {
   else
     [ "$code" = "200" ] || { warn "verify: expected HTTP 200 on $addr:$PORT, got '$code'"; fails=$((fails+1)); }
   fi
+  verify_session_restore || fails=$((fails+1))
   [ "$fails" -eq 0 ] || return 1
   log "verified: service active and serving on $addr:$PORT ($MODE mode)"
+}
+
+# Session restore must actually engage, not just be configured: boot a scratch
+# tmux server (own socket — the real webshell server is untouched) on the
+# linked conf and require tmux-resurrect's key bindings to appear, which only
+# happens when tpm ran and loaded the plugins. The scratch conf turns
+# @continuum-restore off after sourcing the real one (tpm's `run` executes
+# after config parsing) so verification never replays saved sessions.
+# continuum only arms auto-save/auto-restore on a machine's sole tmux server,
+# so its save hook is asserted on the live server when one exists (where real
+# saves happen) and on the scratch server otherwise (CI / fresh boxes).
+verify_session_restore() {
+  local sock="webshell-verify-$$" keys="" sright="" i fails=0
+  local tmpconf; tmpconf=$(mktemp)
+  printf 'source-file %s\nset -g @continuum-restore "off"\n' "$HOME/.tmux.conf" > "$tmpconf"
+  if tmux -L "$sock" -f "$tmpconf" new-session -d -s verify 2>/dev/null; then
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      keys=$(tmux -L "$sock" list-keys 2>/dev/null || true)
+      case "$keys" in *tmux-resurrect/scripts/save.sh*) break ;; esac
+      sleep 1
+    done
+    if tmux has-session 2>/dev/null; then
+      sright=$(tmux show-option -gv status-right 2>/dev/null || true)
+    else
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        sright=$(tmux -L "$sock" show-option -gv status-right 2>/dev/null || true)
+        case "$sright" in *continuum_save*) break ;; esac
+        sleep 1
+      done
+    fi
+    tmux -L "$sock" kill-server 2>/dev/null || true
+  fi
+  rm -f "$tmpconf"
+  case "$keys" in *tmux-resurrect/scripts/save.sh*) ;; *)
+    warn "verify: tmux-resurrect did not load in a fresh tmux server"; fails=$((fails+1)) ;; esac
+  case "$sright" in *continuum_save*) ;; *)
+    warn "verify: continuum auto-save hook missing from status-right"; fails=$((fails+1)) ;; esac
+  [ -f "$HOME/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh" ] || {
+    warn "verify: tmux-continuum save script is missing"; fails=$((fails+1)); }
+  [ "$fails" -eq 0 ] || return 1
+  log "verified: session-restore plugins load and continuum auto-save is armed"
 }
 
 summary() {
@@ -229,12 +353,14 @@ summary() {
     echo "  Ensure an authenticating HTTPS proxy fronts it and the port is"
     echo "  not otherwise reachable."
   fi
-  echo "  Sessions persist across refresh/disconnect (tmux session: $SESSION)."
+  echo "  Sessions persist across refresh/disconnect (tmux session: $SESSION),"
+  echo "  and window/pane layout is restored after a reboot (processes are not)."
 }
 
 main() {
   parse_args "$@"
   check_platform
+  adopt_installed_mode
   if [ "$VERIFY_ONLY" = 1 ]; then
     # Standalone health check of an existing install (e.g. from CI or cron):
     # same assertions as a fresh install, exits nonzero on any failure.
@@ -246,9 +372,12 @@ main() {
   fi
   install_ttyd
   install_tmux_config
+  install_tmux_plugins
   install_service
   verify
   summary
 }
 
-main "$@"
+# SETUP_SKIP_MAIN=1 lets tests source individual functions (e.g. render_unit)
+# without running the bootstrap.
+[ "${SETUP_SKIP_MAIN:-0}" = 1 ] || main "$@"

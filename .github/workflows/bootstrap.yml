@@ -119,6 +119,8 @@ jobs:
           systemctl is-active ttyd
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7681/)" = "401"
           test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
+          # a ttyd restart must not take the tmux server (all shells) with it
+          sudo grep -q '^KillMode=process' /etc/systemd/system/ttyd.service
           webshell/install.sh --verify-only
 
       - name: Verify webshell is safe to re-run (password not rotated)
@@ -127,6 +129,52 @@ jobs:
           webshell/install.sh | tee rerun.log
           grep -q "ttyd.service unchanged" rerun.log
           test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
+
+      # Simulated reboot on a scratch tmux socket: a layout saved by resurrect
+      # must be replayed by continuum when a fresh server starts with the same
+      # conf — independent of the installer's own verify.
+      - name: Verify webshell restores tmux sessions across server restart
+        if: runner.os == 'Linux'
+        run: |
+          tmux -L ci-restore -f "$HOME/.tmux.conf" new-session -d -s main
+          sleep 5   # let tpm finish loading plugins
+          tmux -L ci-restore new-window -t main -n restoreme
+          tmux -L ci-restore split-window -t main:restoreme
+          tmux -L ci-restore run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
+          tmux -L ci-restore kill-server
+          tmux -L ci-restore -f "$HOME/.tmux.conf" new-session -d -s main   # "reboot"
+          for i in $(seq 1 15); do
+            tmux -L ci-restore list-windows -t main -F '#{window_name}' 2>/dev/null | grep -qx restoreme && break
+            sleep 1
+          done
+          tmux -L ci-restore list-windows -t main -F '#{window_name}' | grep -qx restoreme
+          test "$(tmux -L ci-restore list-panes -t main:restoreme | wc -l)" = "2"
+          tmux -L ci-restore kill-server
+
+      - name: Verify webshell verify fails when restore plugins are missing
+        if: runner.os == 'Linux'
+        run: |
+          mv "$HOME/.tmux/plugins/tmux-continuum" /tmp/tmux-continuum.away
+          if webshell/install.sh --verify-only; then
+            echo "verify unexpectedly passed without tmux-continuum" >&2
+            exit 1
+          fi
+          mv /tmp/tmux-continuum.away "$HOME/.tmux/plugins/tmux-continuum"
+          webshell/install.sh --verify-only
+
+      # A flagless re-run must keep the deployed mode (a private->public flip
+      # once locked out a proxy-fronted webshell); an explicit flag must still
+      # switch modes.
+      - name: Verify webshell re-run preserves deployed mode
+        if: runner.os == 'Linux'
+        run: |
+          webshell/install.sh --public --iface eth0
+          webshell/install.sh | tee mode-rerun.log
+          grep -q "keeping installed ttyd mode (public)" mode-rerun.log
+          sudo grep -q -- "--interface eth0" /etc/systemd/system/ttyd.service
+          ! sudo grep -q -- "--credential" /etc/systemd/system/ttyd.service
+          WEBSHELL_PASSWORD=ci-test-password webshell/install.sh --private
+          sudo grep -q -- "--credential" /etc/systemd/system/ttyd.service
 
       - name: Verify webshell refuses unsupported platforms cleanly
         if: runner.os == 'macOS'
