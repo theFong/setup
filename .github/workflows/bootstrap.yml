@@ -53,21 +53,11 @@ jobs:
       - name: Check shell syntax
         run: |
           bash -n install.sh
+          bash -n test.sh
           bash -n webshell/install.sh
 
-      - name: Verify failed installs return nonzero
-        run: |
-          export SETUP_SKIP_MAIN=1
-          source install.sh
-          FAILED=""
-          if assert_installed "missing test tool" setup-test-tool-does-not-exist; then
-            echo "missing tool assertion unexpectedly succeeded" >&2
-            exit 1
-          fi
-          if summary >/dev/null 2>&1; then
-            echo "summary unexpectedly returned zero after a failed assertion" >&2
-            exit 1
-          fi
+      - name: Run negative tests
+        run: ./test.sh
 
       - name: Prepare isolated home directory
         run: |
