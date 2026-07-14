@@ -39,10 +39,18 @@ It also sets Claude Code's default permission mode to **auto mode** by writing
 `"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`
 (merged, never clobbering other settings; the legacy top-level `defaultMode`
 key written by older bootstraps is removed since Claude Code does not read the
-mode from there). This setting is Claude Code-specific — Codex approval
-settings are not modified. To undo, set it to `"default"`; to only auto-accept
+mode from there). To undo, set it to `"default"`; to only auto-accept
 edits, use `"acceptEdits"`; for full skip-all-prompts mode, use
 `"bypassPermissions"`.
+
+Codex gets the equivalent **Auto** approval preset by writing top-level
+`approval_policy = "on-request"` and `sandbox_mode = "workspace-write"` into
+`~/.codex/config.toml`: Codex works autonomously inside a workspace-write
+sandbox and only prompts to escalate. The keys are inserted above any
+`[table]` section (top-level TOML keys must precede table headers); everything
+else in the file is preserved. To undo, delete both keys; for full
+skip-all-prompts mode, use `approval_policy = "never"` with
+`sandbox_mode = "danger-full-access"`.
 
 After it finishes, open a new shell so PATH changes take effect. Run `claude`
 or `codex` to sign in, `brev login` to authenticate Brev, and `hf auth login`

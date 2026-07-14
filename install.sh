@@ -354,6 +354,60 @@ configure_claude() {
   assert_claude_mode "$settings" "$mode"
 }
 
+# assert_codex_mode CONFIG APPROVAL SANDBOX — verify Codex's approval policy
+# and sandbox mode actually landed on disk as top-level keys. Keys that only
+# appear after a [table] header do not count: TOML scopes them to that table,
+# so Codex would not read them as its approval settings.
+assert_codex_mode() {
+  local config="$1" approval="$2" sandbox="$3"
+  if awk -v approval="$approval" -v sandbox="$sandbox" '
+      /^[[:space:]]*\[/ { exit }
+      $0 ~ "^approval_policy[[:space:]]*=[[:space:]]*\"" approval "\"[[:space:]]*$" { a = 1 }
+      $0 ~ "^sandbox_mode[[:space:]]*=[[:space:]]*\"" sandbox "\"[[:space:]]*$"     { s = 1 }
+      END { exit !(a && s) }
+    ' "$config" 2>/dev/null; then
+    log "verified Codex approval_policy=$approval sandbox_mode=$sandbox in $config"
+    return 0
+  fi
+  warn "Codex config $config does not set approval_policy=$approval and sandbox_mode=$sandbox at top level"
+  record_failure codex-approval-mode
+  return 1
+}
+
+# Default Codex to its "Auto" approval preset — the Codex equivalent of Claude
+# Code's auto mode above — by writing approval_policy and sandbox_mode into
+# ~/.codex/config.toml: work autonomously inside a workspace-write sandbox and
+# only prompt to escalate. Top-level TOML keys must appear before any [table]
+# header, so the keys are inserted at the top of the file and any stale
+# top-level values are dropped; everything else (including same-named keys
+# inside tables) is preserved. For full skip-all-prompts mode use
+# approval_policy "never" with sandbox_mode "danger-full-access"; to undo,
+# delete both keys.
+configure_codex() {
+  local config="$HOME/.codex/config.toml"
+  local approval="on-request" sandbox="workspace-write"
+  mkdir -p "$HOME/.codex"
+  if [ ! -f "$config" ]; then
+    printf 'approval_policy = "%s"\nsandbox_mode = "%s"\n' "$approval" "$sandbox" > "$config"
+  else
+    local tmp; tmp=$(mktemp)
+    if awk -v approval="$approval" -v sandbox="$sandbox" '
+        BEGIN {
+          print "approval_policy = \"" approval "\""
+          print "sandbox_mode = \"" sandbox "\""
+        }
+        /^[[:space:]]*\[/ { in_table = 1 }
+        !in_table && /^[[:space:]]*(approval_policy|sandbox_mode)[[:space:]]*=/ { next }
+        { print }
+      ' "$config" > "$tmp"; then
+      mv "$tmp" "$config"
+    else
+      rm -f "$tmp"; warn "could not update $config; leaving it unchanged"
+    fi
+  fi
+  assert_codex_mode "$config" "$approval" "$sandbox"
+}
+
 # ---------------------------------------------------------------------------
 # dotfiles / Claude config
 # ---------------------------------------------------------------------------
@@ -429,6 +483,7 @@ main() {
   install_huggingface    || warn "Hugging Face CLI install failed"
   install_opencode       || warn "opencode install failed"
   configure_claude       || warn "configuring Claude default mode failed"
+  configure_codex        || warn "configuring Codex approval mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
   link_brev_skill        || warn "linking Brev skill failed"
   summary

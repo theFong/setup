@@ -41,4 +41,44 @@ if [ "$(cat "$scratch/home/.claude/settings.json")" != "not json" ]; then
   exit 1
 fi
 
+# configure_codex must insert its keys above existing [table] headers (TOML
+# reads keys after a header as belonging to that table), preserve same-named
+# keys inside tables, and produce identical output when re-run. A fresh
+# bootstrap only exercises the no-existing-config path, so the merge behavior
+# is covered here.
+mkdir -p "$scratch/home/.codex"
+printf '# existing config\n[projects."/tmp"]\ntrust_level = "trusted"\napproval_policy = "never"\n' \
+  > "$scratch/home/.codex/config.toml"
+if ! (export HOME="$scratch/home"; configure_codex) >/dev/null 2>&1; then
+  echo "FAIL: configure_codex failed on a config with existing tables" >&2
+  exit 1
+fi
+if [ "$(head -n 2 "$scratch/home/.codex/config.toml")" != 'approval_policy = "on-request"
+sandbox_mode = "workspace-write"' ]; then
+  echo "FAIL: configure_codex did not place its keys above existing tables" >&2
+  exit 1
+fi
+if ! grep -q 'approval_policy = "never"' "$scratch/home/.codex/config.toml"; then
+  echo "FAIL: configure_codex removed a same-named key inside a table" >&2
+  exit 1
+fi
+first_pass=$(cat "$scratch/home/.codex/config.toml")
+if ! (export HOME="$scratch/home"; configure_codex) >/dev/null 2>&1; then
+  echo "FAIL: configure_codex failed on re-run" >&2
+  exit 1
+fi
+if [ "$(cat "$scratch/home/.codex/config.toml")" != "$first_pass" ]; then
+  echo "FAIL: configure_codex is not idempotent across re-runs" >&2
+  exit 1
+fi
+
+# assert_codex_mode must reject keys that only appear inside a table: Codex
+# would not read them as its top-level approval settings.
+printf '[profiles.x]\napproval_policy = "on-request"\nsandbox_mode = "workspace-write"\n' \
+  > "$scratch/codex-table-scoped.toml"
+if assert_codex_mode "$scratch/codex-table-scoped.toml" "on-request" "workspace-write" >/dev/null 2>&1; then
+  echo "FAIL: assert_codex_mode accepted keys scoped inside a table" >&2
+  exit 1
+fi
+
 log "all negative tests passed"
