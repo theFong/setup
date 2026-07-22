@@ -347,7 +347,10 @@ verify_session_restore() {
     [ "$(tmux -L "$sock" show -gv status 2>/dev/null)" = "2" ] || groups_ok=0
     tmux -L "$sock" list-keys 2>/dev/null | grep -q "tmux-groups" || groups_ok=0
     tmux -L "$sock" new-session -d -s groupcheck 2>/dev/null || true
-    groups_menu=$(tmux -L "$sock" run-shell "/usr/local/bin/tmux-groups --print menu dummy" 2>/dev/null || true)
+    # capture via file: tmux 3.4 no longer relays run-shell stdout to a CLI
+    # client, so the redirect must happen inside run-shell's own shell
+    tmux -L "$sock" run-shell "/usr/local/bin/tmux-groups --print menu dummy > '$vdir/menu.out' 2>&1" 2>/dev/null || true
+    groups_menu=$(cat "$vdir/menu.out" 2>/dev/null || true)
     case "$groups_menu" in *groupcheck*) ;; *) groups_ok=0 ;; esac
     case "$groups_menu" in *"new group"*) ;; *) groups_ok=0 ;; esac
 
