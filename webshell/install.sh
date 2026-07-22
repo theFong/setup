@@ -4,8 +4,8 @@
 #
 # Installs ttyd (built from source: release/distro builds bundle an xterm.js
 # with no OSC 52 handler, so copy-to-clipboard silently fails), links this
-# directory's tmux.conf to ~/.tmux.conf, installs the tmux-clip clipboard
-# helper, installs tmux plugins (tpm + resurrect + continuum: window/pane
+# directory's tmux.conf to ~/.tmux.conf, installs the tmux-clip and
+# tmux-groups helpers, installs tmux plugins (tpm + resurrect + continuum:
 # layout, cwds, and visible text survive reboots — processes do not), and
 # sets up a systemd service. Sessions are tmux-backed, so a browser refresh
 # (or full disconnect) reattaches to the same shells.
@@ -114,6 +114,8 @@ install_tmux_config() {
   # copy bindings pipe through this helper, which writes the escape sequence
   # directly to every attached client tty.
   $SUDO install -m 0755 "$WEBSHELL_DIR/tmux-clip" /usr/local/bin/tmux-clip
+  # tmux-groups: mouse-driven tab-group (session) menus for the status bar.
+  $SUDO install -m 0755 "$WEBSHELL_DIR/tmux-groups" /usr/local/bin/tmux-groups
   # Symlink ~/.tmux.conf into the repo (source of truth), backing up any
   # existing regular file.
   if [ -f "$HOME/.tmux.conf" ] && [ ! -L "$HOME/.tmux.conf" ]; then
@@ -320,7 +322,7 @@ verify_session_restore() {
   # server -> "server exited unexpectedly"). Restore state lives in files,
   # so a fresh socket restores identically — race-free by construction.
   local sock="webshell-verify-$$" sock2="webshell-verify2-$$"
-  local keys="" sright="" restored="" i fails=0
+  local keys="" sright="" restored="" groups_menu="" i fails=0 groups_ok=1
   local vdir; vdir=$(mktemp -d)
   printf 'source-file %s\nset -g @continuum-restore "off"\nset -g @resurrect-dir "%s"\n' \
     "$HOME/.tmux.conf" "$vdir" > "$vdir/conf"
@@ -340,6 +342,18 @@ verify_session_restore() {
         sleep 1
       done
     fi
+    # groups UI: second status row on, menu bindings bound, and the menu
+    # generator must list this server's groups plus the management actions
+    [ "$(tmux -L "$sock" show -gv status 2>/dev/null)" = "2" ] || groups_ok=0
+    tmux -L "$sock" list-keys 2>/dev/null | grep -q "tmux-groups" || groups_ok=0
+    tmux -L "$sock" new-session -d -s groupcheck 2>/dev/null || true
+    # capture via file: tmux 3.4 no longer relays run-shell stdout to a CLI
+    # client, so the redirect must happen inside run-shell's own shell
+    tmux -L "$sock" run-shell "/usr/local/bin/tmux-groups --print menu dummy > '$vdir/menu.out' 2>&1" 2>/dev/null || true
+    groups_menu=$(cat "$vdir/menu.out" 2>/dev/null || true)
+    case "$groups_menu" in *groupcheck*) ;; *) groups_ok=0 ;; esac
+    case "$groups_menu" in *"new group"*) ;; *) groups_ok=0 ;; esac
+
     # save -> kill -> fresh server -> restore: the layout must come back
     tmux -L "$sock" new-window -t main -n restoreme 2>/dev/null || true
     tmux -L "$sock" split-window -t main:restoreme 2>/dev/null || true
@@ -361,8 +375,10 @@ verify_session_restore() {
     warn "verify: tmux-continuum save script is missing"; fails=$((fails+1)); }
   case "$restored" in *"restoreme:2"*) ;; *)
     warn "verify: save/restore cycle did not bring the window layout back"; fails=$((fails+1)) ;; esac
+  [ "$groups_ok" = 1 ] || {
+    warn "verify: tab-group UI is not wired up (status row, bindings, or menu generation)"; fails=$((fails+1)); }
   [ "$fails" -eq 0 ] || return 1
-  log "verified: session-restore plugins load, auto-save armed, save/restore cycle works"
+  log "verified: session-restore plugins load, auto-save armed, save/restore cycle works, groups UI wired"
 }
 
 summary() {

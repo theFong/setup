@@ -62,4 +62,20 @@ else
   echo "skip: tmux not available; webshell restore negative test not run" >&2
 fi
 
+# webshell: tmux-groups must fail loudly when misused instead of opening a
+# menu with missing context. These paths exit before any tmux call, so no
+# server or client is needed.
+if ./webshell/tmux-groups >/dev/null 2>&1; then
+  echo "FAIL: tmux-groups without a subcommand unexpectedly succeeded" >&2
+  exit 1
+fi
+if ./webshell/tmux-groups --print tab-menu >/dev/null 2>&1; then
+  echo "FAIL: tmux-groups tab-menu without window/client unexpectedly succeeded" >&2
+  exit 1
+fi
+if ./webshell/tmux-groups --print bogus-subcommand >/dev/null 2>&1; then
+  echo "FAIL: tmux-groups unknown subcommand unexpectedly succeeded" >&2
+  exit 1
+fi
+
 log "all negative tests passed"
