@@ -89,6 +89,13 @@ Notes baked into the setup (hard-won):
   tmux server, so scratch servers on other sockets don't clobber saves.
 - Re-running the installer keeps the deployed mode, interface, and port
   unless you pass `--private`/`--public` (or `WEBSHELL_*`) explicitly.
+- **Tab groups** (tmux sessions) are fully mouse-driven: a second status row
+  lists the groups with the current one highlighted. Click that row — or
+  right-click anywhere on the bar — for the groups menu (switch / new /
+  rename / close). Right-click a tab to rename it, close it, or move it to
+  another group; mouse-wheel over the bar cycles groups. Menus come from
+  `webshell/tmux-groups`. Groups survive reboots like everything else
+  (resurrect saves and restores all sessions).
 
 ## North/South Internet Check
 
