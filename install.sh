@@ -354,6 +354,79 @@ configure_claude() {
   assert_claude_mode "$settings" "$mode"
 }
 
+# Sample status JSON, shaped like what Claude Code pipes to statusLine.command
+# on stdin. Used to prove the status line script actually renders rather than
+# only that it is referenced from settings.json.
+STATUSLINE_SAMPLE='{"session_id":"setup-selftest-session","cwd":"/tmp","model":{"display_name":"Test Model"},"context_window":{"total_input_tokens":50000,"context_window_size":200000,"used_percentage":25}}'
+
+# assert_claude_statusline SETTINGS SCRIPT — verify the status line is wired up
+# in settings.json and that the script renders the session id and context usage
+# from STATUSLINE_SAMPLE. The in-script counterpart of assert_installed for the
+# status line configuration.
+assert_claude_statusline() {
+  local settings="$1" script="$2" rendered=""
+  if ! have jq || ! jq -e --arg c "$script" \
+      '.statusLine.type == "command" and .statusLine.command == $c' \
+      "$settings" >/dev/null 2>&1; then
+    warn "Claude status line is not configured in $settings"
+    record_failure claude-statusline
+    return 1
+  fi
+  if [ ! -x "$script" ]; then
+    warn "Claude status line script is not executable: $script"
+    record_failure claude-statusline
+    return 1
+  fi
+  rendered=$(printf '%s' "$STATUSLINE_SAMPLE" | "$script" 2>/dev/null) || true
+  case "$rendered" in
+    *setup-selftest-session*"ctx 25%"*|*"ctx 25%"*setup-selftest-session*) ;;
+    *)
+      warn "Claude status line script did not render the session id and context usage"
+      record_failure claude-statusline
+      return 1
+      ;;
+  esac
+  log "verified Claude status line: $script"
+}
+
+# Show the session id and context-window usage under the Claude Code prompt by
+# pointing statusLine.command at this repo's claude/statusline.sh. Claude Code
+# has no built-in setting for either, but it pipes both to the status line
+# command. Claude Code-specific: Codex CLI has no status line hook (see
+# README.md). Merges into existing settings via jq rather than overwriting, so
+# re-runs are a no-op. Remove the statusLine key to undo.
+configure_claude_statusline() {
+  local settings="$HOME/.claude/settings.json"
+  local script="$HOME/.setup/claude/statusline.sh"
+  local tmp
+
+  if [ ! -f "$script" ]; then
+    warn "status line script not found at $script"
+    record_failure claude-statusline
+    return 1
+  fi
+  [ -x "$script" ] || chmod +x "$script" 2>/dev/null || true
+
+  if ! have jq; then
+    warn "jq unavailable; not configuring the Claude status line"
+    record_failure claude-statusline
+    return 1
+  fi
+
+  mkdir -p "$HOME/.claude"
+  [ -f "$settings" ] || printf '{}\n' > "$settings"
+
+  tmp=$(mktemp)
+  if jq --arg c "$script" '.statusLine = {type: "command", command: $c}' "$settings" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$settings"
+  else
+    rm -f "$tmp"
+    warn "could not update $settings (invalid JSON?); leaving it unchanged"
+  fi
+
+  assert_claude_statusline "$settings" "$script"
+}
+
 # ---------------------------------------------------------------------------
 # dotfiles / Claude config
 # ---------------------------------------------------------------------------
@@ -431,6 +504,8 @@ main() {
   configure_claude       || warn "configuring Claude default mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
   link_brev_skill        || warn "linking Brev skill failed"
+  # Must run after link_dotfiles: the status line script lives in ~/.setup.
+  configure_claude_statusline || warn "configuring Claude status line failed"
   summary
 }
 

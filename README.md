@@ -9,6 +9,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
+- **claude/statusline.sh** — Claude Code status line showing session id and context usage (see below)
 - **webshell/** — Browser terminal (ttyd + tmux) with persistent sessions, clickable tabs, and copy-to-clipboard (see below)
 - **.agent/skills/** — Custom Claude Code skills (brev-cli, outlook-calendar, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
@@ -47,6 +48,30 @@ edits, use `"acceptEdits"`; for full skip-all-prompts mode, use
 After it finishes, open a new shell so PATH changes take effect. Run `claude`
 or `codex` to sign in, `brev login` to authenticate Brev, and `hf auth login`
 to authenticate Hugging Face.
+
+## Claude Code Status Line
+
+Claude Code has no built-in setting to always show the session id or context
+usage, but it pipes both to the status line command, so the bootstrap points
+`statusLine.command` at `~/.setup/claude/statusline.sh`:
+
+```
+Opus 5 · ~/setup · ctx 24% (248k/1M) · 2fa86bc7-74ec-4c0d-bcd4-12cdb70798be
+```
+
+Model, working directory, context-window usage, and the full session id — full
+rather than shortened so it can be pasted into `claude --resume <id>`. The
+percentage turns yellow at 50% and red at 80%. Older Claude Code versions that
+do not send `context_window` just drop that segment, and the line stays empty
+rather than erroring if `jq` is missing.
+
+Edit `claude/statusline.sh` to change what it renders; the bootstrap verifies
+on every run that the script is wired into `~/.claude/settings.json` and that
+it actually renders a sample payload. Delete the `statusLine` key from
+`~/.claude/settings.json` to undo. Like the permission mode above, this is
+Claude Code-specific — Codex CLI has no status line hook. The equivalent Codex
+workflow is `codex resume`, whose session picker (or `--last`) selects a past
+session without needing the id in front of you.
 
 ## Web Shell (browser terminal)
 

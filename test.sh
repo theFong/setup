@@ -41,4 +41,48 @@ if [ "$(cat "$scratch/home/.claude/settings.json")" != "not json" ]; then
   exit 1
 fi
 
+# configure_claude_statusline must fail when the repo-managed status line
+# script is missing, and must not write a statusLine key pointing at it.
+mkdir -p "$scratch/nostatusline/.claude"
+printf '{}\n' > "$scratch/nostatusline/.claude/settings.json"
+if (export HOME="$scratch/nostatusline"; configure_claude_statusline) >/dev/null 2>&1; then
+  echo "FAIL: configure_claude_statusline unexpectedly succeeded without its script" >&2
+  exit 1
+fi
+if jq -e 'has("statusLine")' "$scratch/nostatusline/.claude/settings.json" >/dev/null 2>&1; then
+  echo "FAIL: configure_claude_statusline wired up a missing script" >&2
+  exit 1
+fi
+
+# assert_claude_statusline must fail when settings.json does not reference the
+# script, and when the script exists but renders nothing usable.
+mkdir -p "$scratch/statusline"
+printf '{}\n' > "$scratch/statusline/settings.json"
+printf '#!/usr/bin/env bash\ncat >/dev/null\n' > "$scratch/statusline/statusline.sh"
+chmod +x "$scratch/statusline/statusline.sh"
+if assert_claude_statusline "$scratch/statusline/settings.json" "$scratch/statusline/statusline.sh" >/dev/null 2>&1; then
+  echo "FAIL: assert_claude_statusline passed with no statusLine in settings" >&2
+  exit 1
+fi
+jq --arg c "$scratch/statusline/statusline.sh" \
+  '.statusLine = {type: "command", command: $c}' \
+  "$scratch/statusline/settings.json" > "$scratch/statusline/settings.next"
+mv "$scratch/statusline/settings.next" "$scratch/statusline/settings.json"
+if assert_claude_statusline "$scratch/statusline/settings.json" "$scratch/statusline/statusline.sh" >/dev/null 2>&1; then
+  echo "FAIL: assert_claude_statusline passed for a script that renders nothing" >&2
+  exit 1
+fi
+
+# The real status line script must render the sample payload, and must stay
+# quiet (rather than erroring into the prompt) on input jq cannot parse.
+real_statusline="$(dirname "$0")/claude/statusline.sh"
+if ! printf '%s' "$STATUSLINE_SAMPLE" | "$real_statusline" | grep -q 'ctx 25%'; then
+  echo "FAIL: claude/statusline.sh did not render context usage for the sample payload" >&2
+  exit 1
+fi
+if [ -n "$(printf 'not json' | "$real_statusline" 2>&1)" ]; then
+  echo "FAIL: claude/statusline.sh emitted output for unparseable input" >&2
+  exit 1
+fi
+
 log "all negative tests passed"
