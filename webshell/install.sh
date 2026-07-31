@@ -49,6 +49,10 @@ MODE_EXPLICIT=0; IFACE_EXPLICIT=0; PORT_EXPLICIT=0
 [ -z "${WEBSHELL_MODE:-}" ]  || MODE_EXPLICIT=1
 [ -z "${WEBSHELL_IFACE:-}" ] || IFACE_EXPLICIT=1
 [ -z "${WEBSHELL_PORT:-}" ]  || PORT_EXPLICIT=1
+# The systemd unit this script owns. Overridable so mode adoption and the
+# deployed-mode assertion can be exercised against a scratch file with no root
+# and no systemd (see test.sh); nothing else should change it.
+UNIT="${WEBSHELL_UNIT:-/etc/systemd/system/ttyd.service}"
 WSUSER="${WEBSHELL_USER:-$(id -un)}"
 PASSWORD="${WEBSHELL_PASSWORD:-}"
 SESSION="${WEBSHELL_SESSION:-main}"
@@ -160,14 +164,25 @@ install_tmux_plugins() {
   fi
 }
 
+# Emit the installed unit's contents. Reads directly when the file is readable
+# (systemd units are, and a scratch UNIT in tests is too) and only falls back
+# to sudo otherwise, so unit parsing can be exercised without root.
+read_unit() {
+  # Always succeeds (empty output when there is no unit yet): callers pipe this
+  # into sed/grep under `set -o pipefail`, where a nonzero read would abort the
+  # script instead of letting them report a missing or malformed unit.
+  [ -f "$UNIT" ] || return 0
+  if [ -r "$UNIT" ]; then cat "$UNIT"; else $SUDO cat "$UNIT" 2>/dev/null || true; fi
+}
+
 # Re-runs must not change a deployed webshell's exposure: unless the caller
 # explicitly chose a mode (flag or WEBSHELL_MODE), adopt the mode, interface,
 # and port of the already-installed unit. A flagless re-run once flipped a
 # public (proxy-fronted) webshell to private and locked every client out.
 adopt_installed_mode() {
-  local unit="/etc/systemd/system/ttyd.service" exec_line="" val=""
-  if [ "$MODE_EXPLICIT" = 1 ] || [ ! -f "$unit" ]; then return 0; fi
-  exec_line=$($SUDO sed -n 's/^ExecStart=//p' "$unit" 2>/dev/null | head -1)
+  local exec_line="" val=""
+  if [ "$MODE_EXPLICIT" = 1 ] || [ ! -f "$UNIT" ]; then return 0; fi
+  exec_line=$(read_unit | sed -n 's/^ExecStart=//p' | head -1)
   if [ -z "$exec_line" ]; then return 0; fi
   case "$exec_line" in
     *--credential*) MODE="private" ;;
@@ -188,8 +203,8 @@ adopt_installed_mode() {
 # Populate WSUSER/PASSWORD from the credential in the installed unit, if any.
 # Returns nonzero when no credential is found.
 load_existing_credential() {
-  local unit="/etc/systemd/system/ttyd.service" existing=""
-  [ -f "$unit" ] && existing=$($SUDO sed -n 's/.*--credential \([^ ]*\).*/\1/p' "$unit" 2>/dev/null | head -1)
+  local existing=""
+  existing=$(read_unit | sed -n 's/.*--credential \([^ ]*\).*/\1/p' | head -1)
   [ -n "$existing" ] || return 1
   WSUSER="${existing%%:*}"
   PASSWORD="${existing#*:}"
@@ -247,7 +262,7 @@ EOF
 }
 
 install_service() {
-  local unit="/etc/systemd/system/ttyd.service"
+  local unit="$UNIT"
   compute_service_args
   local tmp; tmp=$(mktemp)
   render_unit > "$tmp"
@@ -292,13 +307,48 @@ verify() {
     [ "$code" = "200" ] || { warn "verify: expected HTTP 200 on $addr:$PORT, got '$code'"; fails=$((fails+1)); }
   fi
   # a ttyd restart must never take the tmux server (all shells) down with it
-  if ! $SUDO grep -q '^KillMode=process' /etc/systemd/system/ttyd.service 2>/dev/null; then
+  if ! read_unit | grep -q '^KillMode=process'; then
     warn "verify: ttyd.service missing KillMode=process (a restart would kill all shells)"
     fails=$((fails+1))
   fi
+  assert_deployed_mode || fails=$((fails+1))
   verify_session_restore || fails=$((fails+1))
   [ "$fails" -eq 0 ] || return 1
   log "verified: service active and serving on $addr:$PORT ($MODE mode)"
+}
+
+# The installed unit must match the mode this run intended. On a flagless
+# re-run that is what proves adoption actually held: the regression this
+# guards against is a deployed public (proxy-fronted) webshell silently
+# reverting to private, which rebinds it to 127.0.0.1 and locks every client
+# out. Private mode is the mirror image — losing --credential would publish an
+# unauthenticated shell. Runs on every install and every --verify-only.
+assert_deployed_mode() {
+  local exec_line
+  exec_line=$(read_unit | sed -n 's/^ExecStart=//p' | head -1)
+  if [ -z "$exec_line" ]; then
+    warn "verify: no ExecStart in $UNIT"
+    return 1
+  fi
+  case "$exec_line" in
+    *"--port $PORT"*) ;;
+    *) warn "verify: deployed unit does not serve port $PORT"; return 1 ;;
+  esac
+  if [ "$MODE" = "private" ]; then
+    case "$exec_line" in
+      *--credential*) ;;
+      *) warn "verify: private mode but no --credential in $UNIT (shell would be unauthenticated)"; return 1 ;;
+    esac
+  else
+    case "$exec_line" in
+      *--credential*) warn "verify: public mode but $UNIT still carries a --credential"; return 1 ;;
+    esac
+    case "$exec_line" in
+      *"--interface $IFACE"*) ;;
+      *) warn "verify: public mode expected --interface $IFACE in $UNIT"; return 1 ;;
+    esac
+  fi
+  log "verified: deployed unit matches $MODE mode on port $PORT"
 }
 
 # Session restore must actually work, not just be configured. Everything runs
