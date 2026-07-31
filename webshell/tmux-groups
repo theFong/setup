@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# tmux-groups — mouse-first "tab group" (tmux session) menus for the webshell.
+#
+# Invoked from mouse bindings in tmux.conf; every subcommand opens a clickable
+# display-menu at the mouse position on the client that fired the binding
+# (menus must be told their client explicitly: this script runs via run-shell,
+# whose own tmux calls have no implicit client).
+#
+#   menu <client>                groups: switch / new / rename / close
+#   tab-menu <window_id> <client>   per-tab: rename / close / move to group
+#   move-menu <window_id> <client>  pick the group a tab moves to
+#   close-group                  kill current session unless it is the last
+#
+# --print (before the subcommand) prints the generated menu arguments one per
+# line instead of opening the menu — used by install.sh verify and test.sh.
+#
+# Group names are used inside generated tmux commands; quotes are stripped
+# from them there to keep the quoting unambiguous (rename prompts already
+# accept anything — only the generated menu commands sanitize).
+
+set -euo pipefail
+
+PRINT=0
+if [ "${1:-}" = "--print" ]; then PRINT=1; shift; fi
+CMD="${1:-}"
+[ -n "$CMD" ] || { echo "usage: tmux-groups [--print] <menu|tab-menu|move-menu|close-group> ..." >&2; exit 1; }
+shift
+
+open_menu() {
+  local client="$1"; shift
+  if [ "$PRINT" = 1 ]; then
+    printf '%s\n' "$@"
+  else
+    tmux display-menu -c "$client" -x M -y S "$@"
+  fi
+}
+
+# strip quote characters from a group name before embedding it in a command
+safe() { local s="${1//\'/}"; printf '%s' "${s//\"/}"; }
+
+current_session() { tmux display-message -p '#{session_name}'; }
+
+groups_menu() {
+  local client="${1:-}" cur name wins items=()
+  [ -n "$client" ] || { echo "tmux-groups menu: missing client" >&2; exit 1; }
+  cur=$(current_session)
+  while IFS=$'\t' read -r name wins; do
+    if [ "$name" = "$cur" ]; then
+      items+=("-⬢ $name ($wins tabs)" "" "")
+    else
+      items+=("  $name ($wins tabs)" "" "switch-client -c '$client' -t '$(safe "$name")'")
+    fi
+  done < <(tmux list-sessions -F '#{session_name}	#{session_windows}')
+  items+=("" "" "")
+  items+=("＋ new group…" n "command-prompt -p 'new group name:' \"new-session -d -s '%%' ; switch-client -t '%%'\"")
+  items+=("✎ rename group…" r "command-prompt -I '#S' -p 'rename group:' \"rename-session -- '%%'\"")
+  items+=("✕ close group" x "confirm-before -p 'close group #S and all its tabs? (y/n)' 'run-shell \"/usr/local/bin/tmux-groups close-group\"'")
+  open_menu "$client" -T " groups " "${items[@]}"
+}
+
+tab_menu() {
+  local win="${1:-}" client="${2:-}"
+  [ -n "$win" ] && [ -n "$client" ] || { echo "tmux-groups tab-menu: missing window/client" >&2; exit 1; }
+  open_menu "$client" -T " tab " \
+    "✎ rename…" r "command-prompt -p 'rename tab:' \"rename-window -t '$win' -- '%%'\"" \
+    "⇢ move to group…" m "run-shell -b '/usr/local/bin/tmux-groups move-menu $win $client'" \
+    "" "" "" \
+    "✕ close" x "confirm-before -p 'close this tab? (y/n)' 'kill-window -t \"$win\"'"
+}
+
+move_menu() {
+  local win="${1:-}" client="${2:-}" home name items=()
+  [ -n "$win" ] && [ -n "$client" ] || { echo "tmux-groups move-menu: missing window/client" >&2; exit 1; }
+  home=$(tmux display-message -t "$win" -p '#{session_name}')
+  while IFS= read -r name; do
+    [ "$name" = "$home" ] && continue
+    items+=("  $name" "" "move-window -s '$win' -t '$(safe "$name"):'")
+  done < <(tmux list-sessions -F '#{session_name}')
+  items+=("" "" "")
+  items+=("＋ new group…" n "command-prompt -p 'new group name:' \"new-session -d -s '%%' ; move-window -s $win -t '%%:'\"")
+  open_menu "$client" -T " move tab to " "${items[@]}"
+}
+
+close_group() {
+  if [ "$(tmux list-sessions | wc -l)" -le 1 ]; then
+    tmux display-message "can't close the last group"
+  else
+    tmux kill-session
+  fi
+}
+
+case "$CMD" in
+  menu)        groups_menu "$@" ;;
+  tab-menu)    tab_menu "$@" ;;
+  move-menu)   move_menu "$@" ;;
+  close-group) close_group ;;
+  *) echo "tmux-groups: unknown subcommand '$CMD'" >&2; exit 1 ;;
+esac
