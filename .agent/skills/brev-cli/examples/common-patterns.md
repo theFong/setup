@@ -234,9 +234,13 @@ brev port-forward my-box -p 8888:8888
 brev create my-cluster --count 3 --type g5.xlarge
 ```
 
+> **Terminology.** "Cluster nodes" here means the multiple *instances* created by
+> `--count`. That is a different thing from Brev **external nodes**, which are
+> registered physical machines listed by `brev ls nodes` — see the next section.
+
 ### Run Command on All Cluster Nodes
 ```bash
-# Run nvidia-smi on all nodes
+# Run nvidia-smi on all instances in the cluster
 brev shell my-cluster-1 my-cluster-2 my-cluster-3 -c "nvidia-smi"
 
 # Or pipe from create
@@ -247,6 +251,61 @@ brev create my-cluster --count 3 | brev shell -c "nvidia-smi"
 ```bash
 brev open my-cluster-1 my-cluster-2 my-cluster-3 cursor
 ```
+
+## External Node Patterns
+
+External nodes are physical machines registered to the org. They are listed only by
+`brev ls nodes` — never by `brev ls`, and not by `brev ls --all` either.
+
+### Inventory
+```bash
+# Human-readable
+brev ls nodes
+
+# Just the names
+brev ls nodes --json | jq -r '.[].name'
+
+# Only the reachable ones
+brev ls nodes --json | jq -r '.[] | select(.status=="Connected") | .name'
+
+# Anything that dropped off
+brev ls nodes --json | jq -r '.[] | select(.status!="Connected") | "\(.name) -> \(.status)"'
+```
+
+### Health check across the fleet
+```bash
+# Exit non-zero if any node is disconnected -- safe in a cron or CI job
+brev ls nodes --json | jq -e 'all(.[]; .status=="Connected")' >/dev/null \
+  || { echo "WARNING: node(s) disconnected"; brev ls nodes; }
+```
+
+### Fan out over SSH
+`brev refresh` writes node names into `~/.brev/ssh_config`, so they work as plain
+SSH aliases. `brev shell` is not required.
+
+```bash
+for n in $(brev ls nodes --json | jq -r '.[] | select(.status=="Connected") | .name'); do
+  printf '\n== %s\n' "$n"
+  ssh -o BatchMode=yes "$n" 'nvidia-smi --query-gpu=name,memory.total --format=csv,noheader'
+done
+```
+
+### Combined view
+There is no single command for "everything in the org" — `--all` does not deliver it.
+
+```bash
+echo "--- instances"; brev ls
+echo "--- nodes";     brev ls nodes
+
+# Every machine name in the org, one per line. Note the two different jq paths:
+# `ls nodes --json` is a bare array, `ls --json` wraps rows in .workspaces.
+{ brev ls --json | jq -r '.workspaces[].name'
+  brev ls nodes --json | jq -r '.[].name'; } | sort
+```
+
+**Do not pipe nodes into lifecycle commands.** `brev stop`, `brev start` and
+`brev delete` operate on instances. External nodes are hardware Brev doesn't own;
+treat their workloads as production unless you know otherwise.
 
 ## File Transfer Patterns
 

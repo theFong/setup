@@ -132,17 +132,102 @@ brev search --gpu-name H100 --max-boot-time 3
 ```
 
 ### brev ls
-List instances in active org.
+List instances in active org. Has three subcommands covering **two separate
+namespaces** — cloud instances and external nodes.
 
 ```bash
-brev ls [flags]
+brev ls [subcommand] [flags]
 ```
+
+**Subcommands:**
+| Subcommand | Lists | Notes |
+|---|---|---|
+| *(none)* | cloud instances | identical to `brev ls instances` |
+| `instances` | cloud instances | VMs Brev provisioned for you |
+| `nodes` | **external nodes only** | physical/on-prem machines registered to the org |
+| `orgs` | organizations | same as `brev org ls` |
 
 **Flags:**
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--org` | `-o` | Override active org |
-| `--all` | | Show all instances in org |
+| `--all` | | Documented as "show all instances and external nodes in org" |
+| `--json` | | Machine-readable output |
+
+#### Instances vs. nodes
+
+They are disjoint lists. A node **never** appears in `brev ls`, and the two use
+different status vocabularies:
+
+```bash
+$ brev ls                                    # cloud instances
+ NAME           STATUS   BUILD      SHELL  ID         MACHINE          GPU
+ head           RUNNING  COMPLETED  READY  jmorx0saw  n2d-standard-2   -
+
+$ brev ls nodes                              # external nodes
+ NAME     STATUS
+ spark-1  Connected
+```
+
+| | `brev ls` | `brev ls nodes` |
+|---|---|---|
+| Status values | `RUNNING` / `STOPPED` | `Connected` / `Disconnected` |
+| Columns | NAME, STATUS, BUILD, SHELL, ID, MACHINE, GPU | NAME, STATUS only |
+| Has an instance ID | yes | no |
+| `ssh_config` entries | two (`name` and `name-host`) | one (`name`) |
+| Accepts `stop`/`start`/`delete` | yes | no — lifecycle is not Brev's to manage |
+
+**Gotcha — `--all` does not merge the two lists.** Despite the help text saying
+"show all instances and external nodes in org", `brev ls --all` returns exactly
+the same rows as `brev ls` (verified on v0.6.329). To see everything you must run
+both commands. Do not use `--all` as a substitute for `brev ls nodes`.
+
+**Gotcha — piped output is not names-only.** `brev ls --help` claims that when
+stdout is piped it emits bare instance names, one per line. On v0.6.329 it still
+emits the full table including the `Org X has N instances` banner and the header
+row. This is why every pipeline in this reference goes through `awk '{print $1}'`
+rather than piping `brev ls` straight into `brev stop`.
+
+#### Scripting against nodes
+
+`--json` is the stable interface. Node objects carry only three fields — there is
+no IP, hardware, or GPU information, so anything richer has to come from the node
+itself over SSH.
+
+**The two `--json` shapes differ — a common scripting trap.** `brev ls nodes --json`
+returns a bare array, but `brev ls --json` returns an object wrapping the rows under
+`.workspaces`. The same jq expression will not work on both, and the failure is
+`Cannot index array with string "name"`:
+
+```bash
+brev ls nodes --json | jq -r '.[].name'            # nodes: top-level array
+brev ls       --json | jq -r '.workspaces[].name'  # instances: wrapped in .workspaces
+```
+
+```bash
+# All node names
+brev ls nodes --json | jq -r '.[].name'
+
+# Only the ones actually reachable
+brev ls nodes --json | jq -r '.[] | select(.status=="Connected") | .name'
+
+# Alert on anything that dropped off the mesh
+brev ls nodes --json | jq -e 'all(.[]; .status=="Connected")' >/dev/null \
+  || echo "WARNING: a node is disconnected"
+
+# Fan a read-only command out across every connected node
+for n in $(brev ls nodes --json | jq -r '.[] | select(.status=="Connected") | .name'); do
+  echo "== $n"; ssh "$n" 'nvidia-smi --query-gpu=name --format=csv,noheader'
+done
+```
+
+Node names double as SSH host aliases, because `brev refresh` writes them into
+`~/.brev/ssh_config` (which `~/.ssh/config` Includes). So `ssh spark-1` works
+directly — `brev shell` is not required.
+
+**`Connected` means registered, not reachable.** It reflects the node's control-plane
+registration. A node can report `Connected` while SSH hangs, usually a stale gateway
+port mapping; see Troubleshooting in SKILL.md.
 
 ### brev delete
 Delete instances. Supports multiple names and stdin piping.
