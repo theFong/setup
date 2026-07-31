@@ -83,9 +83,10 @@ session without needing the id in front of you.
 
 ## Web Shell (browser terminal)
 
-A tmux-backed terminal in the browser: sessions survive refresh/disconnect,
-the status bar acts as clickable tabs (`+ new shell` / `✕ close`, double-click
-to rename), and highlight-to-copy lands on your local clipboard via OSC 52.
+A tmux-backed terminal in the browser: sessions survive refresh/disconnect
+(and their layout survives reboots), the status bar acts as clickable tabs
+(`+ new shell` / `✕ close`, double-click to rename), and highlight-to-copy
+lands on your local clipboard via OSC 52.
 
 ```bash
 ~/.setup/webshell/install.sh              # private (default): 127.0.0.1 + password
@@ -98,8 +99,10 @@ to rename), and highlight-to-copy lands on your local clipboard via OSC 52.
 `wt0`) with no password and assumes an authenticating HTTPS proxy in front —
 don't use it without one. Flags: `--iface`, `--port`, `--session`,
 `--force-build`; env: `WEBSHELL_*`. `--verify-only` health-checks an existing
-install (service active, HTTP serving, auth enforced) and exits nonzero on
-failure — CI runs it, and it works as a cron/liveness probe too.
+install (service active, HTTP serving, auth enforced, the deployed unit still
+matching the intended mode/interface/port, `KillMode=process` present, and
+session restore actually working) and exits nonzero on failure — CI runs it,
+and it works as a cron/liveness probe too.
 
 Notes baked into the setup (hard-won):
 - ttyd is **built from source** — release/apt builds bundle an xterm.js
@@ -109,6 +112,18 @@ Notes baked into the setup (hard-won):
   straight to the client tty.
 - Clipboard needs a secure context (https or localhost) and the page focused.
 - `~/.tmux.conf` is symlinked to `webshell/tmux.conf`.
+- Reboots restore your windows macOS-Terminal-style: tmux-resurrect +
+  tmux-continuum (via tpm) auto-save layout, working dirs, and visible pane
+  text every 15 min and replay them when the tmux server next starts —
+  `ttyd.service` starts one on connect, so just reopen the webshell.
+  Processes are **not** resumed; panes reopen as fresh shells. Manual
+  save/restore: `prefix + Ctrl-s` / `prefix + Ctrl-r`.
+- `ttyd.service` uses `KillMode=process`: restarting/upgrading ttyd only
+  bounces the browser connection — the tmux server (your shells) survives.
+  Continuum only auto-saves/restores when its server is the machine's sole
+  tmux server, so scratch servers on other sockets don't clobber saves.
+- Re-running the installer keeps the deployed mode, interface, and port
+  unless you pass `--private`/`--public` (or `WEBSHELL_*`) explicitly.
 
 ## North/South Internet Check
 
