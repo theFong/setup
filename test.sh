@@ -242,4 +242,87 @@ if ./webshell/tmux-groups --print bogus-subcommand >/dev/null 2>&1; then
   exit 1
 fi
 
+# assert_runs must reject a binary that resolves on PATH but does not execute
+# (truncated download, broken venv shim, wrong-architecture build) — the case
+# assert_installed cannot see.
+mkdir -p "$scratch/brokenbin"
+printf '#!/usr/bin/env bash\nexit 3\n' > "$scratch/brokenbin/setup-broken-tool"
+chmod +x "$scratch/brokenbin/setup-broken-tool"
+FAILED=""
+if assert_runs "broken test tool" broken-test-tool "$scratch/brokenbin/setup-broken-tool" --version >/dev/null 2>&1; then
+  echo "FAIL: assert_runs accepted a binary that exits nonzero" >&2
+  exit 1
+fi
+if summary >/dev/null 2>&1; then
+  echo "FAIL: summary returned zero after a tool failed to run" >&2
+  exit 1
+fi
+FAILED=""
+
+# assert_skill_links must reject a dangling symlink: link_brev_skill's
+# create-if-absent guard is satisfied by a broken link, which would leave every
+# agent silently without the skill.
+mkdir -p "$scratch/skillhome/.claude/skills" "$scratch/skillhome/.codex/skills" "$scratch/skillhome/.agents/skills"
+ln -s "$scratch/does-not-exist" "$scratch/skillhome/.claude/skills/brev-cli"
+if (export HOME="$scratch/skillhome"; assert_skill_links) >/dev/null 2>&1; then
+  echo "FAIL: assert_skill_links accepted a dangling skill symlink" >&2
+  exit 1
+fi
+
+# webshell/install.sh must refuse a non-Linux host, and refuse it before
+# installing anything. A uname shim makes this runnable on any platform; the
+# guard is the second thing main() does, so a scratch HOME must come back
+# untouched (the real /usr/local/bin cannot be asserted on — a machine running
+# this may legitimately have the webshell installed already).
+mkdir -p "$scratch/fakebin" "$scratch/wsguard"
+printf '#!/usr/bin/env bash\necho Darwin\n' > "$scratch/fakebin/uname"
+chmod +x "$scratch/fakebin/uname"
+# SETUP_SKIP_MAIN is exported at the top of this file so functions can be
+# sourced; it must be unset here or the installer would skip main() and exit 0,
+# making this test pass for entirely the wrong reason.
+if (
+  export PATH="$scratch/fakebin:$PATH" HOME="$scratch/wsguard"
+  unset SETUP_SKIP_MAIN
+  ./webshell/install.sh
+) >/dev/null 2>&1; then
+  echo "FAIL: webshell installer ran on a non-Linux host" >&2
+  exit 1
+fi
+if [ -n "$(ls -A "$scratch/wsguard" 2>/dev/null)" ]; then
+  echo "FAIL: webshell installer touched HOME before refusing an unsupported platform" >&2
+  exit 1
+fi
+
+# verify() must reject a private-mode webshell that answers unauthenticated
+# requests — the "shell exposed with no password" regression, and the check
+# that used to live as a curl assertion in the workflow. A throwaway HTTP
+# server stands in for a broken ttyd: it returns 200 where verify() demands
+# 401, so this also proves verify() is not a no-op. Needs python3; skipped
+# where it is absent.
+if command -v python3 >/dev/null 2>&1; then
+  ws_port=39998
+  python3 -m http.server "$ws_port" --bind 127.0.0.1 --directory "$scratch" >/dev/null 2>&1 &
+  ws_srv=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -s -o /dev/null -m 1 "http://127.0.0.1:$ws_port/" && break
+    sleep 0.3
+  done
+  printf '[Service]\nExecStart=/usr/local/bin/ttyd --interface 127.0.0.1 --credential u:p --port %s --writable tmux new -A -s main\nKillMode=process\n' \
+    "$ws_port" > "$scratch/ttyd-open.service"
+  if (
+    export WEBSHELL_UNIT="$scratch/ttyd-open.service" SETUP_SKIP_MAIN=1
+    source ./webshell/install.sh
+    MODE=private; PORT="$ws_port"; WSUSER=u; PASSWORD=p
+    verify
+  ) >/dev/null 2>&1; then
+    kill "$ws_srv" 2>/dev/null || true
+    echo "FAIL: verify() accepted a private webshell serving unauthenticated requests" >&2
+    exit 1
+  fi
+  kill "$ws_srv" 2>/dev/null || true
+  wait "$ws_srv" 2>/dev/null || true
+else
+  echo "skip: python3 not available; webshell auth-enforcement test not run" >&2
+fi
+
 log "all negative tests passed"

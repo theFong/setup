@@ -75,57 +75,26 @@ jobs:
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
 
-      - name: Verify tools and Brev skill
-        run: |
-          for tool in claude codex brev hf opencode git gh jq rg fzf wget curl htop tmux go speedtest; do
-            command -v "$tool"
-          done
-
-          claude --version
-          codex --version
-          brev --version
-          HF_HUB_DISABLE_UPDATE_CHECK=1 hf version
-          opencode --version
-          go version
-          speedtest --version
-
-          test -e "$HOME/.claude/skills/brev-cli/SKILL.md"
-          test -e "$HOME/.codex/skills/brev-cli/SKILL.md"
-          test -e "$HOME/.agents/skills/brev-cli/SKILL.md"
-
+      # No success-path assertions here: install.sh proves its own results on
+      # every run (assert_installed / assert_runs / assert_* helpers) and exits
+      # nonzero if anything is missing or does not execute, so running it IS
+      # the check. Negative tests live in test.sh. See STYLE_GUIDE.md.
       - name: Verify bootstrap is safe to re-run
         run: bash install.sh
 
       # Webshell (Linux-only: requires systemd). The installer's built-in
-      # verify fails nonzero unless the service is active, unauthenticated
-      # requests get 401, and the credential gets 200; the curl checks below
-      # re-assert that independently of the script under test.
+      # verify() fails nonzero unless the service is active, the deployed unit
+      # matches the intended mode, auth is enforced, and session restore works.
       - name: Install webshell (private mode)
         if: runner.os == 'Linux'
         run: WEBSHELL_PASSWORD=ci-test-password webshell/install.sh
 
-      - name: Verify webshell auth enforcement
+      - name: Verify webshell health check passes standalone
         if: runner.os == 'Linux'
-        run: |
-          systemctl is-active ttyd
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7681/)" = "401"
-          test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
-          webshell/install.sh --verify-only
+        run: webshell/install.sh --verify-only
 
       - name: Verify webshell is safe to re-run (password not rotated)
         if: runner.os == 'Linux'
         run: |
           webshell/install.sh | tee rerun.log
           grep -q "ttyd.service unchanged" rerun.log
-          test "$(curl -s -o /dev/null -w '%{http_code}' -u "$(id -un):ci-test-password" http://127.0.0.1:7681/)" = "200"
-
-      - name: Verify webshell refuses unsupported platforms cleanly
-        if: runner.os == 'macOS'
-        run: |
-          if webshell/install.sh; then
-            echo "webshell install unexpectedly succeeded on macOS" >&2
-            exit 1
-          fi
-          # the guard must fire before anything is installed
-          test ! -e /usr/local/bin/tmux-clip
-          test ! -e "$HOME/.tmux.conf"

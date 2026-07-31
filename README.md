@@ -28,13 +28,18 @@ then clones this repo to `~/.setup` and symlinks the Claude config into
 `~/.claude`. It works on macOS (Homebrew) and Linux (apt/dnf/apk), and is safe
 to re-run — anything already present is skipped.
 
-Each install is verified by checking that its expected command is available on
-`PATH`. The bootstrap continues attempting the remaining tools after a failure,
-then exits nonzero if anything is still missing.
+Each install is verified twice: the expected command must be on `PATH`, and the
+CLIs this bootstrap exists to install must actually execute (`assert_runs`
+invokes each one's version command, since a truncated download or a
+wrong-architecture build still satisfies `command -v`). The bootstrap continues
+attempting the remaining tools after a failure, then exits nonzero if anything
+is still missing or does not run.
 
 The repo-managed Brev skill is linked into Claude Code (`~/.claude/skills`),
 Codex (`~/.codex/skills`), and the shared agent skill directory
-(`~/.agents/skills`). Existing Brev skill installations are preserved.
+(`~/.agents/skills`), and each path is then checked to resolve to a readable
+`SKILL.md` — a dangling symlink would otherwise leave every agent silently
+without the skill. Existing Brev skill installations are preserved.
 
 It also sets Claude Code's default permission mode to **auto mode** by writing
 `"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`
