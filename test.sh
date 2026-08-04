@@ -242,4 +242,51 @@ if ./webshell/tmux-groups --print bogus-subcommand >/dev/null 2>&1; then
   exit 1
 fi
 
+# Agent skills: assert_agent_skill must fail when a skill is not readable
+# through every agent directory, rather than reporting a clean link. Run against
+# a scratch HOME so the real skill installation is never consulted or touched.
+mkdir -p "$scratch/skillhome"
+if (export HOME="$scratch/skillhome"; assert_agent_skill cluster-ops) >/dev/null 2>&1; then
+  echo "FAIL: assert_agent_skill unexpectedly passed for an uninstalled skill" >&2
+  exit 1
+fi
+
+# cluster-ops: assert_cluster_probe must fail when the probe script is missing.
+# A skill that ships a broken or absent discovery script would only fail later,
+# mid-survey against someone's production fleet.
+if (export HOME="$scratch/skillhome"; assert_cluster_probe) >/dev/null 2>&1; then
+  echo "FAIL: assert_cluster_probe unexpectedly passed with no probe script" >&2
+  exit 1
+fi
+
+# cluster-ops: probe-cluster.sh must reject misuse instead of silently sweeping
+# nothing. Both paths exit before any SSH is attempted.
+probe=.agent/skills/cluster-ops/scripts/probe-cluster.sh
+if bash "$probe" >/dev/null 2>&1; then
+  echo "FAIL: probe-cluster.sh with no hosts unexpectedly succeeded" >&2
+  exit 1
+fi
+if bash "$probe" --bogus-option >/dev/null 2>&1; then
+  echo "FAIL: probe-cluster.sh unknown option unexpectedly succeeded" >&2
+  exit 1
+fi
+
+# cluster-ops: an unreachable host must be RECORDED and must make the sweep
+# exit nonzero. Dropping it silently would leave a node missing from an
+# inventory that reads as complete. .invalid never resolves (RFC 2606), so this
+# fails fast and touches no real host.
+if command -v ssh >/dev/null 2>&1; then
+  probe_out="$scratch/probe.json"
+  if bash "$probe" -t 2 -o "$probe_out" no-such-host.invalid >/dev/null 2>&1; then
+    echo "FAIL: probe-cluster.sh returned zero despite an unreachable host" >&2
+    exit 1
+  fi
+  if ! grep -q '"error"' "$probe_out" 2>/dev/null; then
+    echo "FAIL: probe-cluster.sh did not record an entry for the failed host" >&2
+    exit 1
+  fi
+else
+  echo "skip: ssh not available; probe unreachable-host test not run" >&2
+fi
+
 log "all negative tests passed"
