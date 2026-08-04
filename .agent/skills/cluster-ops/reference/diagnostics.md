@@ -67,6 +67,16 @@ calls and 15-second scrapes. **Never put NCCL or any collective on the overlay.*
 
 ### 1.4 When the vendor SSH path breaks, jump via a LAN peer
 
+**A control plane reporting `Connected` means registered, not reachable.** Treat
+the two as independent facts. Cheap remedies first, in order:
+
+1. **Re-sync the generated SSH config** — gateway ports rotate, so a host that
+   worked yesterday resolves to a dead port today (`brev refresh`, or your
+   provider's equivalent).
+2. **Re-register the node's overlay agent** — `systemctl restart netbird` on the
+   node clears a stale gateway mapping.
+3. If both fail, the gateway path itself is broken. Jump via a LAN peer, below.
+
 If `ssh <node>` dies with `kex_exchange_identification: Connection closed by
 remote host` but the control plane still reports the node connected, the gateway
 path is broken, not the node. Reach it over the LAN through a peer that still

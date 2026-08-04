@@ -16,6 +16,7 @@
 # Usage:
 #   probe-cluster.sh [options] HOST [HOST...]
 #   probe-cluster.sh [options] --hosts-file FILE
+#   probe-cluster.sh [options] --brev
 #   probe-cluster.sh --self-test
 #
 # Options:
@@ -24,16 +25,25 @@
 #   -T SECS           per-host wall-clock timeout (default 90)
 #   -u USER           force this SSH user for every host
 #   --hosts-file F    read hosts from F (one per line, # comments allowed)
+#   --brev            enumerate physical nodes from `brev ls nodes`
+#   --brev-instances  enumerate cloud instances from `brev ls`
 #   --include-local   also probe the machine this runs on, as host "local"
 #   --self-test       probe the local machine and assert the output is
 #                     well-formed; prints nothing but a verdict
 #   -h, --help        this text
 #
+# Sources combine, so `--brev --brev-instances extra-host` sweeps the whole
+# fleet plus anything the control plane does not know about.
+#
 # Exit status: 0 if every host was probed, 1 if any host failed (the JSON
 # still contains an entry for it, with an "error" field).
 #
 # Hosts are whatever `ssh <name>` already resolves — an ~/.ssh/config alias, a
-# hostname, or user@host. Fix SSH first; this script does not manage keys.
+# hostname, or user@host. Brev node and instance names double as SSH aliases
+# because `brev refresh` writes them into ~/.brev/ssh_config, which
+# ~/.ssh/config Includes. If a host stops resolving, run `brev refresh` — this
+# script will not, because it stays read-only. Fix SSH first; this script does
+# not manage keys.
 
 set -uo pipefail
 
@@ -43,6 +53,8 @@ OUT=""
 FORCE_USER=""
 INCLUDE_LOCAL=0
 SELF_TEST=0
+BREV_NODES=0
+BREV_INSTANCES=0
 # Newline-delimited rather than an array: macOS ships bash 3.2, where expanding
 # an empty array under `set -u` is an unbound-variable error.
 HOSTS=""
@@ -249,6 +261,49 @@ error_entry() {
   printf '  {\n    "host": "%s",\n    "error": "%s"\n  }' "$1" "$2"
 }
 
+# enumerate_brev nodes|instances — take the host list from the brev control
+# plane. Node and instance names double as SSH aliases, so what this returns is
+# directly probe-able. Read-only: it lists, it does not refresh or mutate.
+enumerate_brev() {
+  local kind="$1" json filter names down
+  command -v brev >/dev/null 2>&1 || die "--brev needs the brev CLI on PATH (see the brev-cli skill)"
+  command -v jq   >/dev/null 2>&1 || die "--brev needs jq on PATH"
+
+  if [ "$kind" = nodes ]; then
+    json=$(brev ls nodes --json 2>/dev/null)
+    # `brev ls nodes --json` is a BARE ARRAY, while `brev ls --json` wraps its
+    # rows under .workspaces. Using either filter on the other output fails with
+    # 'Cannot index array with string "name"'.
+    filter='.[]'
+  else
+    json=$(brev ls --json 2>/dev/null)
+    filter='.workspaces[]'
+  fi
+
+  printf '%s' "$json" | jq -e . >/dev/null 2>&1 \
+    || die "brev ls $kind did not return JSON — is 'brev login' done?"
+
+  if [ "$kind" = nodes ]; then
+    # `Connected` is control-plane registration, not reachability. Probe the
+    # disconnected ones anyway: a node that cannot be reached belongs in the
+    # inventory as unverified, not omitted. Naming them now saves waiting out
+    # a timeout to discover which they were.
+    down=$(printf '%s' "$json" | jq -r '.[] | select(.status != "Connected") | "\(.name)=\(.status)"')
+    [ -n "$down" ] && warn "not Connected per brev: $(printf '%s' "$down" | tr '\n' ' ')"
+  fi
+
+  names=$(printf '%s' "$json" | jq -r "$filter | .name" 2>/dev/null)
+  if [ -z "$names" ]; then
+    warn "brev returned no $kind"
+    return 0
+  fi
+  while IFS= read -r nm; do
+    [ -n "$nm" ] && add_host "$nm"
+  done <<EOF
+$names
+EOF
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) OUT="${2-}"; shift 2 ;;
@@ -262,6 +317,8 @@ while [ $# -gt 0 ]; do
         [ -n "$line" ] && add_host "$line"
       done < "$2"
       shift 2 ;;
+    --brev) BREV_NODES=1; shift ;;
+    --brev-instances) BREV_INSTANCES=1; shift ;;
     --include-local) INCLUDE_LOCAL=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -308,6 +365,8 @@ if [ "$SELF_TEST" = 1 ]; then
   exit "$status"
 fi
 
+[ "$BREV_NODES" = 1 ] && enumerate_brev nodes
+[ "$BREV_INSTANCES" = 1 ] && enumerate_brev instances
 [ "$INCLUDE_LOCAL" = 1 ] && add_host "local"
 [ -n "$HOSTS" ] || { usage; die "no hosts given"; }
 
@@ -348,5 +407,9 @@ else
   printf '%s\n' "$buf"
 fi
 
-[ "$failed" = 0 ] || warn "one or more hosts failed to probe; see \"error\" entries"
+if [ "$failed" != 0 ]; then
+  warn "one or more hosts failed to probe; see \"error\" entries"
+  warn "if a host that should exist stopped resolving, run 'brev refresh' (gateway"
+  warn "ports rotate) and re-probe. Record anything still unreachable as unverified."
+fi
 exit "$failed"
