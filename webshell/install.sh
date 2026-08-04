@@ -4,8 +4,8 @@
 #
 # Installs ttyd (built from source: release/distro builds bundle an xterm.js
 # with no OSC 52 handler, so copy-to-clipboard silently fails), links this
-# directory's tmux.conf to ~/.tmux.conf, installs the tmux-clip and
-# tmux-groups helpers, installs tmux plugins (tpm + resurrect + continuum:
+# directory's tmux.conf to ~/.tmux.conf, installs the tmux-clip, tmux-groups
+# and tmux-files helpers, installs tmux plugins (tpm + resurrect + continuum:
 # layout, cwds, and visible text survive reboots — processes do not), and
 # sets up a systemd service. Sessions are tmux-backed, so a browser refresh
 # (or full disconnect) reattaches to the same shells.
@@ -49,6 +49,10 @@ MODE_EXPLICIT=0; IFACE_EXPLICIT=0; PORT_EXPLICIT=0
 [ -z "${WEBSHELL_MODE:-}" ]  || MODE_EXPLICIT=1
 [ -z "${WEBSHELL_IFACE:-}" ] || IFACE_EXPLICIT=1
 [ -z "${WEBSHELL_PORT:-}" ]  || PORT_EXPLICIT=1
+# The systemd unit this script owns. Overridable so mode adoption and the
+# deployed-mode assertion can be exercised against a scratch file with no root
+# and no systemd (see test.sh); nothing else should change it.
+UNIT="${WEBSHELL_UNIT:-/etc/systemd/system/ttyd.service}"
 WSUSER="${WEBSHELL_USER:-$(id -un)}"
 PASSWORD="${WEBSHELL_PASSWORD:-}"
 SESSION="${WEBSHELL_SESSION:-main}"
@@ -165,10 +169,10 @@ install_tmux_plugins() {
 
 # Sourcing the conf resets status-right, dropping continuum's auto-save hook,
 # and continuum will not put it back: it arms only when it believes it is the
-# machine's sole tmux, and the `tmux source-file` command driving the reload
-# is itself counted as another tmux process. Left alone, a live box silently
-# stops auto-saving until its next server start. Re-add the interpolation
-# directly (exactly what continuum's own arming does).
+# machine's sole tmux, and the `tmux source-file` command driving the reload is
+# itself counted as another tmux process. Left alone, a live box silently stops
+# auto-saving until its next server start. Re-add the interpolation directly —
+# exactly what continuum's own arming does.
 rearm_continuum() {
   local save_script="$HOME/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh" cur
   [ -x "$save_script" ] || return 0
@@ -181,14 +185,25 @@ rearm_continuum() {
   esac
 }
 
+# Emit the installed unit's contents. Reads directly when the file is readable
+# (systemd units are, and a scratch UNIT in tests is too) and only falls back
+# to sudo otherwise, so unit parsing can be exercised without root.
+read_unit() {
+  # Always succeeds (empty output when there is no unit yet): callers pipe this
+  # into sed/grep under `set -o pipefail`, where a nonzero read would abort the
+  # script instead of letting them report a missing or malformed unit.
+  [ -f "$UNIT" ] || return 0
+  if [ -r "$UNIT" ]; then cat "$UNIT"; else $SUDO cat "$UNIT" 2>/dev/null || true; fi
+}
+
 # Re-runs must not change a deployed webshell's exposure: unless the caller
 # explicitly chose a mode (flag or WEBSHELL_MODE), adopt the mode, interface,
 # and port of the already-installed unit. A flagless re-run once flipped a
 # public (proxy-fronted) webshell to private and locked every client out.
 adopt_installed_mode() {
-  local unit="/etc/systemd/system/ttyd.service" exec_line="" val=""
-  if [ "$MODE_EXPLICIT" = 1 ] || [ ! -f "$unit" ]; then return 0; fi
-  exec_line=$($SUDO sed -n 's/^ExecStart=//p' "$unit" 2>/dev/null | head -1)
+  local exec_line="" val=""
+  if [ "$MODE_EXPLICIT" = 1 ] || [ ! -f "$UNIT" ]; then return 0; fi
+  exec_line=$(read_unit | sed -n 's/^ExecStart=//p' | head -1)
   if [ -z "$exec_line" ]; then return 0; fi
   case "$exec_line" in
     *--credential*) MODE="private" ;;
@@ -209,8 +224,8 @@ adopt_installed_mode() {
 # Populate WSUSER/PASSWORD from the credential in the installed unit, if any.
 # Returns nonzero when no credential is found.
 load_existing_credential() {
-  local unit="/etc/systemd/system/ttyd.service" existing=""
-  [ -f "$unit" ] && existing=$($SUDO sed -n 's/.*--credential \([^ ]*\).*/\1/p' "$unit" 2>/dev/null | head -1)
+  local existing=""
+  existing=$(read_unit | sed -n 's/.*--credential \([^ ]*\).*/\1/p' | head -1)
   [ -n "$existing" ] || return 1
   WSUSER="${existing%%:*}"
   PASSWORD="${existing#*:}"
@@ -251,10 +266,9 @@ $EXTRA_UNIT
 [Service]
 Type=simple
 User=$WSUSER
-# Attach to the most recently used session so a reconnect lands in the tab
-# group you were in, not always "$SESSION"; fall back to creating it on a
-# fresh server (first boot — continuum then restores all groups).
-ExecStart=/usr/local/bin/ttyd $BIND_ARGS --port $PORT --writable sh -c 'tmux attach 2>/dev/null || tmux new -A -s $SESSION'
+# tmux "new -A" attaches if the session exists, else creates it ->
+# refreshing the browser preserves your shells.
+ExecStart=/usr/local/bin/ttyd $BIND_ARGS --port $PORT --writable tmux new -A -s $SESSION
 Restart=always
 RestartSec=2
 # The tmux server is a child in this unit's cgroup; the default cgroup kill
@@ -269,7 +283,7 @@ EOF
 }
 
 install_service() {
-  local unit="/etc/systemd/system/ttyd.service"
+  local unit="$UNIT"
   compute_service_args
   local tmp; tmp=$(mktemp)
   render_unit > "$tmp"
@@ -314,13 +328,48 @@ verify() {
     [ "$code" = "200" ] || { warn "verify: expected HTTP 200 on $addr:$PORT, got '$code'"; fails=$((fails+1)); }
   fi
   # a ttyd restart must never take the tmux server (all shells) down with it
-  if ! $SUDO grep -q '^KillMode=process' /etc/systemd/system/ttyd.service 2>/dev/null; then
+  if ! read_unit | grep -q '^KillMode=process'; then
     warn "verify: ttyd.service missing KillMode=process (a restart would kill all shells)"
     fails=$((fails+1))
   fi
+  assert_deployed_mode || fails=$((fails+1))
   verify_session_restore || fails=$((fails+1))
   [ "$fails" -eq 0 ] || return 1
   log "verified: service active and serving on $addr:$PORT ($MODE mode)"
+}
+
+# The installed unit must match the mode this run intended. On a flagless
+# re-run that is what proves adoption actually held: the regression this
+# guards against is a deployed public (proxy-fronted) webshell silently
+# reverting to private, which rebinds it to 127.0.0.1 and locks every client
+# out. Private mode is the mirror image — losing --credential would publish an
+# unauthenticated shell. Runs on every install and every --verify-only.
+assert_deployed_mode() {
+  local exec_line
+  exec_line=$(read_unit | sed -n 's/^ExecStart=//p' | head -1)
+  if [ -z "$exec_line" ]; then
+    warn "verify: no ExecStart in $UNIT"
+    return 1
+  fi
+  case "$exec_line" in
+    *"--port $PORT"*) ;;
+    *) warn "verify: deployed unit does not serve port $PORT"; return 1 ;;
+  esac
+  if [ "$MODE" = "private" ]; then
+    case "$exec_line" in
+      *--credential*) ;;
+      *) warn "verify: private mode but no --credential in $UNIT (shell would be unauthenticated)"; return 1 ;;
+    esac
+  else
+    case "$exec_line" in
+      *--credential*) warn "verify: public mode but $UNIT still carries a --credential"; return 1 ;;
+    esac
+    case "$exec_line" in
+      *"--interface $IFACE"*) ;;
+      *) warn "verify: public mode expected --interface $IFACE in $UNIT"; return 1 ;;
+    esac
+  fi
+  log "verified: deployed unit matches $MODE mode on port $PORT"
 }
 
 # Session restore must actually work, not just be configured. Everything runs
@@ -346,7 +395,7 @@ verify_session_restore() {
   local keys="" sright="" restored="" groups_menu="" i fails=0 groups_ok=1
   local vdir; vdir=$(mktemp -d)
   # Socket PATHS (-S) inside the scratch dir, not names (-L): names leave a
-  # socket file behind in /tmp/tmux-$UID for every run, which piled up into
+  # socket file behind in /tmp/tmux-$UID on every run, which piled up into
   # dozens of stale entries. rm -rf "$vdir" now takes the sockets with it.
   local sock="$vdir/s1" sock2="$vdir/s2"
   printf 'source-file %s\nset -g @continuum-restore "off"\nset -g @resurrect-dir "%s"\n' \
@@ -371,6 +420,15 @@ verify_session_restore() {
     # generator must list this server's groups plus the management actions
     [ "$(tmux -S "$sock" show -gv status 2>/dev/null)" = "2" ] || groups_ok=0
     tmux -S "$sock" list-keys 2>/dev/null | grep -q "tmux-groups" || groups_ok=0
+    # The UI is display-popup, not display-menu: a menu is dismissed by any
+    # pointer-motion event and xterm.js emits motion with no button held, so
+    # menus flicker away in a browser. A popup needs an attached client, which
+    # a headless verify has none of, so assert the wiring instead.
+    tmux -S "$sock" list-keys 2>/dev/null | grep -q "display-popup.*tmux-groups" || groups_ok=0
+    tmux -S "$sock" list-keys 2>/dev/null | grep -q "display-popup.*tmux-files" || groups_ok=0
+    /usr/local/bin/tmux-files --print browse "$vdir" >/dev/null 2>&1 || groups_ok=0
+    printf 'clipboard probe\n' > "$vdir/probe.txt"
+    /usr/local/bin/tmux-files copy "$vdir" probe.txt >/dev/null 2>&1 || groups_ok=0
     tmux -S "$sock" new-session -d -s groupcheck 2>/dev/null || true
     # capture via file: tmux 3.4 no longer relays run-shell stdout to a CLI
     # client, so the redirect must happen inside run-shell's own shell
@@ -378,25 +436,7 @@ verify_session_restore() {
     groups_menu=$(cat "$vdir/menu.out" 2>/dev/null || true)
     case "$groups_menu" in *groupcheck*) ;; *) groups_ok=0 ;; esac
     case "$groups_menu" in *"new group"*) ;; *) groups_ok=0 ;; esac
-    # The UI is display-popup, not display-menu (menus are killed by pointer
-    # motion in a browser). A popup needs an attached client, which a headless
-    # verify has none of, so assert the wiring instead: the bindings must open
-    # popups that run the helper. Actually driving a popup with synthetic
-    # mouse events needs a pty client and lives outside the installer.
-    tmux -S "$sock" list-keys 2>/dev/null | grep -q "display-popup.*tmux-groups" || groups_ok=0
-    # file browser: installed, bound to prefix+f, reachable from the bar popup,
-    # and able to list a directory (its --print path, same contract as groups)
-    tmux -S "$sock" list-keys 2>/dev/null | grep -q "display-popup.*tmux-files" || groups_ok=0
-    /usr/local/bin/tmux-files --print browse "$vdir" >/dev/null 2>&1 || groups_ok=0
-    # copy-to-clipboard path: a text file must copy cleanly (tmux-clip is a
-    # no-op with no clients attached) and a binary must be refused
-    printf 'clipboard probe\n' > "$vdir/probe.txt"
-    /usr/local/bin/tmux-files copy "$vdir" probe.txt >/dev/null 2>&1 || groups_ok=0
     case "$groups_menu" in *"browse files"*) ;; *) groups_ok=0 ;; esac
-    # fzf drives the popup's selection list (mouse clicks + wheel); without
-    # it the helper silently degrades to a keyboard-only numbered prompt.
-    command -v fzf >/dev/null 2>&1 || {
-      warn "verify: fzf is missing — group popups fall back to keyboard-only"; groups_ok=0; }
 
     # save -> kill -> fresh server -> restore: the layout must come back
     tmux -S "$sock" new-window -t main -n restoreme 2>/dev/null || true
@@ -409,12 +449,6 @@ verify_session_restore() {
       tmux -S "$sock2" kill-server 2>/dev/null || true
     fi
   fi
-  # Belt and braces: a tmux client that outlives its server can respawn a
-  # fresh server on the scratch socket; any survivor makes continuum think
-  # another tmux is running and silently disarms auto-save machine-wide.
-  tmux -S "$sock" kill-server 2>/dev/null || true
-  tmux -S "$sock2" kill-server 2>/dev/null || true
-  pkill -f "webshell-verify2?-$$" 2>/dev/null || true
   rm -rf "$vdir"
 
   case "$keys" in *tmux-resurrect/scripts/save.sh*) ;; *)

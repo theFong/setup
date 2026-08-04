@@ -9,8 +9,9 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
+- **claude/statusline.sh** — Claude Code status line showing session id and context usage (see below)
 - **webshell/** — Browser terminal (ttyd + tmux) with persistent sessions, clickable tabs, and copy-to-clipboard (see below)
-- **.agent/skills/** — Custom Claude Code skills (brev-cli, outlook-calendar, skill-creator, etc.)
+- **.agent/skills/** — Custom agent skills (brev-cli, cluster-ops, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
 
 ## Quick Start (new machine)
@@ -31,22 +32,58 @@ Each install is verified by checking that its expected command is available on
 `PATH`. The bootstrap continues attempting the remaining tools after a failure,
 then exits nonzero if anything is still missing.
 
-The repo-managed Brev skill is linked into Claude Code (`~/.claude/skills`),
-Codex (`~/.codex/skills`), and the shared agent skill directory
-(`~/.agents/skills`). Existing Brev skill installations are preserved.
+The repo-managed skills (**brev-cli** and **cluster-ops**) are linked into
+Claude Code (`~/.claude/skills`), Codex (`~/.codex/skills`), and the shared
+agent skill directory (`~/.agents/skills`). Existing skill installations are
+preserved. Each link is verified afterwards, and the cluster-ops discovery
+script is run in self-test mode against the local machine, so a skill that only
+reached one agent — or a probe script broken on this platform — fails the
+bootstrap instead of surfacing later.
 
 It also sets Claude Code's default permission mode to **auto mode** by writing
 `"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`
 (merged, never clobbering other settings; the legacy top-level `defaultMode`
 key written by older bootstraps is removed since Claude Code does not read the
-mode from there). This setting is Claude Code-specific — Codex approval
-settings are not modified. To undo, set it to `"default"`; to only auto-accept
+mode from there). To undo, set it to `"default"`; to only auto-accept
 edits, use `"acceptEdits"`; for full skip-all-prompts mode, use
 `"bypassPermissions"`.
+
+Codex gets the equivalent **Auto** approval preset by writing top-level
+`approval_policy = "on-request"` and `sandbox_mode = "workspace-write"` into
+`~/.codex/config.toml`: Codex works autonomously inside a workspace-write
+sandbox and only prompts to escalate. The keys are inserted above any
+`[table]` section (top-level TOML keys must precede table headers); everything
+else in the file is preserved. To undo, delete both keys; for full
+skip-all-prompts mode, use `approval_policy = "never"` with
+`sandbox_mode = "danger-full-access"`.
 
 After it finishes, open a new shell so PATH changes take effect. Run `claude`
 or `codex` to sign in, `brev login` to authenticate Brev, and `hf auth login`
 to authenticate Hugging Face.
+
+## Claude Code Status Line
+
+Claude Code has no built-in setting to always show the session id or context
+usage, but it pipes both to the status line command, so the bootstrap points
+`statusLine.command` at `~/.setup/claude/statusline.sh`:
+
+```
+Opus 5 · ~/setup · ctx 24% (248k/1M) · 2fa86bc7-74ec-4c0d-bcd4-12cdb70798be
+```
+
+Model, working directory, context-window usage, and the full session id — full
+rather than shortened so it can be pasted into `claude --resume <id>`. The
+percentage turns yellow at 50% and red at 80%. Older Claude Code versions that
+do not send `context_window` just drop that segment, and the line stays empty
+rather than erroring if `jq` is missing.
+
+Edit `claude/statusline.sh` to change what it renders; the bootstrap verifies
+on every run that the script is wired into `~/.claude/settings.json` and that
+it actually renders a sample payload. Delete the `statusLine` key from
+`~/.claude/settings.json` to undo. Like the permission mode above, this is
+Claude Code-specific — Codex CLI has no status line hook. The equivalent Codex
+workflow is `codex resume`, whose session picker (or `--last`) selects a past
+session without needing the id in front of you.
 
 ## Web Shell (browser terminal)
 
@@ -66,8 +103,10 @@ lands on your local clipboard via OSC 52.
 `wt0`) with no password and assumes an authenticating HTTPS proxy in front —
 don't use it without one. Flags: `--iface`, `--port`, `--session`,
 `--force-build`; env: `WEBSHELL_*`. `--verify-only` health-checks an existing
-install (service active, HTTP serving, auth enforced) and exits nonzero on
-failure — CI runs it, and it works as a cron/liveness probe too.
+install (service active, HTTP serving, auth enforced, the deployed unit still
+matching the intended mode/interface/port, `KillMode=process` present, and
+session restore actually working) and exits nonzero on failure — CI runs it,
+and it works as a cron/liveness probe too.
 
 Notes baked into the setup (hard-won):
 - ttyd is **built from source** — release/apt builds bundle an xterm.js
@@ -99,30 +138,34 @@ Notes baked into the setup (hard-won):
 - The pickers are `display-popup` + `fzf`, not tmux's `display-menu`, and that
   is not cosmetic: a tmux menu is dismissed by any pointer-motion event, and
   xterm.js reports motion with no button held — so in a browser the menu
-  vanishes as soon as you move the mouse toward it. A popup is a real pane,
-  so motion goes to the program inside it (`choose-tree` was measured too and
+  vanishes as soon as you move the mouse toward it. A popup is a real pane, so
+  motion goes to the program inside it (`choose-tree` was measured too and
   dies the same way). Inside the popup you get a real tty, so fzf handles
-  mouse clicks and wheel, and prompts are plain `read`. Menu contents are
-  generated by `webshell/tmux-groups`, which `--print`s its labels so the
-  installer and `test.sh` can check the UI headlessly.
+  mouse clicks and wheel, and prompts are plain `read`. Both helpers `--print`
+  their labels so the installer and `test.sh` can check the UI headlessly.
 - **File browser/viewer**: `prefix + f`, or click the bar and pick
-  `📁 browse files…`. Opens a popup in the current pane's directory with a
-  live preview beside the list — click a folder to descend, `../` to go up, a
-  file to page it in `less`, `q` back to the list, `esc` to close. Typing
-  filters (fzf), hidden files are shown, and binary files are named rather
-  than dumped. It is a viewer only — nothing there can modify a file.
-  Implemented in `webshell/tmux-files`.
+  `📁 browse files…`. Opens in the current pane's directory with a live
+  preview beside the list — click a folder to descend, `../` to go up, a file
+  to page it in `less`, `esc` to close. Typing filters, hidden files are
+  shown, and binary files are named rather than dumped. Viewer only: nothing
+  there can modify a file. Implemented in `webshell/tmux-files`.
 - **Copying out of a file.** Drag-select-to-copy works in a tmux *pane* but
   does nothing inside a popup — popups are not panes and have no copy-mode on
   this build (measured), so dragging inside the browser popup is a no-op.
   `ctrl-o` therefore opens the file in a pane **beside the current one**, in
   the same tab, where the normal drag-select copy works (`less` runs there
   without `--mouse` on purpose, so tmux keeps the drag). `ctrl-t` does the
-  same as its own tab when a 50% split is too narrow, and `ctrl-y` / `alt-y`
-  copy the whole file / its path without selecting anything. All land in the
-  browser clipboard via `tmux-clip`'s OSC 52, which needs a secure context —
-  fine over the https app URL, and over an SSH tunnel to localhost. Pasting
-  back: `prefix + ]` for the tmux buffer, or the browser's normal paste.
+  same as its own tab, and `ctrl-y` / `alt-y` copy the whole file / its path
+  without selecting anything. All land in the browser clipboard via
+  `tmux-clip`'s OSC 52, which needs a secure context (the https app URL, or a
+  tunnel to localhost). Paste back with `prefix + ]` or the browser's paste.
+- **Tab groups** (tmux sessions) are fully mouse-driven: a second status row
+  lists the groups with the current one highlighted. Click that row — or
+  right-click anywhere on the bar — for the groups menu (switch / new /
+  rename / close). Right-click a tab to rename it, close it, or move it to
+  another group; mouse-wheel over the bar cycles groups. Menus come from
+  `webshell/tmux-groups`. Groups survive reboots like everything else
+  (resurrect saves and restores all sessions).
 
 ## North/South Internet Check
 
@@ -142,6 +185,50 @@ speedtest --servers                       # list nearby servers
 speedtest --server-id=<id>                # pin a specific server
 speedtest --format=json                   # machine-readable output
 ```
+
+## Cluster Onboarding (`cluster-ops` skill)
+
+`.agent/skills/cluster-ops/` turns an undocumented compute cluster into a
+per-cluster operations skill an agent can trust, and carries the portable
+GPU-fleet failure patterns that recur across every fleet.
+
+Ask an agent to onboard a cluster, or drive the discovery sweep directly:
+
+```bash
+PROBE=~/.claude/skills/cluster-ops/scripts/probe-cluster.sh
+
+$PROBE --self-test                                 # verify the collector on this machine
+$PROBE -o /tmp/acme.json head node-1 node-2        # sweep the fleet
+$PROBE --hosts-file hosts.txt --include-local      # or read hosts from a file
+```
+
+The sweep is **read-only by construction**: it reads `/proc`, `/sys`,
+`/etc/os-release` and `/etc/docker/daemon.json`, runs query-only commands (`ip`,
+`ss`, `docker ps`, `nvidia-smi`, `systemctl list-units`), and uses `sudo` for
+nothing but `sudo -n true` to detect passwordless sudo. It emits one JSON record
+per host covering identity, GPUs, containers and their restart policies,
+addresses on every plane (LAN / overlay / RDMA fabric), listening ports, and
+per-node access shape. A host that cannot be reached still gets a record, with
+an `error` field, and the sweep exits nonzero — an unprobed node is a finding,
+not an omission.
+
+The skill then walks a six-phase flow (scope → enumerate → probe → interview →
+render → verify) and fills `templates/` to produce a `<cluster>-cluster` skill,
+installed for both Claude Code and Codex. Layout:
+
+| Path | Holds |
+|---|---|
+| `SKILL.md` | Entry points, non-negotiables, symptom → diagnostics index |
+| `reference/onboarding.md` | The six phases, the interview questions, how to read probe output |
+| `reference/diagnostics.md` | Portable failure patterns: overlay collisions, reboot survival, RDMA verification, telemetry that lies, ingress and routing |
+| `reference/contract.md` | Authoring rules, when to update, anti-drift, how to retire a skill |
+| `templates/` | The cluster skill, topology, and runbook templates |
+| `scripts/probe-cluster.sh` | The read-only discovery sweep |
+
+The split is deliberate: `cluster-ops` holds what is true of clusters in
+general, a `<cluster>-cluster` skill holds what is true of one fleet. Keeping
+facts on the right side of that line means a fix reaches every cluster instead
+of one.
 
 ## Manual Installation
 

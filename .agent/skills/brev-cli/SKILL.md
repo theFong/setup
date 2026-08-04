@@ -1,8 +1,8 @@
 ---
 name: brev-cli
-description: Manage GPU cloud instances with the Brev CLI. Use when users want to create GPU instances, search for GPUs, SSH into instances, open editors, copy files, port forward, manage organizations, or work with cloud compute. Trigger keywords - brev, gpu, instance, create instance, ssh, vram, A100, H100, cloud gpu, remote machine.
+description: Manage GPU cloud instances and external nodes with the Brev CLI. Use when users want to create GPU instances, search for GPUs, list instances or on-prem nodes, SSH into machines, open editors, copy files, port forward, manage organizations, or work with cloud compute. Trigger keywords - brev, gpu, instance, create instance, brev ls, brev ls nodes, external node, on-prem node, ssh, vram, A100, H100, cloud gpu, remote machine.
 allowed-tools: Bash, Read, AskUserQuestion
-argument-hint: [create|search|shell|open|ls|delete] [instance-name]
+argument-hint: [create|search|shell|open|ls|ls nodes|delete] [instance-name]
 ---
 <!--
 Token Budget:
@@ -40,8 +40,11 @@ brev create my-instance
 # Create with specific GPU
 brev create my-instance --type g5.xlarge
 
-# List your instances
+# List your cloud instances
 brev ls
+
+# List external/on-prem nodes -- a SEPARATE list that `brev ls` never shows
+brev ls nodes
 
 # SSH into an instance
 brev shell my-instance
@@ -120,6 +123,41 @@ brev copy my-instance:/remote/file ./local-path/
 brev port-forward my-instance -p 8080:8080
 ```
 
+### Listing: instances vs. nodes
+
+`brev ls` has two namespaces and they do **not** overlap. If you are looking for a
+machine and `brev ls` doesn't show it, check `brev ls nodes` before concluding it
+doesn't exist.
+
+```bash
+brev ls              # cloud instances (VMs Brev provisioned)
+brev ls instances    # same as above, explicit
+brev ls nodes        # external nodes only -- physical/on-prem machines
+brev ls orgs         # organizations
+brev ls nodes --json # machine-readable: name, org_id, status
+```
+
+|  | `brev ls` | `brev ls nodes` |
+|---|---|---|
+| Status values | `RUNNING` / `STOPPED` | `Connected` / `Disconnected` |
+| Columns | NAME, STATUS, BUILD, SHELL, ID, MACHINE, GPU | NAME, STATUS only |
+| `stop`/`start`/`delete` | yes | **no** — Brev doesn't own their lifecycle |
+
+**Two gotchas, both verified on v0.6.329:**
+- `brev ls --all` does *not* merge the lists despite its help text promising
+  "all instances and external nodes". It returns the same rows as `brev ls`.
+  Run both commands; don't rely on `--all`.
+- Piped output is *not* names-only despite the help text. You still get the full
+  table, which is why the pipelines below all use `awk '{print $1}'`.
+
+Node names are also SSH host aliases — `brev refresh` writes them into
+`~/.brev/ssh_config`, so `ssh spark-1` works without `brev shell`.
+
+```bash
+# Names of every node that is currently connected
+brev ls nodes --json | jq -r '.[] | select(.status=="Connected") | .name'
+```
+
 ### Instance Management
 ```bash
 # List instances
@@ -192,13 +230,27 @@ brev invite
 **ALWAYS do these:**
 - Show instance cost/type before creating
 - Confirm instance name before deletion
-- Check `brev ls` before assuming instance exists
+- Check `brev ls` **and `brev ls nodes`** before assuming a machine doesn't exist —
+  they are separate lists
+
+**External nodes are not disposable.** Nodes in `brev ls nodes` are real hardware
+someone registered to the org, not Brev-provisioned VMs. Never try to `delete` or
+`stop` one, and treat anything running on them as production unless told otherwise.
 
 ## Troubleshooting
 
 **"Instance not found":**
 - Run `brev ls` to see available instances
+- **Run `brev ls nodes` too** — external nodes never appear in `brev ls`, and
+  `brev ls --all` does not include them either
 - Check if you're in the correct org: `brev org ls`
+
+**Node shows `Connected` but SSH hangs:**
+- `Connected` means registered with the control plane, not reachable. The usual
+  cause is a stale gateway port mapping.
+- `brev refresh` first — gateway ports rotate and `~/.brev/ssh_config` goes stale.
+- If it still hangs, the node's mesh agent needs to re-register (on the node:
+  `systemctl restart netbird`, or the equivalent for your overlay).
 
 **"Failed to create instance":**
 - Try a different instance type: `brev search --sort price`
