@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+#
+# tmux-files — mouse-driven file browser/viewer for the webshell.
+#
+# Runs inside a display-popup (see tmux.conf), for the same reason the group
+# pickers do: tmux's display-menu is killed by any pointer-motion event and
+# xterm.js emits motion with no button held, so overlays that are menus
+# flicker away in a browser. A popup is a real pane, so fzf inside it gets
+# the clicks and the wheel.
+#
+#   browse [dir]      directory browser; click a folder to descend, a file to
+#                     view it, "../" to go up
+#   view <file>       page one file (less -R)
+#   preview <dir> <item>   used by fzf's --preview pane
+#   copy <dir> <item>      whole file -> browser clipboard (OSC 52)
+#   copy-path <dir> <item> absolute path -> browser clipboard
+#   open-tab <dir> <item>  open the file in a real tmux window
+#   open-split <dir> <item> open the file in a pane to the RIGHT of this one
+#   open-split <dir> <item> open the file in a pane to the RIGHT of this one
+#
+# Copying deserves a note. Drag-select-to-copy works in a tmux PANE (the
+# copy-mode binding pipes through tmux-clip), but does nothing inside a
+# popup: popups are not panes and have no copy-mode on this build (measured).
+# So the browser offers whole-file and path copies directly, and ctrl-o opens
+# the file in a pane beside the current one, where the usual drag-select copy
+# works for selecting a region by hand.
+#
+# --print (before the subcommand) lists what browse would show, one per line,
+# instead of drawing anything — lets install.sh verify and test.sh check this
+# headlessly, the same contract tmux-groups uses.
+#
+# There is deliberately no editing here: this is a viewer, and a read-only
+# tool needs no confirmation prompts to be safe to click around in.
+
+set -euo pipefail
+# dotglob: hidden entries (.github, .claude, .git) are the interesting ones on
+# a dev box. nullglob: an empty directory must expand to nothing, not to a
+# literal "*".
+shopt -s dotglob nullglob
+
+SELF="/usr/local/bin/tmux-files"
+[ -x "$SELF" ] || SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+PRINT=0
+if [ "${1:-}" = "--print" ]; then PRINT=1; shift; fi
+CMD="${1:-browse}"
+[ $# -gt 0 ] && shift
+
+MAX_PREVIEW_LINES=500
+
+# Where to start when no directory is given. Ask tmux for the client's active
+# pane path rather than taking it as an argument: display-popup does NOT
+# expand formats in its command string, so a binding passing
+# '#{pane_current_path}' hands over that literal text and the browser would
+# open in the popup's own cwd (the session start dir) instead of the tab you
+# are looking at. Resolving it here fixes every entry point at once.
+default_dir() {
+  local d
+  d=$(tmux display-message -p '#{pane_current_path}' 2>/dev/null || true)
+  if [ -n "$d" ] && [ -d "$d" ]; then printf '%s' "$d"; else printf '%s' "${PWD:-$HOME}"; fi
+}
+
+# is_text <file> -> 0 when the file looks like text (grep -I detects binary)
+is_text() { LC_ALL=C grep -Iq . "$1" 2>/dev/null; }
+
+# list_dir <dir> -> "../", then directories with a trailing /, then files.
+# Directories first is what every file manager does and keeps descending fast.
+list_dir() {
+  local dir="$1" entry
+  [ "$dir" = "/" ] || printf '../\n'
+  for entry in "$dir"/*; do
+    [ -e "$entry" ] || continue
+    [ -d "$entry" ] && printf '%s/\n' "$(basename "$entry")"
+  done
+  for entry in "$dir"/*; do
+    [ -e "$entry" ] || continue
+    [ -d "$entry" ] || printf '%s\n' "$(basename "$entry")"
+  done
+}
+
+# preview <dir> <item> — what fzf shows in the side pane
+preview() {
+  local dir="${1:-}" item="${2:-}" target
+  [ -n "$dir" ] && [ -n "$item" ] || return 0
+  case "$item" in
+    ../) target=$(dirname "$dir") ;;
+    */)  target="$dir/${item%/}" ;;
+    *)   target="$dir/$item" ;;
+  esac
+  if [ -d "$target" ]; then
+    printf '%s/\n\n' "$target"
+    ls -lAh --group-directories-first "$target" 2>/dev/null | head -n "$MAX_PREVIEW_LINES"
+  elif [ -f "$target" ]; then
+    printf '%s  (%s)\n\n' "$target" "$(du -h "$target" 2>/dev/null | cut -f1)"
+    if is_text "$target"; then
+      head -n "$MAX_PREVIEW_LINES" "$target"
+    else
+      printf '(binary file — no preview)\n'
+      file -b "$target" 2>/dev/null || true
+    fi
+  fi
+}
+
+# resolve <dir> <item> -> absolute path of what the list row points at
+resolve() {
+  local dir="${1:-}" item="${2:-}"
+  case "$item" in
+    ../) dirname "$dir" ;;
+    */)  printf '%s/%s' "$dir" "${item%/}" ;;
+    *)   printf '%s/%s' "$dir" "$item" ;;
+  esac
+}
+
+# tmux-clip emits OSC 52 to every attached client tty, which is the proven
+# path to the browser clipboard on this stack (tmux's own set-clipboard does
+# not emit here).
+clip() {
+  if [ -x /usr/local/bin/tmux-clip ]; then /usr/local/bin/tmux-clip
+  else cat >/dev/null; fi
+}
+
+copy_file() {
+  local target; target=$(resolve "${1:-}" "${2:-}")
+  [ -f "$target" ] || { printf 'not a file: %s\n' "$target" >&2; return 1; }
+  is_text "$target" || { printf 'refusing to copy a binary file\n' >&2; return 1; }
+  clip < "$target"
+}
+
+copy_path() {
+  local target; target=$(resolve "${1:-}" "${2:-}")
+  [ -e "$target" ] || { printf 'no such path: %s\n' "$target" >&2; return 1; }
+  printf '%s' "$target" | clip
+}
+
+# Open beside the current pane, which is the copy-friendly place to read a
+# file: a pane has copy-mode, so the normal drag-select -> tmux-clip -> OSC 52
+# path works there. A popup has no copy-mode at all (measured), which is why
+# dragging inside the browser popup does nothing. less runs WITHOUT --mouse
+# on purpose — with it, less would swallow the drag before tmux sees it.
+open_split() {
+  local target; target=$(resolve "${1:-}" "${2:-}")
+  [ -f "$target" ] || { printf 'not a file: %s\n' "$target" >&2; return 1; }
+  tmux split-window -h -l 50% "less -R -- $(printf '%q' "$target")"
+}
+
+# Same idea, but as its own tab when a side-by-side split would be too narrow.
+open_tab() {
+  local target; target=$(resolve "${1:-}" "${2:-}")
+  [ -f "$target" ] || { printf 'not a file: %s\n' "$target" >&2; return 1; }
+  tmux new-window -n "$(basename "$target")" "less -R -- '$target'"
+}
+
+view() {
+  local file="${1:-}"
+  [ -f "$file" ] || { printf 'not a file: %s\n' "$file" >&2; return 0; }
+  if is_text "$file"; then
+    # -R keeps colour escapes, +Gg lands at the top, --mouse gives wheel
+    # scrolling inside the popup on less >= 551 (ignored by older builds).
+    less -R --mouse -- "$file" 2>/dev/null || less -R -- "$file"
+  else
+    printf '%s is not a text file.\n\n' "$file"
+    file -b "$file" 2>/dev/null || true
+    printf '\npress enter to go back'
+    read -r _ || true
+  fi
+}
+
+browse() {
+  local dir="${1:-}" choice
+  [ -n "$dir" ] && [ -d "$dir" ] || dir=$(default_dir)
+  dir=$(cd "$dir" && pwd)
+
+  if [ "$PRINT" = 1 ]; then
+    list_dir "$dir"
+    return 0
+  fi
+  if ! command -v fzf >/dev/null 2>&1; then
+    printf 'tmux-files needs fzf for the browser; showing %s instead\n\n' "$dir"
+    ls -lAh "$dir"; printf '\npress enter to close'; read -r _ || true
+    return 0
+  fi
+
+  while :; do
+    choice=$(list_dir "$dir" | fzf --reverse --no-sort --height=100% \
+      --prompt="$dir/ > " --pointer='▸' --color=prompt:4,pointer:4 \
+      --preview "$SELF preview '$dir' {}" --preview-window=right:58%:wrap \
+      --bind "ctrl-y:execute-silent($SELF copy '$dir' {})" \
+      --bind "alt-y:execute-silent($SELF copy-path '$dir' {})" \
+      --bind "ctrl-o:execute-silent($SELF open-split '$dir' {})+abort" \
+      --bind "ctrl-t:execute-silent($SELF open-tab '$dir' {})+abort" \
+      --header='enter: peek · ctrl-o: open right (drag-select to copy) · ctrl-t: open as tab · ctrl-y: copy whole file · esc: close') || return 0
+    [ -n "$choice" ] || return 0
+    case "$choice" in
+      ../) dir=$(dirname "$dir") ;;
+      */)  dir="$dir/${choice%/}" ;;
+      *)   view "$dir/$choice" ;;
+    esac
+  done
+}
+
+case "$CMD" in
+  browse)    browse "${1:-}" ;;
+  view)      view "${1:-}" ;;
+  preview)   preview "${1:-}" "${2:-}" ;;
+  copy)      copy_file "${1:-}" "${2:-}" ;;
+  copy-path) copy_path "${1:-}" "${2:-}" ;;
+  open-tab)  open_tab "${1:-}" "${2:-}" ;;
+  open-split) open_split "${1:-}" "${2:-}" ;;
+  *) echo "tmux-files: unknown subcommand '$CMD'" >&2; exit 1 ;;
+esac
