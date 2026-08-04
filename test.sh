@@ -271,6 +271,14 @@ if bash "$probe" --bogus-option >/dev/null 2>&1; then
   exit 1
 fi
 
+# cluster-ops: --brev must fail loudly when the brev CLI (or jq) is missing,
+# rather than enumerating nothing and reporting a clean, empty sweep — which
+# would read as "the fleet has no nodes". Run with a PATH containing neither.
+if (export PATH=/nonexistent; /bin/bash "$probe" --brev) >/dev/null 2>&1; then
+  echo "FAIL: probe-cluster.sh --brev unexpectedly succeeded without the brev CLI" >&2
+  exit 1
+fi
+
 # cluster-ops: an unreachable host must be RECORDED and must make the sweep
 # exit nonzero. Dropping it silently would leave a node missing from an
 # inventory that reads as complete. .invalid never resolves (RFC 2606), so this

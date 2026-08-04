@@ -42,7 +42,7 @@ reading of probe output: **[reference/onboarding.md](reference/onboarding.md)**.
 | Phase | Do |
 |---|---|
 | 0. Scope | What is production? What is the blast radius? Anything mid-incident? What is the cluster called? |
-| 1. Enumerate | Get the host list from the control plane, then ask what is missing or decommissioned |
+| 1. Enumerate | Host list from the control plane (`--brev`, `kubectl`, `sinfo`), then ask what is missing or decommissioned |
 | 2. Probe | `scripts/probe-cluster.sh` across every node — read-only |
 | 3. Interview | Safety rules, why-it-runs-there, history, what is known-broken |
 | 4. Render | Fill `templates/`, delete inapplicable sections, real trigger keywords |
@@ -52,8 +52,17 @@ reading of probe output: **[reference/onboarding.md](reference/onboarding.md)**.
 ```bash
 SKILL_DIR=~/.claude/skills/cluster-ops
 "$SKILL_DIR/scripts/probe-cluster.sh" --self-test                  # prove the collector runs here
-"$SKILL_DIR/scripts/probe-cluster.sh" -o /tmp/acme-probe.json head node-1 node-2
+
+brev refresh                                                       # if brev-managed; ports rotate
+"$SKILL_DIR/scripts/probe-cluster.sh" --brev --brev-instances -o /tmp/acme.json
+"$SKILL_DIR/scripts/probe-cluster.sh" -o /tmp/acme.json head node-1 node-2   # or name them
 ```
+
+`--brev` enumerates physical nodes, `--brev-instances` cloud instances — **two
+separate lists, and `brev ls --all` is not a substitute for either**. Names
+double as SSH aliases via `~/.brev/ssh_config`; do not pass `-F` to point at it
+explicitly, which breaks literal-prefix tool-permission rules. Deeper CLI
+surface is the **`brev-cli`** skill's job.
 
 The probe is **read-only by construction**: it reads `/proc`, `/sys`,
 `/etc/os-release` and `/etc/docker/daemon.json`, runs query-only commands, and
