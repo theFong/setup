@@ -4,7 +4,8 @@
 #
 # Installs: Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, tmux,
 # git, gh, jq, ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links
-# this repo's Claude config and Brev skill into the supported agent directories.
+# this repo's Claude config and agent skills (brev-cli, cluster-ops) into the
+# supported agent directories.
 #
 # Usage (one-liner):
 #   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
@@ -514,49 +515,88 @@ link_dotfiles() {
   log "linked Claude config into ~/.claude"
 }
 
-# Make the repo-managed Brev skill available to Claude Code, Codex, and other
-# agents. Existing skill installations are preserved.
-link_brev_skill() {
-  local skill_source="$HOME/.setup/.agent/skills/brev-cli"
-  local skills_dir target
-  if [ ! -f "$skill_source/SKILL.md" ]; then
-    warn "Brev skill source not found at $skill_source"
-    record_failure brev-skill
-    return 1
-  fi
+# Repo-managed skills linked into every supported agent's skills directory.
+# Add a skill here and it becomes available to Claude Code, Codex, and any
+# other agent that reads ~/.agents/skills.
+AGENT_SKILLS="brev-cli cluster-ops"
 
-  for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
-    mkdir -p "$skills_dir"
-    target="$skills_dir/brev-cli"
-    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
-      if ! ln -s "$skill_source" "$target"; then
-        warn "failed to link Brev skill into $skills_dir"
-        record_failure brev-skill
-        return 1
-      fi
-    fi
-  done
-  log "linked Brev skill into Claude Code, Codex, and agent skill directories"
-  assert_skill_links
+# The agent skill directories the bootstrap wires up. ~/.claude/skills is
+# normally a symlink to the repo's .agent/skills (see link_dotfiles), so skills
+# appear there without a per-skill link; the others get one link per skill.
+# A function rather than a constant so it reads $HOME at call time, which keeps
+# it correct after link_dotfiles and testable against a scratch HOME.
+agent_skill_dirs() {
+  printf '%s %s %s' "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"
 }
 
-# assert_skill_links — verify each agent path really resolves to a readable
-# SKILL.md. Creating the symlink is not proof: a dangling link (repo moved,
-# skill renamed) still satisfies the `[ ! -e ] && [ ! -L ]` guard above and
-# would leave every agent silently without the skill.
-assert_skill_links() {
-  local skills_dir target fails=0
-  for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
-    target="$skills_dir/brev-cli/SKILL.md"
-    [ -r "$target" ] && continue
-    warn "Brev skill is not readable at $target"
-    fails=1
+# assert_agent_skill NAME — verify a repo-managed skill is actually readable
+# through every agent skills directory. The skill counterpart of
+# assert_installed: linking without checking is how a skill silently reaches
+# only one of the two agents. Readability, not existence, is the test — a
+# dangling symlink (repo moved, skill renamed) still satisfies the
+# `[ ! -e ] && [ ! -L ]` create-guard in link_agent_skills and would leave
+# every agent silently without the skill.
+assert_agent_skill() {
+  local name="$1" skills_dir missing=""
+  for skills_dir in $(agent_skill_dirs); do
+    [ -r "$skills_dir/$name/SKILL.md" ] || missing="$missing $skills_dir"
   done
-  if [ "$fails" != 0 ]; then
-    record_failure brev-skill
+  if [ -n "$missing" ]; then
+    warn "skill $name is not readable through:$missing"
+    record_failure "$name-skill"
     return 1
   fi
-  log "verified Brev skill readable from Claude Code, Codex, and agent skill dirs"
+  log "verified skill $name in Claude Code, Codex, and agent skill directories"
+}
+
+# assert_cluster_probe — run the cluster-ops discovery collector against this
+# machine and require well-formed, complete output. Shipping a broken probe is
+# worse than shipping none: it would fail while surveying someone's production
+# fleet. Read-only, and touches nothing but localhost.
+assert_cluster_probe() {
+  local script="$HOME/.setup/.agent/skills/cluster-ops/scripts/probe-cluster.sh"
+  if [ ! -f "$script" ]; then
+    warn "cluster-ops probe script not found at $script"
+    record_failure cluster-ops-skill
+    return 1
+  fi
+  [ -x "$script" ] || chmod +x "$script" 2>/dev/null || true
+  if ! bash "$script" --self-test >/dev/null 2>&1; then
+    warn "cluster-ops probe self-test failed on this machine"
+    record_failure cluster-ops-skill
+    return 1
+  fi
+  log "verified cluster-ops probe: collector produced valid JSON for this host"
+}
+
+# Make the repo-managed skills available to Claude Code, Codex, and other
+# agents. Existing skill installations are preserved, so a hand-installed or
+# newer copy of a skill is never clobbered.
+link_agent_skills() {
+  local name skill_source skills_dir target status=0
+  for name in $AGENT_SKILLS; do
+    skill_source="$HOME/.setup/.agent/skills/$name"
+    if [ ! -f "$skill_source/SKILL.md" ]; then
+      warn "skill source not found at $skill_source"
+      record_failure "$name-skill"
+      status=1
+      continue
+    fi
+    for skills_dir in $(agent_skill_dirs); do
+      mkdir -p "$skills_dir"
+      target="$skills_dir/$name"
+      if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        if ! ln -s "$skill_source" "$target"; then
+          warn "failed to link $name skill into $skills_dir"
+          record_failure "$name-skill"
+          status=1
+        fi
+      fi
+    done
+    assert_agent_skill "$name" || status=1
+  done
+  assert_cluster_probe || status=1
+  return "$status"
 }
 
 # ---------------------------------------------------------------------------
@@ -610,7 +650,7 @@ main() {
   configure_claude       || warn "configuring Claude default mode failed"
   configure_codex        || warn "configuring Codex approval mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
-  link_brev_skill        || warn "linking Brev skill failed"
+  link_agent_skills      || warn "linking agent skills failed"
   # Must run after link_dotfiles: the status line script lives in ~/.setup.
   configure_claude_statusline || warn "configuring Claude status line failed"
   verify_toolchain       || warn "some installed tools did not run"

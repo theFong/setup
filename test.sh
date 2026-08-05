@@ -259,16 +259,6 @@ if summary >/dev/null 2>&1; then
 fi
 FAILED=""
 
-# assert_skill_links must reject a dangling symlink: link_brev_skill's
-# create-if-absent guard is satisfied by a broken link, which would leave every
-# agent silently without the skill.
-mkdir -p "$scratch/skillhome/.claude/skills" "$scratch/skillhome/.codex/skills" "$scratch/skillhome/.agents/skills"
-ln -s "$scratch/does-not-exist" "$scratch/skillhome/.claude/skills/brev-cli"
-if (export HOME="$scratch/skillhome"; assert_skill_links) >/dev/null 2>&1; then
-  echo "FAIL: assert_skill_links accepted a dangling skill symlink" >&2
-  exit 1
-fi
-
 # webshell/install.sh must refuse a non-Linux host, and refuse it before
 # installing anything. A uname shim makes this runnable on any platform; the
 # guard is the second thing main() does, so a scratch HOME must come back
@@ -324,5 +314,68 @@ if command -v python3 >/dev/null 2>&1; then
 else
   echo "skip: python3 not available; webshell auth-enforcement test not run" >&2
 fi
+
+# Agent skills: assert_agent_skill must fail when a skill is not readable
+# through every agent directory, rather than reporting a clean link. Run against
+# a scratch HOME so the real skill installation is never consulted or touched.
+mkdir -p "$scratch/skillhome"
+if (export HOME="$scratch/skillhome"; assert_agent_skill cluster-ops) >/dev/null 2>&1; then
+  echo "FAIL: assert_agent_skill unexpectedly passed for an uninstalled skill" >&2
+  exit 1
+fi
+
+# cluster-ops: assert_cluster_probe must fail when the probe script is missing.
+# A skill that ships a broken or absent discovery script would only fail later,
+# mid-survey against someone's production fleet.
+if (export HOME="$scratch/skillhome"; assert_cluster_probe) >/dev/null 2>&1; then
+  echo "FAIL: assert_cluster_probe unexpectedly passed with no probe script" >&2
+  exit 1
+fi
+
+# cluster-ops: probe-cluster.sh must reject misuse instead of silently sweeping
+# nothing. Both paths exit before any SSH is attempted.
+probe=.agent/skills/cluster-ops/scripts/probe-cluster.sh
+if bash "$probe" >/dev/null 2>&1; then
+  echo "FAIL: probe-cluster.sh with no hosts unexpectedly succeeded" >&2
+  exit 1
+fi
+if bash "$probe" --bogus-option >/dev/null 2>&1; then
+  echo "FAIL: probe-cluster.sh unknown option unexpectedly succeeded" >&2
+  exit 1
+fi
+
+# cluster-ops: an unreachable host must be RECORDED and must make the sweep
+# exit nonzero. Dropping it silently would leave a node missing from an
+# inventory that reads as complete. .invalid never resolves (RFC 2606), so this
+# fails fast and touches no real host.
+if command -v ssh >/dev/null 2>&1; then
+  probe_out="$scratch/probe.json"
+  if bash "$probe" -t 2 -o "$probe_out" no-such-host.invalid >/dev/null 2>&1; then
+    echo "FAIL: probe-cluster.sh returned zero despite an unreachable host" >&2
+    exit 1
+  fi
+  if ! grep -q '"error"' "$probe_out" 2>/dev/null; then
+    echo "FAIL: probe-cluster.sh did not record an entry for the failed host" >&2
+    exit 1
+  fi
+else
+  echo "skip: ssh not available; probe unreachable-host test not run" >&2
+fi
+
+# assert_agent_skill must reject a DANGLING symlink, not merely a missing one:
+# link_agent_skills' create-if-absent guard is satisfied by a broken link, which
+# would leave every agent silently without the skill. All three dirs get a
+# dangling link, so unreadability is the only thing that can fail the assertion.
+mkdir -p "$scratch/danglinghome/.claude/skills" \
+         "$scratch/danglinghome/.codex/skills" \
+         "$scratch/danglinghome/.agents/skills"
+for d in .claude .codex .agents; do
+  ln -s "$scratch/does-not-exist" "$scratch/danglinghome/$d/skills/brev-cli"
+done
+if (export HOME="$scratch/danglinghome"; assert_agent_skill brev-cli) >/dev/null 2>&1; then
+  echo "FAIL: assert_agent_skill accepted a dangling skill symlink" >&2
+  exit 1
+fi
+
 
 log "all negative tests passed"

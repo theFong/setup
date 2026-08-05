@@ -11,7 +11,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
 - **claude/statusline.sh** — Claude Code status line showing session id and context usage (see below)
 - **webshell/** — Browser terminal (ttyd + tmux) with persistent sessions, clickable tabs, and copy-to-clipboard (see below)
-- **.agent/skills/** — Custom Claude Code skills (brev-cli, outlook-calendar, skill-creator, etc.)
+- **.agent/skills/** — Custom agent skills (brev-cli, cluster-ops, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
 
 ## Quick Start (new machine)
@@ -35,11 +35,15 @@ wrong-architecture build still satisfies `command -v`). The bootstrap continues
 attempting the remaining tools after a failure, then exits nonzero if anything
 is still missing or does not run.
 
-The repo-managed Brev skill is linked into Claude Code (`~/.claude/skills`),
-Codex (`~/.codex/skills`), and the shared agent skill directory
-(`~/.agents/skills`), and each path is then checked to resolve to a readable
-`SKILL.md` — a dangling symlink would otherwise leave every agent silently
-without the skill. Existing Brev skill installations are preserved.
+The repo-managed skills (**brev-cli** and **cluster-ops**) are linked into
+Claude Code (`~/.claude/skills`), Codex (`~/.codex/skills`), and the shared
+agent skill directory (`~/.agents/skills`). Existing skill installations are
+preserved. Each path is then checked to resolve to a **readable** `SKILL.md` —
+a dangling symlink would otherwise satisfy the create-if-absent guard and leave
+every agent silently without the skill — and the cluster-ops discovery script is
+run in self-test mode against the local machine. So a skill that reached only
+one agent, or a probe script broken on this platform, fails the bootstrap
+instead of surfacing later.
 
 It also sets Claude Code's default permission mode to **auto mode** by writing
 `"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`
@@ -155,6 +159,50 @@ speedtest --servers                       # list nearby servers
 speedtest --server-id=<id>                # pin a specific server
 speedtest --format=json                   # machine-readable output
 ```
+
+## Cluster Onboarding (`cluster-ops` skill)
+
+`.agent/skills/cluster-ops/` turns an undocumented compute cluster into a
+per-cluster operations skill an agent can trust, and carries the portable
+GPU-fleet failure patterns that recur across every fleet.
+
+Ask an agent to onboard a cluster, or drive the discovery sweep directly:
+
+```bash
+PROBE=~/.claude/skills/cluster-ops/scripts/probe-cluster.sh
+
+$PROBE --self-test                                 # verify the collector on this machine
+$PROBE -o /tmp/acme.json head node-1 node-2        # sweep the fleet
+$PROBE --hosts-file hosts.txt --include-local      # or read hosts from a file
+```
+
+The sweep is **read-only by construction**: it reads `/proc`, `/sys`,
+`/etc/os-release` and `/etc/docker/daemon.json`, runs query-only commands (`ip`,
+`ss`, `docker ps`, `nvidia-smi`, `systemctl list-units`), and uses `sudo` for
+nothing but `sudo -n true` to detect passwordless sudo. It emits one JSON record
+per host covering identity, GPUs, containers and their restart policies,
+addresses on every plane (LAN / overlay / RDMA fabric), listening ports, and
+per-node access shape. A host that cannot be reached still gets a record, with
+an `error` field, and the sweep exits nonzero — an unprobed node is a finding,
+not an omission.
+
+The skill then walks a six-phase flow (scope → enumerate → probe → interview →
+render → verify) and fills `templates/` to produce a `<cluster>-cluster` skill,
+installed for both Claude Code and Codex. Layout:
+
+| Path | Holds |
+|---|---|
+| `SKILL.md` | Entry points, non-negotiables, symptom → diagnostics index |
+| `reference/onboarding.md` | The six phases, the interview questions, how to read probe output |
+| `reference/diagnostics.md` | Portable failure patterns: overlay collisions, reboot survival, RDMA verification, telemetry that lies, ingress and routing |
+| `reference/contract.md` | Authoring rules, when to update, anti-drift, how to retire a skill |
+| `templates/` | The cluster skill, topology, and runbook templates |
+| `scripts/probe-cluster.sh` | The read-only discovery sweep |
+
+The split is deliberate: `cluster-ops` holds what is true of clusters in
+general, a `<cluster>-cluster` skill holds what is true of one fleet. Keeping
+facts on the right side of that line means a fix reaches every cluster instead
+of one.
 
 ## Manual Installation
 
