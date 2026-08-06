@@ -58,8 +58,33 @@ if (export HOME="$scratch/home"; assert_skill_linked broken-skill) >/dev/null 2>
   exit 1
 fi
 
+# assert_skill_linked must also fail when SKILL.md links a reference document
+# that is not installed, so progressive-disclosure skills cannot ship with
+# dangling links that only surface when an agent tries to read them.
+mkdir -p "$scratch/skill-src/dangling-skill"
+printf -- '---\nname: dangling-skill\ndescription: test\n---\nSee [x](reference/missing.md)\n' \
+  > "$scratch/skill-src/dangling-skill/SKILL.md"
+for agent_dir in .claude .codex .agents; do
+  mkdir -p "$scratch/home/$agent_dir/skills"
+  ln -s "$scratch/skill-src/dangling-skill" "$scratch/home/$agent_dir/skills/dangling-skill"
+done
+if (export HOME="$scratch/home"; assert_skill_linked dangling-skill) >/dev/null 2>&1; then
+  echo "FAIL: assert_skill_linked unexpectedly succeeded with a missing reference doc" >&2
+  exit 1
+fi
+
+# The same helper must still pass once the referenced document exists, so the
+# check cannot be satisfied by failing unconditionally.
+mkdir -p "$scratch/skill-src/dangling-skill/reference"
+echo "present" > "$scratch/skill-src/dangling-skill/reference/missing.md"
+if ! (export HOME="$scratch/home"; assert_skill_linked dangling-skill) >/dev/null 2>&1; then
+  echo "FAIL: assert_skill_linked failed on a skill whose reference docs all resolve" >&2
+  exit 1
+fi
+
 # Every repo-managed skill must carry a SKILL.md with name/description
-# frontmatter, or agents cannot discover it.
+# frontmatter, or agents cannot discover it, and every reference document it
+# links must exist in the repo.
 for skill_dir in .agent/skills/*/; do
   skill_md="$skill_dir/SKILL.md"
   if [ ! -f "$skill_md" ]; then
@@ -73,6 +98,12 @@ for skill_dir in .agent/skills/*/; do
   for field in name description; do
     if ! sed -n '2,/^---$/p' "$skill_md" | grep -q "^$field:"; then
       echo "FAIL: $skill_md frontmatter is missing '$field'" >&2
+      exit 1
+    fi
+  done
+  for ref in $(grep -o 'reference/[A-Za-z0-9._-]*\.md' "$skill_md" 2>/dev/null | sort -u || true); do
+    if [ ! -f "$skill_dir/$ref" ]; then
+      echo "FAIL: $skill_md links $ref, which does not exist" >&2
       exit 1
     fi
   done

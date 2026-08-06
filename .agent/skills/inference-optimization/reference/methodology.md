@@ -14,6 +14,12 @@ Every conclusion drawn from it had to be retracted.
 length, kernel backend, graph mode, or any flag you change, the cause is almost
 never the software you are editing.
 
+In a distributed job, validate **every node**, not the cluster. A tensor-parallel
+server runs at the speed of its worst rank, so one degraded GPU presents as a
+uniformly slow cluster: measured, a single power-braked GPU held a two-node
+server at ~9 tok/s that reached ~90 once it was fixed. See
+[multi-node.md](multi-node.md).
+
 ## 2. Profile before hypothesizing
 
 Four hypotheses were tested by full server restarts before anyone profiled:
@@ -46,9 +52,47 @@ kernel moved the number by only 20%.
 Order-of-magnitude agreement is weak evidence. Say so when presenting it, and
 design a test that *discriminates* rather than one that merely confirms.
 
-## 4. Read the sources before inferring
+## 4. Read the sources, not the labels
 
-Two errors from reading filenames instead of code:
+### The running artifact is a variable — verify it first
+
+The most expensive single lesson here. Days were spent explaining a performance
+gap between two clusters as a driver difference, a userspace-library mismatch,
+and a kernel bug — while the actual delta was that **the reference machine was
+running a different container image than everyone believed**.
+
+What made it invisible:
+
+- **Baked-in version strings lie.** Environment variables in the image announced
+  a nightly build tag; `docker inspect --format '{{.Config.Image}}'` reported a
+  stable release. The env vars were stale metadata from the build, not truth.
+- **Published configs are not running configs.** The launch command shared
+  publicly differed from the one on disk in the container, in both directions
+  over time (documented graph mode, actually eager; later the reverse).
+- The reference system had been **updated mid-investigation**, invalidating
+  comparisons made a day earlier.
+
+When reproducing someone else's number, treat the artifact as the first thing to
+compare, not the last:
+
+```bash
+docker inspect "$C" --format '{{.Config.Image}}{{"\n"}}{{.Config.Cmd}}'
+docker inspect "$C" --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+docker exec "$C" python3 -c "import vllm; print(vllm.__version__)"
+```
+
+Read the **mounted launch script**, not the documentation. And confirm the
+library versions the process actually loaded (see [multi-node.md](multi-node.md)).
+
+### Newer is not better; the right build is the one with your kernels
+
+For a new accelerator, build selection is a correctness question before it is a
+performance one. On one generation: the current stable release lacked the
+architecture's kernels entirely and would not start; two nightlies deadlocked
+mid-decode; a *later stable release* was the fix and ran ~10x faster than the
+nightlies that did start. Pin what you validated and re-verify on every bump.
+
+### Two errors from reading filenames instead of code
 
 - A vendor overlay was assumed to be hand-written performance kernels. Its own
   `PATCHES.md` stated the changes were multi-sequence **correctness** fixes and
@@ -73,6 +117,10 @@ Each of these produced a materially wrong number at least once:
   wall-clock-including-prefill reported 47–140 tok/s while the engine's own
   counters showed 180–205. If aggregate is *below* per-stream, the denominator
   is wrong.
+- **Prefix caching.** Re-running a long-context benchmark with the same or a
+  similar prompt measures the cache, not prefill. A 337k-token request appeared
+  to prefill in 2.4 s on a near-identical payload. Vary the prompt per run, or
+  disable prefix caching when prefill is the number you are reporting.
 - **Reasoning tokens.** Thinking modes silently consume decode budget. Disable
   for raw throughput numbers.
 - **Piping through `tail`/`head`.** Buffers everything until exit; no interim
@@ -124,7 +172,39 @@ Enumerate the *supported-for-your-format* set before planning around a backend.
   survive a retracted theory and remain useful; inferences do not.
 - Flag confounds as they appear, not after they invalidate a conclusion.
 
-## 10. Deliver the operational wins separately
+## 10. Assume more than one cause
+
+A large gap is often a product of independent factors, and fixing one leaves a
+still-large gap that invites you to discard a correct fix.
+
+Measured: a ~100x shortfall was **two** unrelated problems — a software/config
+delta worth ~9x, and a hardware fault on one node worth ~7x. Correcting the
+software took the server from ~1 to ~9 tok/s, still ~10x short, which looked like
+evidence that the config theory was wrong. It was not; the remaining factor was a
+loose power cable.
+
+- After a fix lands, **re-measure and re-decompose** rather than judging it
+  against the original target.
+- A partial improvement that does not reach the goal is not a refuted hypothesis.
+- Conversely, do not stop at the first cause that produces a real gain.
+
+## 11. Reproducing someone else's number
+
+- **Ask what the number measures.** A headline "up to N tok/s" was a short-output,
+  warm-cache peak; sustained throughput on the same hardware and software was
+  ~30% lower. Both are true; only one is a service level. Reproduce the
+  *methodology* (output length, temperature, concurrency, warm state) before
+  concluding anything about the gap.
+- **Get access to the reference system if it exists.** One direct comparison of
+  the running artifact was worth more than days of local hypothesis testing —
+  and see §4 for why the artifact, not the documentation, is the thing to compare.
+- **Compare static facts first** (hardware, topology, fabric, driver, image,
+  launch command), then dynamic ones. Cheap, and it retires whole branches.
+- **A claim can be real and still not reproducible for you.** Ending with
+  "confirmed, and here is what it takes" is a complete result; so is "confirmed
+  for their configuration, blocked on ours by X".
+
+## 12. Deliver the operational wins separately
 
 Even with the headline question unresolved, this exercise produced durable
 results worth shipping on their own: a concurrency-dependent speculative-decoding

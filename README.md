@@ -36,10 +36,12 @@ Claude Code (`~/.claude/skills`), Codex (`~/.codex/skills`), and the shared agen
 skill directory (`~/.agents/skills`). Existing skill installations are preserved.
 
 - **brev-cli** — manage GPU cloud instances.
-- **inference-optimization** — diagnose and tune LLM inference throughput.
-  Leads with GPU hardware validation, because a throttled GPU makes every
-  software measurement meaningless (see the skill's `reference/` for a case
-  study where identical GPUs differed 7x).
+- **inference-optimization** — diagnose and tune LLM inference throughput,
+  single-node or multi-node. Leads with GPU hardware validation, because a
+  throttled GPU makes every software measurement meaningless (see the skill's
+  `reference/` for a case study where identical GPUs differed 7x). Also covers
+  sizing a model against the KV-cache budget, tensor-parallel and NCCL pitfalls,
+  and validating that tool calling survives every hop to the client.
 
 It also sets Claude Code's default permission mode to **auto mode** by writing
 `"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`

@@ -38,6 +38,44 @@ evidence *against* the hardware.
 Rule: an asserted `HW Slowdown` is a blocker, not a footnote. Stop and get a
 second machine.
 
+## When it really is hardware: exhaust remote levers, then discriminate
+
+Once a power brake is confirmed, the useful question is **environment or box** —
+because the answers are "call the facility" and "open the chassis" respectively.
+
+Remote levers, in increasing order of disruption. None of these cleared a
+genuine power-delivery fault, and knowing that saves a day of hoping:
+
+```bash
+nvidia-smi -r -i "$GPU"                  # GPU reset
+reboot                                   # warm reboot
+ipmitool -H "$BMC" -U "$U" -P "$P" -I lanplus chassis power off   # BMC off,
+ipmitool ... chassis power on                                    #   drain, on
+ipmitool ... mc reset cold               # BMC cold reset
+# full AC cord pull + hold power button ~30 s (drains standby rails)
+```
+
+A brake that survives an AC drain is physical. `0x80` (HW Power Brake) is an
+**external signal into the GPU**, not a software state — it cannot be cleared by
+anything you type.
+
+**Then design the discriminating test.** The candidates were "this circuit cannot
+deliver enough power" and "this machine cannot". Two experiments settled it:
+
+1. Power the healthy machine fully off so the suspect one had the circuit to
+   itself — still braked. Rules out contention.
+2. **Swap the two machines' outlets.** The healthy box ran at full speed on the
+   suspect outlet; the suspect box stayed braked on the proven-good outlet.
+
+The fault followed the **box**, not the outlet. That is a one-hour test that
+converts "maybe it's the power in this room" into a hardware ticket with
+evidence. The actual defect was a partially seated GPU power cable inside the
+chassis; reseating it restored full performance.
+
+Order of physical remediation: reseat GPU power connectors, then check the PSU,
+then RMA. Note that moving the machine to a different outlet is *not* a fix — if
+the fault follows the box, it will follow it there too.
+
 ## Checks, in order
 
 ```bash
@@ -74,6 +112,14 @@ substantial fraction of TDP. Idle-ish power at high utilization is wrong.
 - **`power.draw` is the trustworthy signal** for whether real work is happening.
 - **Max clocks do not imply health.** Both machines sat at 2070 MHz while
   differing 7x in throughput.
+
+## Multi-node jobs
+
+The checks above are per-GPU, and a distributed server hides which rank is sick:
+tensor parallelism runs at the speed of its worst rank, so one degraded GPU looks
+like a uniformly slow cluster. Run a standalone compute benchmark on **every**
+node before launching or profiling the distributed job — see
+[multi-node.md](multi-node.md).
 
 ## Multi-GPU hosts
 

@@ -400,16 +400,26 @@ link_agent_skill() {
 }
 
 # Assert a skill resolves to a readable SKILL.md from every agent skill
-# directory. Catches broken symlinks and partially-installed skills.
+# directory, and that every reference/ document SKILL.md links resolves too.
+# Catches broken symlinks, partially-installed skills, and progressive-disclosure
+# links that point at files which were never installed.
 assert_skill_linked() {
   local skill_name="$1"
-  local skills_dir
+  local skills_dir skill_md ref
   for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
-    if [ ! -r "$skills_dir/$skill_name/SKILL.md" ]; then
-      warn "$skill_name skill is not readable at $skills_dir/$skill_name/SKILL.md"
+    skill_md="$skills_dir/$skill_name/SKILL.md"
+    if [ ! -r "$skill_md" ]; then
+      warn "$skill_name skill is not readable at $skill_md"
       record_failure "$skill_name-skill"
       return 1
     fi
+    for ref in $(grep -o 'reference/[A-Za-z0-9._-]*\.md' "$skill_md" 2>/dev/null | sort -u || true); do
+      if [ ! -r "$skills_dir/$skill_name/$ref" ]; then
+        warn "$skill_name skill links missing document $ref at $skills_dir/$skill_name/$ref"
+        record_failure "$skill_name-skill"
+        return 1
+      fi
+    done
   done
   return 0
 }
