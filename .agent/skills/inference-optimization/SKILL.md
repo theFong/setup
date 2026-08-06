@@ -52,6 +52,19 @@ honest signal for whether real work is happening.
 | 99% util, power near TDP | Genuinely busy — optimize software |
 | Perf invariant to every config change | Environment, not software |
 
+**First confirm the power reading covers the whole part.** On integrated /
+unified-memory accelerators it is **die-only and excludes memory**, so row 1 above
+is a false positive: a saturated memory-bound workload legitimately reports low
+wattage. Measured on one such part, the die accounted for only ~30% of the real
+idle→load system delta.
+
+```bash
+nvidia-smi -q | grep -A3 "Module Power Readings"   # "N/A" => die-only telemetry
+```
+
+With die-only telemetry, fall back to clocks + throttle reasons for health, and
+never use wattage for capacity or cost estimates.
+
 **If more than one machine exists, baseline a second one before deep work.**
 One comparative run costs less than a day of misattributed profiling.
 
@@ -162,9 +175,9 @@ The habits that would have saved the most time are in
 
 ## References
 
-- **[reference/hardware-validation.md](reference/hardware-validation.md)** — GPU health checks, faulty-GPU case study, isolating a physical fault
+- **[reference/hardware-validation.md](reference/hardware-validation.md)** — GPU health checks, faulty-GPU case study, isolating a physical fault, die-only power telemetry
 - **[reference/memory-budget.md](reference/memory-budget.md)** — KV/weights budget, the context-concurrency-accuracy trilemma
-- **[reference/multi-node.md](reference/multi-node.md)** — tensor-parallel serving, NCCL loading, fabric checks, startup cost
-- **[reference/serving-stack.md](reference/serving-stack.md)** — parsers, gateways, streaming, served limits
-- **[reference/methodology.md](reference/methodology.md)** — benchmarking pitfalls, artifact verification, reasoning discipline
+- **[reference/multi-node.md](reference/multi-node.md)** — tensor-parallel serving, NCCL loading, fabric checks and exoneration, collective sizing/MTU, startup cost
+- **[reference/serving-stack.md](reference/serving-stack.md)** — parsers, gateways, streaming, served limits, replica routing vs prefix-cache locality
+- **[reference/methodology.md](reference/methodology.md)** — benchmarking pitfalls, throughput identities and ceilings, artifact verification, reasoning discipline
 - **[reference/vllm-tuning.md](reference/vllm-tuning.md)** — vLLM knobs, MoE backends, measured results

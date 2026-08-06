@@ -76,6 +76,46 @@ the agent stops after one turn having done nothing.
   written — this breaks silently when you re-serve a different checkpoint on the
   same endpoint.
 
+## Load balancing replicas can destroy prefix-cache locality
+
+Each engine replica holds its **own** prefix cache in its own KV pool. Nothing is
+shared between them. So a gateway that spreads requests across replicas by load,
+latency or round-robin is making a **performance** decision, not just an
+availability one.
+
+Why it matters: agent traffic resends a long, growing conversation every turn, so
+the shared prefix is nearly the whole prompt. One measured deployment sustained a
+**79.4% prefix-cache hit rate** precisely because each conversation kept landing
+on the same replica. Read yours from the engine:
+
+```
+vllm:prefix_cache_queries_total
+vllm:prefix_cache_hits_total
+```
+
+The value at stake is the gap between cached and cold prefill. Measured on one
+deployment: **~2,000 tok/s cold versus ~7,400 tok/s** with cache hits — a 3.6x
+swing on time-to-first-token for a large prompt. With two replicas and no
+affinity, a conversation's next turn lands on the cold replica about half the
+time.
+
+Check before you scale out horizontally:
+
+- Does the router support **session affinity or prefix-aware routing**? Common
+  strategies (round-robin/shuffle, least-busy, lowest-latency, cost-based) are
+  all cache-blind. A router that cannot pin a conversation to a replica will
+  trade your hit rate for its balance.
+- If it cannot, prefer **separate endpoints** clients choose deliberately, or a
+  routing plugin that hashes a stable session key to one replica. Perfect
+  locality on one replica can beat balanced traffic across two.
+- Measure it rather than assuming: compare hit rate before and after adding the
+  second replica. A throughput win that halves the hit rate can be a net loss on
+  prefill-heavy workloads.
+
+Latency-based routing is the least-bad cache-blind option when one replica is
+local and another is remote: it naturally prefers the near replica and spills
+only under load, which incidentally preserves locality.
+
 ## Served limits are not the model's limits
 
 The checkpoint advertises an architectural maximum; the deployment enforces

@@ -42,6 +42,36 @@ What to extract:
 
 If no kernel exceeds ~15%, **there is no single fix** — stop looking for one.
 
+### Write the governing identity down, then bound each term
+
+Before tuning, state throughput as an equation and measure whether each term can
+actually move. For speculative decoding it is exactly:
+
+```
+tokens/s  =  acceptance_length / step_time
+```
+
+On one measured deployment both terms turned out to be pinned:
+
+- **`step_time` was invariant** — identical for code and prose prompts, and
+  unchanged by every configuration tried. It moved only with batch size and
+  context length, meaning ~85% of a single-stream step was fixed weight
+  streaming, not token work.
+- **`acceptance_length` was capped by the checkpoint**, whose draft block size
+  set a hard maximum of k+1. Real workloads landed well under it, and the drafter
+  produced the whole block in one parallel pass, so there was no per-draft-token
+  latency to reclaim either.
+
+Dividing the cap by the floor gives the ceiling **with a hypothetical perfect
+drafter** — which came out only ~40% above what was already being achieved, and
+below the target that had been requested.
+
+This converts "make it faster" into a closed question, and it is the cheapest
+possible experiment: two measurements and a division, versus a restart-and-guess
+loop at ~1 h per hypothesis. When the ceiling lands below the goal, **say so and
+redirect** — the honest deliverable is "this is a hardware property, here is the
+axis that is not saturated" (see §12), not another week of knobs.
+
 ## 3. Matching magnitude is not evidence of mechanism
 
 An arithmetic estimate ("if the kernel reads all 256 experts, that is ~138 GB,

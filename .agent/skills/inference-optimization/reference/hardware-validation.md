@@ -109,9 +109,49 @@ substantial fraction of TDP. Idle-ish power at high utilization is wrong.
   (Grace-Blackwell). It read a constant 0% across every configuration tested,
   including ones that were demonstrably moving weights. Do not build an argument
   on it.
-- **`power.draw` is the trustworthy signal** for whether real work is happening.
+- **`power.draw` is the trustworthy signal** for whether real work is happening —
+  **on discrete parts.** See the caveat below before applying it to an integrated
+  accelerator.
 - **Max clocks do not imply health.** Both machines sat at 2070 MHz while
   differing 7x in throughput.
+
+### On integrated parts, `power.draw` is die-only — low wattage is not idleness
+
+The case study above reads a low power draw as the symptom of a throttled part.
+That inference is sound for a discrete accelerator with a module-level meter. It
+inverts on integrated / unified-memory designs, where the reported figure covers
+the **die only and excludes the memory subsystem**.
+
+Measured on a small unified-memory accelerator running a memory-bandwidth-bound
+MoE decode, two nodes:
+
+| | die (reported) | pair |
+|---|---|---|
+| idle | 10.5 / 10.9 W | 21.4 W |
+| sustained load (16 concurrent) | 54.1 / 42.8 W | 96.9 W |
+
+The published *system* wall-power delta for the same idle→load transition on that
+hardware is ~250 W for the pair, so the reported die figure accounts for only
+**~30%** of the real increase. The rest is memory, CPU and PSU loss. Corroborating
+evidence that the part was genuinely saturated: SM clocks pinned at maximum with
+every throttle reason inactive, and aggregate throughput flat against concurrency.
+
+Two consequences:
+
+- **Do not conclude "the GPU is starved" from a low wattage** on such a part. It
+  is the expected signature of a memory-bound workload, and chasing it wastes the
+  same time the case study's throttle hunt saves.
+- **Do not price or capacity-plan from it.** The die reading understated real
+  system draw by ~3x here. If the platform exposes no module meter, no BMC and no
+  `/sys/class/power_supply`, there is no on-box path to true wall power — use the
+  vendor's published figures or an external meter, and label the number an
+  estimate.
+
+Check which you have before trusting the counter:
+
+```bash
+nvidia-smi -q | grep -A3 "Module Power Readings"   # "N/A" => die-only telemetry
+```
 
 ## Multi-node jobs
 

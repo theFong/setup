@@ -53,7 +53,56 @@ of it is. That test cleared 20k allgathers while the server it mimicked was
 deadlocking.
 
 Note also that a network-bound rank *idles*. High utilization with low power
-across all ranks is a hardware or kernel symptom, not a fabric one.
+across all ranks is a hardware or kernel symptom, not a fabric one — **unless the
+part reports die-only power**, in which case low wattage is uninformative; see
+`hardware-validation.md`.
+
+### The strongest exoneration is a null result under a large perturbation
+
+Direct measurement (above) shows the link *can* go fast. It does not prove the
+link is irrelevant to your workload. The decisive test is to **change the fabric
+substantially and show the target metric does not move.**
+
+Two real defects were found and fixed on one two-node pair, cutting packets per
+decode step **16,878 → 6,498 (−62%)**. Median step time changed by **0.0 ms**.
+
+A 62% reduction in packet count producing no measurable change is far stronger
+evidence than any single latency number, and it retires the entire "it must be
+the network" line permanently. Record such a result explicitly, with the delta
+you achieved — otherwise the next person re-runs the same week of work.
+
+Both defects are worth checking anyway, because they cost memory and batch
+throughput even when they cost no latency:
+
+- **NCCL picks far too many channels for small rings.** It defaulted to **64
+  channels for a 2-rank ring**, slicing each ~48 KB tensor-parallel allreduce
+  into ~750 B fragments. Capping it recovered NCCL buffer memory — most of a
+  **+19.9% KV pool** — and lifted aggregate throughput at high concurrency ~10%:
+  ```bash
+  NCCL_MAX_NCHANNELS=4
+  NCCL_MIN_NCHANNELS=4
+  ```
+  This is the same lesson as "features are resident weights" in
+  `memory-budget.md`: collective buffers compete with the KV cache.
+- **The high-speed rail may default to MTU 1500**, which forces a small RoCE path
+  MTU and fragments every collective. Set 9000 and persist it in the connection
+  profile, then confirm the port is still ACTIVE at full rate and that jumbo
+  frames actually pass end to end (`ping -M do -s 8972`).
+
+### Fabric headroom is usually enormous relative to need
+
+For tensor-parallel **decode**, the collectives are small and latency-sensitive,
+not bandwidth-hungry. One measured pair sustained ~400 tok/s aggregate while the
+rail carried **1.6 Gb/s of an available 200 Gb/s**.
+
+Corroborating: two otherwise identical pairs, one cabled with **two** links and
+one with **one**, benchmarked within noise of each other at every concurrency.
+
+Do not generalize this past its scope — it is a statement about TP decode at
+small rank counts. Prefill-heavy traffic, higher TP degree, expert parallelism
+and cross-node KV sharding all move real volume, and `memory-budget.md` measures
+a case where a cross-node collective in the decode path cost ~60% of per-stream
+throughput.
 
 ## Setting an environment variable is not loading a library
 
