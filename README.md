@@ -10,7 +10,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
 - **webshell/** — Browser terminal (ttyd + tmux) with persistent sessions, clickable tabs, and copy-to-clipboard (see below)
-- **.agent/skills/** — Custom Claude Code skills (brev-cli, outlook-calendar, skill-creator, etc.)
+- **.agent/skills/** — Custom Claude Code skills (brev-cli, inference-optimization, outlook-calendar, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
 
 ## Quick Start (new machine)
@@ -31,9 +31,15 @@ Each install is verified by checking that its expected command is available on
 `PATH`. The bootstrap continues attempting the remaining tools after a failure,
 then exits nonzero if anything is still missing.
 
-The repo-managed Brev skill is linked into Claude Code (`~/.claude/skills`),
-Codex (`~/.codex/skills`), and the shared agent skill directory
-(`~/.agents/skills`). Existing Brev skill installations are preserved.
+The repo-managed skills (`brev-cli`, `inference-optimization`) are linked into
+Claude Code (`~/.claude/skills`), Codex (`~/.codex/skills`), and the shared agent
+skill directory (`~/.agents/skills`). Existing skill installations are preserved.
+
+- **brev-cli** — manage GPU cloud instances.
+- **inference-optimization** — diagnose and tune LLM inference throughput.
+  Leads with GPU hardware validation, because a throttled GPU makes every
+  software measurement meaningless (see the skill's `reference/` for a case
+  study where identical GPUs differed 7x).
 
 It also sets Claude Code's default permission mode to **auto mode** by writing
 `"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`

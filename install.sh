@@ -372,30 +372,51 @@ link_dotfiles() {
   log "linked Claude config into ~/.claude"
 }
 
-# Make the repo-managed Brev skill available to Claude Code, Codex, and other
-# agents. Existing skill installations are preserved.
-link_brev_skill() {
-  local skill_source="$HOME/.setup/.agent/skills/brev-cli"
+# Make a repo-managed skill available to Claude Code, Codex, and other agents.
+# Existing skill installations are preserved. Usage: link_agent_skill <name>
+link_agent_skill() {
+  local skill_name="$1"
+  local skill_source="$HOME/.setup/.agent/skills/$skill_name"
   local skills_dir target
   if [ ! -f "$skill_source/SKILL.md" ]; then
-    warn "Brev skill source not found at $skill_source"
-    record_failure brev-skill
+    warn "$skill_name skill source not found at $skill_source"
+    record_failure "$skill_name-skill"
     return 1
   fi
 
   for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
     mkdir -p "$skills_dir"
-    target="$skills_dir/brev-cli"
+    target="$skills_dir/$skill_name"
     if [ ! -e "$target" ] && [ ! -L "$target" ]; then
       if ! ln -s "$skill_source" "$target"; then
-        warn "failed to link Brev skill into $skills_dir"
-        record_failure brev-skill
+        warn "failed to link $skill_name skill into $skills_dir"
+        record_failure "$skill_name-skill"
         return 1
       fi
     fi
   done
-  log "linked Brev skill into Claude Code, Codex, and agent skill directories"
+  assert_skill_linked "$skill_name" || return 1
+  log "linked $skill_name skill into Claude Code, Codex, and agent skill directories"
 }
+
+# Assert a skill resolves to a readable SKILL.md from every agent skill
+# directory. Catches broken symlinks and partially-installed skills.
+assert_skill_linked() {
+  local skill_name="$1"
+  local skills_dir
+  for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
+    if [ ! -r "$skills_dir/$skill_name/SKILL.md" ]; then
+      warn "$skill_name skill is not readable at $skills_dir/$skill_name/SKILL.md"
+      record_failure "$skill_name-skill"
+      return 1
+    fi
+  done
+  return 0
+}
+
+link_brev_skill() { link_agent_skill brev-cli; }
+
+link_inference_optimization_skill() { link_agent_skill inference-optimization; }
 
 # ---------------------------------------------------------------------------
 
@@ -431,6 +452,7 @@ main() {
   configure_claude       || warn "configuring Claude default mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
   link_brev_skill        || warn "linking Brev skill failed"
+  link_inference_optimization_skill || warn "linking inference-optimization skill failed"
   summary
 }
 

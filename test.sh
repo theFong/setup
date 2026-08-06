@@ -41,4 +41,41 @@ if [ "$(cat "$scratch/home/.claude/settings.json")" != "not json" ]; then
   exit 1
 fi
 
+# link_agent_skill must fail (not silently succeed) when the skill source is
+# absent, and assert_skill_linked must fail on a broken symlink rather than
+# reporting a healthy install.
+FAILED=""
+if (export HOME="$scratch/home"; link_agent_skill setup-test-skill-does-not-exist) >/dev/null 2>&1; then
+  echo "FAIL: link_agent_skill unexpectedly succeeded for a missing skill source" >&2
+  exit 1
+fi
+
+mkdir -p "$scratch/home/.claude/skills" "$scratch/home/.codex/skills" "$scratch/home/.agents/skills"
+ln -s "$scratch/nonexistent-skill-target" "$scratch/home/.claude/skills/broken-skill"
+FAILED=""
+if (export HOME="$scratch/home"; assert_skill_linked broken-skill) >/dev/null 2>&1; then
+  echo "FAIL: assert_skill_linked unexpectedly succeeded on a broken symlink" >&2
+  exit 1
+fi
+
+# Every repo-managed skill must carry a SKILL.md with name/description
+# frontmatter, or agents cannot discover it.
+for skill_dir in .agent/skills/*/; do
+  skill_md="$skill_dir/SKILL.md"
+  if [ ! -f "$skill_md" ]; then
+    echo "FAIL: $skill_dir has no SKILL.md" >&2
+    exit 1
+  fi
+  if ! head -1 "$skill_md" | grep -q '^---$'; then
+    echo "FAIL: $skill_md does not start with YAML frontmatter" >&2
+    exit 1
+  fi
+  for field in name description; do
+    if ! sed -n '2,/^---$/p' "$skill_md" | grep -q "^$field:"; then
+      echo "FAIL: $skill_md frontmatter is missing '$field'" >&2
+      exit 1
+    fi
+  done
+done
+
 log "all negative tests passed"
