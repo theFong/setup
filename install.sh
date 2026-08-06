@@ -518,7 +518,7 @@ link_dotfiles() {
 # Repo-managed skills linked into every supported agent's skills directory.
 # Add a skill here and it becomes available to Claude Code, Codex, and any
 # other agent that reads ~/.agents/skills.
-AGENT_SKILLS="brev-cli cluster-ops"
+AGENT_SKILLS="brev-cli cluster-ops inference-optimization"
 
 # The agent skill directories the bootstrap wires up. ~/.claude/skills is
 # normally a symlink to the repo's .agent/skills (see link_dotfiles), so skills
@@ -536,10 +536,20 @@ agent_skill_dirs() {
 # dangling symlink (repo moved, skill renamed) still satisfies the
 # `[ ! -e ] && [ ! -L ]` create-guard in link_agent_skills and would leave
 # every agent silently without the skill.
+#
+# Every reference/ document SKILL.md links must resolve too: a progressive-
+# disclosure skill is only half-installed if its level-3 files are missing, and
+# that surfaces as an agent failing to read a doc mid-task rather than at boot.
 assert_agent_skill() {
-  local name="$1" skills_dir missing=""
+  local name="$1" skills_dir ref missing=""
   for skills_dir in $(agent_skill_dirs); do
-    [ -r "$skills_dir/$name/SKILL.md" ] || missing="$missing $skills_dir"
+    if [ ! -r "$skills_dir/$name/SKILL.md" ]; then
+      missing="$missing $skills_dir"
+      continue
+    fi
+    for ref in $(grep -o 'reference/[A-Za-z0-9._-]*\.md' "$skills_dir/$name/SKILL.md" 2>/dev/null | sort -u || true); do
+      [ -r "$skills_dir/$name/$ref" ] || missing="$missing $skills_dir/$name/$ref"
+    done
   done
   if [ -n "$missing" ]; then
     warn "skill $name is not readable through:$missing"

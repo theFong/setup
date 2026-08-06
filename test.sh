@@ -385,6 +385,58 @@ if (export HOME="$scratch/danglinghome"; assert_agent_skill brev-cli) >/dev/null
   exit 1
 fi
 
+# assert_agent_skill must also fail when SKILL.md links a reference/ document
+# that is not installed. A progressive-disclosure skill whose level-3 files are
+# missing reads as healthy at boot and only fails when an agent tries to open
+# one mid-task.
+mkdir -p "$scratch/skill-src/dangling-skill"
+printf -- '---\nname: dangling-skill\ndescription: test\n---\nSee [x](reference/missing.md)\n' \
+  > "$scratch/skill-src/dangling-skill/SKILL.md"
+for d in .claude .codex .agents; do
+  mkdir -p "$scratch/refhome/$d/skills"
+  ln -s "$scratch/skill-src/dangling-skill" "$scratch/refhome/$d/skills/dangling-skill"
+done
+if (export HOME="$scratch/refhome"; assert_agent_skill dangling-skill) >/dev/null 2>&1; then
+  echo "FAIL: assert_agent_skill accepted a skill with a missing reference doc" >&2
+  exit 1
+fi
+
+# ...and must pass once that document exists, so the check above cannot be
+# satisfied by an assertion that simply always fails.
+mkdir -p "$scratch/skill-src/dangling-skill/reference"
+echo "present" > "$scratch/skill-src/dangling-skill/reference/missing.md"
+if ! (export HOME="$scratch/refhome"; assert_agent_skill dangling-skill) >/dev/null 2>&1; then
+  echo "FAIL: assert_agent_skill rejected a skill whose reference docs all resolve" >&2
+  exit 1
+fi
+
+# Every repo-managed skill must carry a SKILL.md with name/description
+# frontmatter, or agents cannot discover it, and every reference document it
+# links must exist in the repo.
+for skill_dir in .agent/skills/*/; do
+  skill_md="$skill_dir/SKILL.md"
+  if [ ! -f "$skill_md" ]; then
+    echo "FAIL: $skill_dir has no SKILL.md" >&2
+    exit 1
+  fi
+  if ! head -1 "$skill_md" | grep -q '^---$'; then
+    echo "FAIL: $skill_md does not start with YAML frontmatter" >&2
+    exit 1
+  fi
+  for field in name description; do
+    if ! sed -n '2,/^---$/p' "$skill_md" | grep -q "^$field:"; then
+      echo "FAIL: $skill_md frontmatter is missing '$field'" >&2
+      exit 1
+    fi
+  done
+  for ref in $(grep -o 'reference/[A-Za-z0-9._-]*\.md' "$skill_md" 2>/dev/null | sort -u || true); do
+    if [ ! -f "$skill_dir/$ref" ]; then
+      echo "FAIL: $skill_md links $ref, which does not exist" >&2
+      exit 1
+    fi
+  done
+done
+
 # webshell helpers must fail loudly when misused rather than drawing a broken
 # UI. These paths exit before any tmux call, so no server or client is needed.
 if ./webshell/tmux-groups >/dev/null 2>&1; then
