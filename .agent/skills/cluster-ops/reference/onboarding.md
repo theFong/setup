@@ -34,19 +34,57 @@ ownership are the two things that cannot be discovered by probing.
 
 ## Phase 1 — Enumerate the hosts
 
-Get a host list before probing. In rough order of reliability:
+Get a host list before probing.
+
+### If the fleet is brev-managed
+
+The probe enumerates it for you — `--brev` takes physical nodes,
+`--brev-instances` takes cloud instances, and they combine:
 
 ```bash
-brev ls && brev ls nodes            # if the fleet is brev-managed (see the brev-cli skill)
-awk '/^Host /{print $2}' ~/.ssh/config ~/.brev/ssh_config 2>/dev/null
-kubectl get nodes -o wide           # if Kubernetes-managed
-sinfo -N -o '%N %f'                 # if Slurm-managed
+brev refresh                         # gateway ports rotate; do this first
+"$SKILL_DIR/scripts/probe-cluster.sh" --brev --brev-instances -o /tmp/<cluster>-probe.json
 ```
 
-Then reconcile with the operator: ask explicitly **"is anything missing from
-this list, and is anything on it decommissioned?"** Control planes routinely
-disagree with reality. Expect to find nodes that are listed but disconnected,
-and nodes that exist but were never registered.
+Three things the brev control plane will do to you, all covered in depth by the
+**`brev-cli`** skill:
+
+- **`brev ls` and `brev ls nodes` are separate lists.** Cloud instances never
+  appear in `brev ls nodes`, physical nodes never appear in `brev ls`, and
+  `brev ls --all` is **not** a substitute. Sweep both or you will miss half the
+  fleet. This is why the flags are separate.
+- **The two `--json` shapes differ.** `brev ls nodes --json` is a bare array;
+  `brev ls --json` wraps its rows under `.workspaces`. The same `jq` filter on
+  the wrong one fails with `Cannot index array with string "name"`.
+- **`Connected` means registered, not reachable.** A node can report Connected
+  while SSH hangs. The probe deliberately sweeps non-Connected nodes too and
+  warns which they are up front — an unreachable node belongs in the inventory
+  as unverified, not omitted.
+
+Names double as SSH aliases because `brev refresh` writes them into
+`~/.brev/ssh_config`, which `~/.ssh/config` Includes — so plain `ssh <node>`
+works and `brev shell` is not needed. **Do not pass `-F ~/.brev/ssh_config`**:
+it is redundant, and it breaks literal-prefix tool-permission rules like
+`Bash(ssh spark-1:*)`, so every command re-prompts.
+
+The probe never runs `brev refresh` itself — that writes to `~/.brev/`, and the
+sweep stays read-only. Run it yourself when a host stops resolving.
+
+### Otherwise
+
+```bash
+awk '/^Host /{print $2}' ~/.ssh/config 2>/dev/null   # whatever SSH already knows
+kubectl get nodes -o wide                            # Kubernetes-managed
+sinfo -N -o '%N %f'                                  # Slurm-managed
+```
+
+Feed the result in with `--hosts-file`, or as plain arguments.
+
+### Then reconcile with the operator
+
+Ask explicitly: **"is anything missing from this list, and is anything on it
+decommissioned?"** Control planes routinely disagree with reality. Expect nodes
+that are listed but dead, and nodes that exist but were never registered.
 
 Record for each host, before probing:
 
@@ -66,14 +104,20 @@ instruction in the skill. Ask directly.
 ```bash
 SKILL_DIR=~/.claude/skills/cluster-ops     # or ~/.codex/skills/cluster-ops
 "$SKILL_DIR/scripts/probe-cluster.sh" --self-test          # prove the collector works here
-"$SKILL_DIR/scripts/probe-cluster.sh" -o /tmp/<cluster>-probe.json \
-    head node-1 node-2 node-3
+
+# brev-managed: enumerate and sweep in one step
+"$SKILL_DIR/scripts/probe-cluster.sh" --brev --brev-instances -o /tmp/<cluster>-probe.json
+
+# or name hosts explicitly
+"$SKILL_DIR/scripts/probe-cluster.sh" -o /tmp/<cluster>-probe.json head node-1 node-2
 ```
 
 Notes:
 
 - Hosts are whatever `ssh <name>` already resolves. Fix SSH first — the script
   does not manage keys, and uses `BatchMode=yes` so it never hangs on a prompt.
+- Expect roughly 10 s per host, run serially. A six-node fleet sweeps in about a
+  minute.
 - A host that fails still gets a record, with an `error` field, and the script
   exits nonzero. **Do not drop failed hosts from the skill** — a node that could
   not be probed is a finding. Record it as unverified.

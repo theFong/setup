@@ -202,10 +202,19 @@ Ask an agent to onboard a cluster, or drive the discovery sweep directly:
 ```bash
 PROBE=~/.claude/skills/cluster-ops/scripts/probe-cluster.sh
 
-$PROBE --self-test                                 # verify the collector on this machine
-$PROBE -o /tmp/acme.json head node-1 node-2        # sweep the fleet
-$PROBE --hosts-file hosts.txt --include-local      # or read hosts from a file
+$PROBE --self-test                              # verify the collector on this machine
+$PROBE --brev --brev-instances -o /tmp/acme.json  # enumerate + sweep a brev-managed fleet
+$PROBE -o /tmp/acme.json head node-1 node-2     # or name hosts explicitly
+$PROBE --hosts-file hosts.txt --include-local   # or read them from a file
 ```
+
+For brev-managed fleets it drives the CLI directly: `--brev` enumerates physical
+nodes and `--brev-instances` cloud instances, which are **two separate lists**
+(`brev ls --all` is not a substitute for either). Names double as SSH aliases
+via `~/.brev/ssh_config`, and non-Connected nodes are swept anyway and flagged
+up front, since `Connected` is control-plane registration rather than
+reachability. The sweep never runs `brev refresh` itself — that writes to
+`~/.brev/`, and it stays read-only.
 
 The sweep is **read-only by construction**: it reads `/proc`, `/sys`,
 `/etc/os-release` and `/etc/docker/daemon.json`, runs query-only commands (`ip`,
