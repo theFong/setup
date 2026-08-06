@@ -54,6 +54,21 @@ assert_installed() {
   return 1
 }
 
+# assert_runs LABEL FAILURE_NAME CMD... — verify an installed binary actually
+# executes, not just that it resolves on PATH. A truncated download, a broken
+# venv shim, or a binary for the wrong architecture all still satisfy
+# `command -v`, so the version command is the cheapest proof it really works.
+assert_runs() {
+  local label="$1" failure_name="$2"; shift 2
+  if "$@" >/dev/null 2>&1; then
+    log "verified $label runs"
+    return 0
+  fi
+  warn "$label is on PATH but failed to run: $*"
+  record_failure "$failure_name"
+  return 1
+}
+
 detect_platform() {
   OS=$(uname -s | tr '[:upper:]' '[:lower:]')
   ARCH=$(uname -m)
@@ -517,7 +532,10 @@ agent_skill_dirs() {
 # assert_agent_skill NAME — verify a repo-managed skill is actually readable
 # through every agent skills directory. The skill counterpart of
 # assert_installed: linking without checking is how a skill silently reaches
-# only one of the two agents.
+# only one of the two agents. Readability, not existence, is the test — a
+# dangling symlink (repo moved, skill renamed) still satisfies the
+# `[ ! -e ] && [ ! -L ]` create-guard in link_agent_skills and would leave
+# every agent silently without the skill.
 assert_agent_skill() {
   local name="$1" skills_dir missing=""
   for skills_dir in $(agent_skill_dirs); do
@@ -583,6 +601,23 @@ link_agent_skills() {
 
 # ---------------------------------------------------------------------------
 
+# The CLIs this bootstrap exists to install must actually run, not merely
+# resolve on PATH. Each installer already calls assert_installed; this is the
+# execution half, and it runs on every real machine rather than only in CI.
+# Skipped for anything that failed to install, so one missing tool does not
+# produce two failures for the same cause.
+verify_toolchain() {
+  have claude    && assert_runs "Claude Code" claude-code claude --version
+  have codex     && assert_runs "Codex CLI" codex codex --version
+  have brev      && assert_runs "Brev CLI" brev brev --version
+  have hf        && assert_runs "Hugging Face CLI" huggingface-cli \
+                      env HF_HUB_DISABLE_UPDATE_CHECK=1 hf version
+  have opencode  && assert_runs "opencode" opencode opencode --version
+  have go        && assert_runs "Go" go go version
+  have speedtest && assert_runs "Ookla speedtest CLI" speedtest speedtest --version
+  return 0
+}
+
 summary() {
   local exit_code=0
   echo
@@ -618,6 +653,7 @@ main() {
   link_agent_skills      || warn "linking agent skills failed"
   # Must run after link_dotfiles: the status line script lives in ~/.setup.
   configure_claude_statusline || warn "configuring Claude status line failed"
+  verify_toolchain       || warn "some installed tools did not run"
   summary
 }
 
