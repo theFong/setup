@@ -4,7 +4,8 @@
 #
 # Installs: Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, tmux,
 # git, gh, jq, ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links
-# this repo's Claude config and Brev skill into the supported agent directories.
+# this repo's Claude config and agent skills (brev-cli, cluster-ops) into the
+# supported agent directories.
 #
 # Usage (one-liner):
 #   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
@@ -49,6 +50,21 @@ assert_installed() {
     return 0
   fi
   warn "$label is not available on PATH after installation"
+  record_failure "$failure_name"
+  return 1
+}
+
+# assert_runs LABEL FAILURE_NAME CMD... — verify an installed binary actually
+# executes, not just that it resolves on PATH. A truncated download, a broken
+# venv shim, or a binary for the wrong architecture all still satisfy
+# `command -v`, so the version command is the cheapest proof it really works.
+assert_runs() {
+  local label="$1" failure_name="$2"; shift 2
+  if "$@" >/dev/null 2>&1; then
+    log "verified $label runs"
+    return 0
+  fi
+  warn "$label is on PATH but failed to run: $*"
   record_failure "$failure_name"
   return 1
 }
@@ -354,6 +370,133 @@ configure_claude() {
   assert_claude_mode "$settings" "$mode"
 }
 
+# assert_codex_mode CONFIG APPROVAL SANDBOX — verify Codex's approval policy
+# and sandbox mode actually landed on disk as top-level keys. Keys that only
+# appear after a [table] header do not count: TOML scopes them to that table,
+# so Codex would not read them as its approval settings.
+assert_codex_mode() {
+  local config="$1" approval="$2" sandbox="$3"
+  if awk -v approval="$approval" -v sandbox="$sandbox" '
+      /^[[:space:]]*\[/ { exit }
+      $0 ~ "^approval_policy[[:space:]]*=[[:space:]]*\"" approval "\"[[:space:]]*$" { a = 1 }
+      $0 ~ "^sandbox_mode[[:space:]]*=[[:space:]]*\"" sandbox "\"[[:space:]]*$"     { s = 1 }
+      END { exit !(a && s) }
+    ' "$config" 2>/dev/null; then
+    log "verified Codex approval_policy=$approval sandbox_mode=$sandbox in $config"
+    return 0
+  fi
+  warn "Codex config $config does not set approval_policy=$approval and sandbox_mode=$sandbox at top level"
+  record_failure codex-approval-mode
+  return 1
+}
+
+# Default Codex to its "Auto" approval preset — the Codex equivalent of Claude
+# Code's auto mode above — by writing approval_policy and sandbox_mode into
+# ~/.codex/config.toml: work autonomously inside a workspace-write sandbox and
+# only prompt to escalate. Top-level TOML keys must appear before any [table]
+# header, so the keys are inserted at the top of the file and any stale
+# top-level values are dropped; everything else (including same-named keys
+# inside tables) is preserved. For full skip-all-prompts mode use
+# approval_policy "never" with sandbox_mode "danger-full-access"; to undo,
+# delete both keys.
+configure_codex() {
+  local config="$HOME/.codex/config.toml"
+  local approval="on-request" sandbox="workspace-write"
+  mkdir -p "$HOME/.codex"
+  if [ ! -f "$config" ]; then
+    printf 'approval_policy = "%s"\nsandbox_mode = "%s"\n' "$approval" "$sandbox" > "$config"
+  else
+    local tmp; tmp=$(mktemp)
+    if awk -v approval="$approval" -v sandbox="$sandbox" '
+        BEGIN {
+          print "approval_policy = \"" approval "\""
+          print "sandbox_mode = \"" sandbox "\""
+        }
+        /^[[:space:]]*\[/ { in_table = 1 }
+        !in_table && /^[[:space:]]*(approval_policy|sandbox_mode)[[:space:]]*=/ { next }
+        { print }
+      ' "$config" > "$tmp"; then
+      mv "$tmp" "$config"
+    else
+      rm -f "$tmp"; warn "could not update $config; leaving it unchanged"
+    fi
+  fi
+  assert_codex_mode "$config" "$approval" "$sandbox"
+}
+
+# Sample status JSON, shaped like what Claude Code pipes to statusLine.command
+# on stdin. Used to prove the status line script actually renders rather than
+# only that it is referenced from settings.json.
+STATUSLINE_SAMPLE='{"session_id":"setup-selftest-session","cwd":"/tmp","model":{"display_name":"Test Model"},"context_window":{"total_input_tokens":50000,"context_window_size":200000,"used_percentage":25}}'
+
+# assert_claude_statusline SETTINGS SCRIPT — verify the status line is wired up
+# in settings.json and that the script renders the session id and context usage
+# from STATUSLINE_SAMPLE. The in-script counterpart of assert_installed for the
+# status line configuration.
+assert_claude_statusline() {
+  local settings="$1" script="$2" rendered=""
+  if ! have jq || ! jq -e --arg c "$script" \
+      '.statusLine.type == "command" and .statusLine.command == $c' \
+      "$settings" >/dev/null 2>&1; then
+    warn "Claude status line is not configured in $settings"
+    record_failure claude-statusline
+    return 1
+  fi
+  if [ ! -x "$script" ]; then
+    warn "Claude status line script is not executable: $script"
+    record_failure claude-statusline
+    return 1
+  fi
+  rendered=$(printf '%s' "$STATUSLINE_SAMPLE" | "$script" 2>/dev/null) || true
+  case "$rendered" in
+    *setup-selftest-session*"ctx 25%"*|*"ctx 25%"*setup-selftest-session*) ;;
+    *)
+      warn "Claude status line script did not render the session id and context usage"
+      record_failure claude-statusline
+      return 1
+      ;;
+  esac
+  log "verified Claude status line: $script"
+}
+
+# Show the session id and context-window usage under the Claude Code prompt by
+# pointing statusLine.command at this repo's claude/statusline.sh. Claude Code
+# has no built-in setting for either, but it pipes both to the status line
+# command. Claude Code-specific: Codex CLI has no status line hook (see
+# README.md). Merges into existing settings via jq rather than overwriting, so
+# re-runs are a no-op. Remove the statusLine key to undo.
+configure_claude_statusline() {
+  local settings="$HOME/.claude/settings.json"
+  local script="$HOME/.setup/claude/statusline.sh"
+  local tmp
+
+  if [ ! -f "$script" ]; then
+    warn "status line script not found at $script"
+    record_failure claude-statusline
+    return 1
+  fi
+  [ -x "$script" ] || chmod +x "$script" 2>/dev/null || true
+
+  if ! have jq; then
+    warn "jq unavailable; not configuring the Claude status line"
+    record_failure claude-statusline
+    return 1
+  fi
+
+  mkdir -p "$HOME/.claude"
+  [ -f "$settings" ] || printf '{}\n' > "$settings"
+
+  tmp=$(mktemp)
+  if jq --arg c "$script" '.statusLine = {type: "command", command: $c}' "$settings" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$settings"
+  else
+    rm -f "$tmp"
+    warn "could not update $settings (invalid JSON?); leaving it unchanged"
+  fi
+
+  assert_claude_statusline "$settings" "$script"
+}
+
 # ---------------------------------------------------------------------------
 # dotfiles / Claude config
 # ---------------------------------------------------------------------------
@@ -372,63 +515,118 @@ link_dotfiles() {
   log "linked Claude config into ~/.claude"
 }
 
-# Make a repo-managed skill available to Claude Code, Codex, and other agents.
-# Existing skill installations are preserved. Usage: link_agent_skill <name>
-link_agent_skill() {
-  local skill_name="$1"
-  local skill_source="$HOME/.setup/.agent/skills/$skill_name"
-  local skills_dir target
-  if [ ! -f "$skill_source/SKILL.md" ]; then
-    warn "$skill_name skill source not found at $skill_source"
-    record_failure "$skill_name-skill"
-    return 1
-  fi
+# Repo-managed skills linked into every supported agent's skills directory.
+# Add a skill here and it becomes available to Claude Code, Codex, and any
+# other agent that reads ~/.agents/skills.
+AGENT_SKILLS="brev-cli cluster-ops inference-optimization"
 
-  for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
-    mkdir -p "$skills_dir"
-    target="$skills_dir/$skill_name"
-    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
-      if ! ln -s "$skill_source" "$target"; then
-        warn "failed to link $skill_name skill into $skills_dir"
-        record_failure "$skill_name-skill"
-        return 1
-      fi
-    fi
-  done
-  assert_skill_linked "$skill_name" || return 1
-  log "linked $skill_name skill into Claude Code, Codex, and agent skill directories"
+# The agent skill directories the bootstrap wires up. ~/.claude/skills is
+# normally a symlink to the repo's .agent/skills (see link_dotfiles), so skills
+# appear there without a per-skill link; the others get one link per skill.
+# A function rather than a constant so it reads $HOME at call time, which keeps
+# it correct after link_dotfiles and testable against a scratch HOME.
+agent_skill_dirs() {
+  printf '%s %s %s' "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"
 }
 
-# Assert a skill resolves to a readable SKILL.md from every agent skill
-# directory, and that every reference/ document SKILL.md links resolves too.
-# Catches broken symlinks, partially-installed skills, and progressive-disclosure
-# links that point at files which were never installed.
-assert_skill_linked() {
-  local skill_name="$1"
-  local skills_dir skill_md ref
-  for skills_dir in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
-    skill_md="$skills_dir/$skill_name/SKILL.md"
-    if [ ! -r "$skill_md" ]; then
-      warn "$skill_name skill is not readable at $skill_md"
-      record_failure "$skill_name-skill"
-      return 1
+# assert_agent_skill NAME — verify a repo-managed skill is actually readable
+# through every agent skills directory. The skill counterpart of
+# assert_installed: linking without checking is how a skill silently reaches
+# only one of the two agents. Readability, not existence, is the test — a
+# dangling symlink (repo moved, skill renamed) still satisfies the
+# `[ ! -e ] && [ ! -L ]` create-guard in link_agent_skills and would leave
+# every agent silently without the skill.
+#
+# Every reference/ document SKILL.md links must resolve too: a progressive-
+# disclosure skill is only half-installed if its level-3 files are missing, and
+# that surfaces as an agent failing to read a doc mid-task rather than at boot.
+assert_agent_skill() {
+  local name="$1" skills_dir ref missing=""
+  for skills_dir in $(agent_skill_dirs); do
+    if [ ! -r "$skills_dir/$name/SKILL.md" ]; then
+      missing="$missing $skills_dir"
+      continue
     fi
-    for ref in $(grep -o 'reference/[A-Za-z0-9._-]*\.md' "$skill_md" 2>/dev/null | sort -u || true); do
-      if [ ! -r "$skills_dir/$skill_name/$ref" ]; then
-        warn "$skill_name skill links missing document $ref at $skills_dir/$skill_name/$ref"
-        record_failure "$skill_name-skill"
-        return 1
-      fi
+    for ref in $(grep -o 'reference/[A-Za-z0-9._-]*\.md' "$skills_dir/$name/SKILL.md" 2>/dev/null | sort -u || true); do
+      [ -r "$skills_dir/$name/$ref" ] || missing="$missing $skills_dir/$name/$ref"
     done
   done
-  return 0
+  if [ -n "$missing" ]; then
+    warn "skill $name is not readable through:$missing"
+    record_failure "$name-skill"
+    return 1
+  fi
+  log "verified skill $name in Claude Code, Codex, and agent skill directories"
 }
 
-link_brev_skill() { link_agent_skill brev-cli; }
+# assert_cluster_probe — run the cluster-ops discovery collector against this
+# machine and require well-formed, complete output. Shipping a broken probe is
+# worse than shipping none: it would fail while surveying someone's production
+# fleet. Read-only, and touches nothing but localhost.
+assert_cluster_probe() {
+  local script="$HOME/.setup/.agent/skills/cluster-ops/scripts/probe-cluster.sh"
+  if [ ! -f "$script" ]; then
+    warn "cluster-ops probe script not found at $script"
+    record_failure cluster-ops-skill
+    return 1
+  fi
+  [ -x "$script" ] || chmod +x "$script" 2>/dev/null || true
+  if ! bash "$script" --self-test >/dev/null 2>&1; then
+    warn "cluster-ops probe self-test failed on this machine"
+    record_failure cluster-ops-skill
+    return 1
+  fi
+  log "verified cluster-ops probe: collector produced valid JSON for this host"
+}
 
-link_inference_optimization_skill() { link_agent_skill inference-optimization; }
+# Make the repo-managed skills available to Claude Code, Codex, and other
+# agents. Existing skill installations are preserved, so a hand-installed or
+# newer copy of a skill is never clobbered.
+link_agent_skills() {
+  local name skill_source skills_dir target status=0
+  for name in $AGENT_SKILLS; do
+    skill_source="$HOME/.setup/.agent/skills/$name"
+    if [ ! -f "$skill_source/SKILL.md" ]; then
+      warn "skill source not found at $skill_source"
+      record_failure "$name-skill"
+      status=1
+      continue
+    fi
+    for skills_dir in $(agent_skill_dirs); do
+      mkdir -p "$skills_dir"
+      target="$skills_dir/$name"
+      if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        if ! ln -s "$skill_source" "$target"; then
+          warn "failed to link $name skill into $skills_dir"
+          record_failure "$name-skill"
+          status=1
+        fi
+      fi
+    done
+    assert_agent_skill "$name" || status=1
+  done
+  assert_cluster_probe || status=1
+  return "$status"
+}
 
 # ---------------------------------------------------------------------------
+
+# The CLIs this bootstrap exists to install must actually run, not merely
+# resolve on PATH. Each installer already calls assert_installed; this is the
+# execution half, and it runs on every real machine rather than only in CI.
+# Skipped for anything that failed to install, so one missing tool does not
+# produce two failures for the same cause.
+verify_toolchain() {
+  have claude    && assert_runs "Claude Code" claude-code claude --version
+  have codex     && assert_runs "Codex CLI" codex codex --version
+  have brev      && assert_runs "Brev CLI" brev brev --version
+  have hf        && assert_runs "Hugging Face CLI" huggingface-cli \
+                      env HF_HUB_DISABLE_UPDATE_CHECK=1 hf version
+  have opencode  && assert_runs "opencode" opencode opencode --version
+  have go        && assert_runs "Go" go go version
+  have speedtest && assert_runs "Ookla speedtest CLI" speedtest speedtest --version
+  return 0
+}
 
 summary() {
   local exit_code=0
@@ -460,9 +658,12 @@ main() {
   install_huggingface    || warn "Hugging Face CLI install failed"
   install_opencode       || warn "opencode install failed"
   configure_claude       || warn "configuring Claude default mode failed"
+  configure_codex        || warn "configuring Codex approval mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
-  link_brev_skill        || warn "linking Brev skill failed"
-  link_inference_optimization_skill || warn "linking inference-optimization skill failed"
+  link_agent_skills      || warn "linking agent skills failed"
+  # Must run after link_dotfiles: the status line script lives in ~/.setup.
+  configure_claude_statusline || warn "configuring Claude status line failed"
+  verify_toolchain       || warn "some installed tools did not run"
   summary
 }
 

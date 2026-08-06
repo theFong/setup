@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+#
+# tmux-groups — mouse-first "tab group" (tmux session) UI for the webshell.
+#
+# Invoked from mouse bindings in tmux.conf, which run these subcommands
+# INSIDE a display-popup (see tmux.conf). The popup is the whole point:
+#
+#   tmux's display-menu is dismissed by any pointer-motion event, and
+#   xterm.js reports motion even with no button held — so in a browser the
+#   menu vanishes the moment you move the mouse toward it ("flicker"), and
+#   no amount of -O / mouse-up binding fixes that. display-popup is a real
+#   pane: motion goes to the program running inside it, so it stays put.
+#   choose-tree was measured too and dies on motion the same way.
+#
+# Inside the popup we get a genuine tty, so selection is fzf (mouse clicks
+# and wheel work) with a numbered read(1) fallback, and prompts are plain
+# read(1) rather than tmux's command-prompt.
+#
+#   menu [client]                groups: switch / new / rename / close
+#   tab-menu <window_id> [client]   per-tab: rename / close / move to group
+#   move-menu <window_id> [client]  pick the group a tab moves to
+#   close-group                  kill current session unless it is the last
+#
+# The client argument is accepted for call-site compatibility but not
+# required: a popup's tmux commands already target the client that opened
+# it, which is also what makes switch-client work without -c.
+#
+# --print (before the subcommand) prints the menu's item labels one per line
+# instead of drawing anything — used by install.sh verify and test.sh, and
+# the reason those can check the UI on a headless server.
+
+set -euo pipefail
+
+PRINT=0
+if [ "${1:-}" = "--print" ]; then PRINT=1; shift; fi
+CMD="${1:-}"
+[ -n "$CMD" ] || { echo "usage: tmux-groups [--print] <menu|tab-menu|move-menu|close-group> ..." >&2; exit 1; }
+shift
+
+# bindings pass the invoking client as the final argument
+CLIENT=""
+case "${!#:-}" in /dev/*|*:*.*) CLIENT="${!#}" ;; esac
+
+BROWSE_FILES="📁 browse files…"
+NEW_GROUP="＋ new group…"
+RENAME_GROUP="✎ rename group…"
+CLOSE_GROUP="✕ close group"
+RENAME_TAB="✎ rename tab…"
+MOVE_TAB="⇢ move tab to group…"
+CLOSE_TAB="✕ close tab"
+
+current_session() { tmux display-message -p '#{session_name}'; }
+
+# "⬢ webster (24 tabs)" / "  webster (24 tabs)" -> "webster". Parameter
+# expansion got this wrong for the two-space-indented rows (it left a leading
+# space, so switch-client looked up a session that does not exist).
+label_to_name() { printf '%s' "$1" | sed -e 's/^[[:space:]⬢]*//' -e 's/[[:space:]]*([0-9]* tabs)$//'; }
+
+# Popups run detached from the invoking client, so client-scoped commands
+# (switch-client) need it named explicitly; bindings pass #{client_name}.
+switch_to() {
+  local target="$1"
+  if [ -n "$CLIENT" ]; then tmux switch-client -c "$CLIENT" -t "$target"
+  else tmux switch-client -t "$target"; fi
+}
+
+# choose <prompt> <item>...  -> prints the chosen item, empty if cancelled.
+# fzf gives mouse clicks and wheel scrolling for free; the numbered fallback
+# keeps the UI usable if fzf is ever missing (keyboard only).
+choose() {
+  local prompt="$1"; shift
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "$@" | fzf --reverse --no-sort --height=100% \
+      --prompt="$prompt> " --pointer='▸' --color=prompt:4,pointer:4 || true
+  else
+    local i=1 reply
+    for item in "$@"; do printf '%2d) %s\n' "$i" "$item"; i=$((i+1)); done
+    read -rp "$prompt [1-$#]: " reply || true
+    case "$reply" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$reply" -ge 1 ] && [ "$reply" -le $# ] && printf '%s\n' "${!reply}"
+  fi
+}
+
+# ask <prompt> [default] -> prints the entered text (empty if cancelled)
+ask() {
+  local prompt="$1" default="${2:-}" reply=""
+  read -rp "$prompt" -i "$default" -e reply || true
+  printf '%s' "$reply"
+}
+
+groups_menu() {
+  local cur name wins items=() choice target
+  cur=$(current_session)
+  while IFS=$'\t' read -r name wins; do
+    if [ "$name" = "$cur" ]; then
+      items+=("⬢ $name ($wins tabs)")
+    else
+      items+=("  $name ($wins tabs)")
+    fi
+  done < <(tmux list-sessions -F '#{session_name}	#{session_windows}')
+  items+=("$BROWSE_FILES" "$NEW_GROUP" "$RENAME_GROUP" "$CLOSE_GROUP")
+  # --print: emit the labels for install.sh verify / test.sh and stop. It must
+  # print here, not inside choose(), whose output a caller captures.
+  if [ "$PRINT" = 1 ]; then printf '%s\n' "${items[@]}"; return 0; fi
+
+  choice=$(choose "groups" "${items[@]}")
+  case "$choice" in
+    "")               : ;;
+    "$BROWSE_FILES")  open_file_browser ;;
+    "$NEW_GROUP")     new_group ;;
+    "$RENAME_GROUP")  rename_group "$cur" ;;
+    "$CLOSE_GROUP")   close_group_interactive "$cur" ;;
+    *)                # "⬢ name (N tabs)" / "  name (N tabs)" -> name
+                      target=$(label_to_name "$choice")
+                      [ -n "$target" ] && switch_to "$target" ;;
+  esac
+}
+
+# The file browser wants a big popup and this one is small, and a popup
+# cannot be resized once open — so schedule it with run-shell -b and let this
+# popup exit, which hands the screen over cleanly.
+open_file_browser() {
+  tmux run-shell -b "tmux display-popup -E -w 90% -h 85% /usr/local/bin/tmux-files"
+}
+
+new_group() {
+  local name
+  name=$(ask "new group name: ")
+  [ -n "$name" ] || return 0
+  tmux new-session -d -s "$name"
+  switch_to "$name"
+}
+
+rename_group() {
+  local cur="$1" name
+  name=$(ask "rename group to: " "$cur")
+  [ -n "$name" ] && [ "$name" != "$cur" ] || return 0
+  tmux rename-session -t "$cur" "$name"
+}
+
+close_group_interactive() {
+  local cur="$1" reply
+  if [ "$(tmux list-sessions | wc -l)" -le 1 ]; then
+    echo "can't close the last group"; sleep 1.5; return 0
+  fi
+  read -rp "close group '$cur' and all its tabs? [y/N] " reply || true
+  case "$reply" in [yY]*) tmux kill-session -t "$cur" ;; esac
+}
+
+tab_menu() {
+  local win="${1:-}" choice name
+  [ -n "$win" ] || { echo "tmux-groups tab-menu: missing window id" >&2; exit 1; }
+  if [ "$PRINT" = 1 ]; then printf '%s\n' "$RENAME_TAB" "$MOVE_TAB" "$CLOSE_TAB"; return 0; fi
+  choice=$(choose "tab" "$RENAME_TAB" "$MOVE_TAB" "$CLOSE_TAB")
+  case "$choice" in
+    "$RENAME_TAB")
+      name=$(ask "rename tab to: " "$(tmux display-message -t "$win" -p '#{window_name}')")
+      [ -n "$name" ] && tmux rename-window -t "$win" "$name" ;;
+    "$MOVE_TAB")  move_menu "$win" ;;
+    "$CLOSE_TAB")
+      read -rp "close this tab? [y/N] " reply || true
+      case "${reply:-}" in [yY]*) tmux kill-window -t "$win" ;; esac ;;
+  esac
+}
+
+move_menu() {
+  local win="${1:-}" home name items=() choice target
+  [ -n "$win" ] || { echo "tmux-groups move-menu: missing window id" >&2; exit 1; }
+  home=$(tmux display-message -t "$win" -p '#{session_name}')
+  while IFS= read -r name; do
+    [ "$name" = "$home" ] && continue
+    items+=("  $name")
+  done < <(tmux list-sessions -F '#{session_name}')
+  items+=("$NEW_GROUP")
+  if [ "$PRINT" = 1 ]; then printf '%s\n' "${items[@]}"; return 0; fi
+
+  choice=$(choose "move tab to" "${items[@]}")
+  case "$choice" in
+    "")           : ;;
+    "$NEW_GROUP") name=$(ask "new group name: ")
+                  [ -n "$name" ] || return 0
+                  tmux new-session -d -s "$name"
+                  tmux move-window -s "$win" -t "$name:"
+                  switch_to "$name" ;;
+    *)            target=$(label_to_name "$choice")
+                  [ -n "$target" ] && tmux move-window -s "$win" -t "$target:" ;;
+  esac
+}
+
+# non-interactive variant kept for callers that already confirmed
+close_group() {
+  if [ "$(tmux list-sessions | wc -l)" -le 1 ]; then
+    tmux display-message "can't close the last group"
+  else
+    tmux kill-session
+  fi
+}
+
+case "$CMD" in
+  menu)        groups_menu ;;
+  tab-menu)    tab_menu "$@" ;;
+  move-menu)   move_menu "$@" ;;
+  close-group) close_group ;;
+  *) echo "tmux-groups: unknown subcommand '$CMD'" >&2; exit 1 ;;
+esac

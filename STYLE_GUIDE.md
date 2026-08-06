@@ -25,7 +25,9 @@ installer, configuration path, or workflow without proving that it works.
 - Prefer the vendor's supported installer or package-manager path.
 - Add user-local binary directories to both the current `PATH` and the user's
   shell profile with `add_path`.
-- Call `assert_installed` after every install attempt with the expected command.
+- Call `assert_installed` after every install attempt with the expected command,
+  and `assert_runs` for tools whose execution matters — `command -v` is
+  satisfied by a truncated download or a wrong-architecture binary.
 - Validate configuration changes the same way: assert the resulting on-disk
   state from inside the script (an `assert_*` helper following the
   `assert_installed` pattern, e.g. `assert_claude_mode`) and call
