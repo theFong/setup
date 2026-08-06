@@ -10,6 +10,14 @@ too because it dominates every other lesson: roughly ten server restarts and a
 full profiling exercise were spent characterizing a GPU that was throttled.
 Every conclusion drawn from it had to be retracted.
 
+**A hardware fault invalidates conclusions drawn before you found it.** When
+you discover a throttled or faulty part, do not only re-run the experiment you
+were on — go back and re-validate every tuning result measured on that machine.
+In the run this skill came from, a speculative-decoding "crossover" had already
+been written up as a headline finding and shipped; on healthy hardware it
+reversed completely. Keep a list of what was measured where, so the blast radius
+is knowable.
+
 **Invariance is the tell.** When a number does not move for batch size, context
 length, kernel backend, graph mode, or any flag you change, the cause is almost
 never the software you are editing.
