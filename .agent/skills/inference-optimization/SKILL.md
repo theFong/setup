@@ -127,9 +127,10 @@ single fix** — stop hunting for one.
 
 Highest-yield knobs, in order:
 
-1. **Speculative decoding has a concurrency crossover.** Big win at low
-   concurrency, big *loss* at high. Measured: +34% at C=1, **-3.1x at C=32**.
-   Ship two profiles, not one.
+1. **Speculative decoding — measure it, do not assume a crossover.** On
+   healthy hardware it won at every context length and concurrency tested
+   (+29% to +145%, C=1 through C=16). An earlier "crossover" reading came from
+   a throttled GPU. Costs ~23% of KV pool; usually worth it.
 2. **Draft length `k`** — raise it for single-stream only; acceptance degrades
    past the checkpoint's block size.
 3. **Backend/kernel selection** — verify what your quantization actually

@@ -3,28 +3,53 @@
 Concrete knobs and measured results. Versions move fast — treat numbers as
 illustrative of *shape*, and re-measure on your stack.
 
-## Speculative decoding has a concurrency crossover
+## Speculative decoding: measure the crossover, do not assume one
 
-The most valuable tuning finding available, and it is rarely documented.
+Speculative decoding submits `k+1` tokens per sequence to the verify pass. The
+common expectation is a crossover — a win at low concurrency, a loss at high,
+because the verify batch grows with concurrency. **Whether that crossover exists
+on your hardware is an empirical question, and getting it wrong is expensive in
+both directions.**
 
-Speculative decoding submits `k+1` tokens per sequence to the verify pass. At
-low concurrency that is free throughput. At high concurrency the verify batch
-grows by `k+1` and can exceed the tuned range of the MoE/GEMM kernels, falling
-off a performance cliff.
+Measured on a *healthy* datacenter GPU (single GB300, MoE model, k=8,
+`max_num_seqs=32`, OSL=256), aggregate decode tok/s:
 
-Measured (MoE model, single datacenter GPU):
+| ISL | C | Spec ON | Spec OFF | Winner |
+|---|---|---|---|---|
+| 256 | 1 | **278** | 158 | ON +76% |
+| 256 | 8 | **1198** | 866 | ON +38% |
+| 256 | 16 | **1875** | 1431 | ON +31% |
+| 8K | 8 | **591** | 409 | ON +44% |
+| 8K | 16 | **654** | 456 | ON +43% |
+| 32K | 8 | **225** | 92 | ON +145% |
+| 32K | 16 | **218** | 112 | ON +95% |
+| 128K | 8 | **46** | 35 | ON +29% |
+| 128K | 16 | **54** | 37 | ON +45% |
 
-| Concurrency | Spec ON | Spec OFF | Winner |
-|---|---|---|---|
-| 1 | **35.0** tok/s | 26.2 | ON (+34%) |
-| 4 | **115.4** | 87.8 | ON (+31%) |
-| 16 | 180.9 | **251.0** | OFF (+39%) |
-| 32 | 132.0 | **411.7** | OFF (**+212%**) |
+**No crossover anywhere up to C=16.** Speculation wins at every context length
+and every concurrency tested, by 29–145%. The only cost is KV pool: freeing the
+draft model's cache gave +23% pool (6.0M → 7.4M tokens), which does not come
+close to paying for the throughput.
 
-**Ship two profiles.** A single setting is wrong for half your traffic.
+### The cautionary tale
 
-Corroborating signal — the autotuner warned at exactly the batch shape where the
-cliff appeared:
+An earlier version of this file reported the opposite — a crossover at C=16 with
+spec-off winning by 3.1x at C=32 — and recommended shipping two profiles. Those
+numbers were real measurements, taken on a GPU that turned out to be **power
+throttled** (see hardware-validation.md). On a starved part the `k+1` verify
+batch is extra work it cannot absorb; with headroom it is nearly free and the
+accepted tokens are pure gain.
+
+Two lessons, both of which cost real time:
+
+1. **Re-validate every tuning conclusion after finding a hardware fault.** The
+   fault invalidates conclusions drawn *before* you found it, not just the ones
+   you were working on at the time.
+2. A plausible mechanism ("the verify batch exceeds the tuned kernel range") is
+   not evidence. It made a hardware artifact look like a software law.
+
+If you do see a crossover, confirm the machine is healthy first, then look for a
+corroborating signal such as an autotuner shape warning:
 
 ```
 No tuned config covers flashinfer::trtllm_fp4_block_scale_moe
@@ -32,7 +57,8 @@ input_shapes=(torch.Size([184, 4096]), ...); falling back to runner=MoERunner
 tactic=-1. This shape is outside the tuning bucket range.
 ```
 
-`32 seqs x (k=5 + 1) = 192` tokens — right at the untuned boundary.
+`32 seqs x (k=5 + 1) = 192` tokens lands right at that boundary — a real effect,
+but on healthy hardware it was not large enough to flip the decision.
 
 ## Draft length `k`
 
