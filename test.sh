@@ -377,5 +377,37 @@ if (export HOME="$scratch/danglinghome"; assert_agent_skill brev-cli) >/dev/null
   exit 1
 fi
 
+# webshell helpers must fail loudly when misused rather than drawing a broken
+# UI. These paths exit before any tmux call, so no server or client is needed.
+if ./webshell/tmux-groups >/dev/null 2>&1; then
+  echo "FAIL: tmux-groups without a subcommand unexpectedly succeeded" >&2
+  exit 1
+fi
+if ./webshell/tmux-groups --print tab-menu >/dev/null 2>&1; then
+  echo "FAIL: tmux-groups tab-menu without a window id unexpectedly succeeded" >&2
+  exit 1
+fi
+if ./webshell/tmux-groups --print bogus-subcommand >/dev/null 2>&1; then
+  echo "FAIL: tmux-groups unknown subcommand unexpectedly succeeded" >&2
+  exit 1
+fi
+if ./webshell/tmux-files bogus-subcommand >/dev/null 2>&1; then
+  echo "FAIL: tmux-files unknown subcommand unexpectedly succeeded" >&2
+  exit 1
+fi
+# copying must refuse anything that would put junk on the clipboard
+if ./webshell/tmux-files copy /usr/local/bin ttyd >/dev/null 2>&1; then
+  echo "FAIL: tmux-files copied a binary file" >&2
+  exit 1
+fi
+if ./webshell/tmux-files copy-path "$scratch" no-such-entry >/dev/null 2>&1; then
+  echo "FAIL: tmux-files copy-path accepted a missing path" >&2
+  exit 1
+fi
+# the viewer must refuse a non-file path rather than paging garbage
+if ! ./webshell/tmux-files view "$scratch" 2>&1 | grep -q "not a file"; then
+  echo "FAIL: tmux-files view accepted a directory" >&2
+  exit 1
+fi
 
 log "all negative tests passed"

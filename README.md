@@ -133,6 +133,37 @@ Notes baked into the setup (hard-won):
   tmux server, so scratch servers on other sockets don't clobber saves.
 - Re-running the installer keeps the deployed mode, interface, and port
   unless you pass `--private`/`--public` (or `WEBSHELL_*`) explicitly.
+- **Tab groups** (tmux sessions) are mouse-driven: a second status row lists
+  the groups with the current one highlighted. Click it (or any empty area of
+  the tab row) for the groups picker — switch / new / rename / close. Click
+  the tab you are already on to rename it, close it, or move it to another
+  group; clicking any other tab just switches to it. Wheel over the bar
+  cycles groups. Everything is reachable by **left** click: browsers hijack
+  right-click before the terminal sees it.
+- The pickers are `display-popup` + `fzf`, not tmux's `display-menu`, and that
+  is not cosmetic: a tmux menu is dismissed by any pointer-motion event, and
+  xterm.js reports motion with no button held — so in a browser the menu
+  vanishes as soon as you move the mouse toward it. A popup is a real pane, so
+  motion goes to the program inside it (`choose-tree` was measured too and
+  dies the same way). Inside the popup you get a real tty, so fzf handles
+  mouse clicks and wheel, and prompts are plain `read`. Both helpers `--print`
+  their labels so the installer and `test.sh` can check the UI headlessly.
+- **File browser/viewer**: `prefix + f`, or click the bar and pick
+  `📁 browse files…`. Opens in the current pane's directory with a live
+  preview beside the list — click a folder to descend, `../` to go up, a file
+  to page it in `less`, `esc` to close. Typing filters, hidden files are
+  shown, and binary files are named rather than dumped. Viewer only: nothing
+  there can modify a file. Implemented in `webshell/tmux-files`.
+- **Copying out of a file.** Drag-select-to-copy works in a tmux *pane* but
+  does nothing inside a popup — popups are not panes and have no copy-mode on
+  this build (measured), so dragging inside the browser popup is a no-op.
+  `ctrl-o` therefore opens the file in a pane **beside the current one**, in
+  the same tab, where the normal drag-select copy works (`less` runs there
+  without `--mouse` on purpose, so tmux keeps the drag). `ctrl-t` does the
+  same as its own tab, and `ctrl-y` / `alt-y` copy the whole file / its path
+  without selecting anything. All land in the browser clipboard via
+  `tmux-clip`'s OSC 52, which needs a secure context (the https app URL, or a
+  tunnel to localhost). Paste back with `prefix + ]` or the browser's paste.
 - **Tab groups** (tmux sessions) are fully mouse-driven: a second status row
   lists the groups with the current one highlighted. Click that row — or
   right-click anywhere on the bar — for the groups menu (switch / new /

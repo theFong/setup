@@ -4,8 +4,8 @@
 #
 # Installs ttyd (built from source: release/distro builds bundle an xterm.js
 # with no OSC 52 handler, so copy-to-clipboard silently fails), links this
-# directory's tmux.conf to ~/.tmux.conf, installs the tmux-clip and
-# tmux-groups helpers, installs tmux plugins (tpm + resurrect + continuum:
+# directory's tmux.conf to ~/.tmux.conf, installs the tmux-clip, tmux-groups
+# and tmux-files helpers, installs tmux plugins (tpm + resurrect + continuum:
 # layout, cwds, and visible text survive reboots — processes do not), and
 # sets up a systemd service. Sessions are tmux-backed, so a browser refresh
 # (or full disconnect) reattaches to the same shells.
@@ -120,6 +120,8 @@ install_tmux_config() {
   $SUDO install -m 0755 "$WEBSHELL_DIR/tmux-clip" /usr/local/bin/tmux-clip
   # tmux-groups: mouse-driven tab-group (session) menus for the status bar.
   $SUDO install -m 0755 "$WEBSHELL_DIR/tmux-groups" /usr/local/bin/tmux-groups
+  # tmux-files: mouse-driven file browser/viewer (prefix+f, or the bar popup).
+  $SUDO install -m 0755 "$WEBSHELL_DIR/tmux-files" /usr/local/bin/tmux-files
   # Symlink ~/.tmux.conf into the repo (source of truth), backing up any
   # existing regular file.
   if [ -f "$HOME/.tmux.conf" ] && [ ! -L "$HOME/.tmux.conf" ]; then
@@ -162,6 +164,25 @@ install_tmux_plugins() {
     # second reload: the running server now loads the just-installed plugins
     tmux source-file "$HOME/.tmux.conf"
   fi
+  rearm_continuum
+}
+
+# Sourcing the conf resets status-right, dropping continuum's auto-save hook,
+# and continuum will not put it back: it arms only when it believes it is the
+# machine's sole tmux, and the `tmux source-file` command driving the reload is
+# itself counted as another tmux process. Left alone, a live box silently stops
+# auto-saving until its next server start. Re-add the interpolation directly —
+# exactly what continuum's own arming does.
+rearm_continuum() {
+  local save_script="$HOME/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh" cur
+  [ -x "$save_script" ] || return 0
+  tmux has-session 2>/dev/null || return 0
+  cur=$(tmux show -gv status-right 2>/dev/null || true)
+  case "$cur" in
+    *continuum_save*) ;;
+    *) tmux set -g status-right "#($save_script)$cur"
+       log "re-armed continuum auto-save on the running server" ;;
+  esac
 }
 
 # Emit the installed unit's contents. Reads directly when the file is readable
@@ -371,15 +392,18 @@ verify_session_restore() {
   # the dying server's cleanup (it unlinks the socket path from under the new
   # server -> "server exited unexpectedly"). Restore state lives in files,
   # so a fresh socket restores identically — race-free by construction.
-  local sock="webshell-verify-$$" sock2="webshell-verify2-$$"
   local keys="" sright="" restored="" groups_menu="" i fails=0 groups_ok=1
   local vdir; vdir=$(mktemp -d)
+  # Socket PATHS (-S) inside the scratch dir, not names (-L): names leave a
+  # socket file behind in /tmp/tmux-$UID on every run, which piled up into
+  # dozens of stale entries. rm -rf "$vdir" now takes the sockets with it.
+  local sock="$vdir/s1" sock2="$vdir/s2"
   printf 'source-file %s\nset -g @continuum-restore "off"\nset -g @resurrect-dir "%s"\n' \
     "$HOME/.tmux.conf" "$vdir" > "$vdir/conf"
 
-  if tmux -L "$sock" -f "$vdir/conf" new-session -d -s main 2>/dev/null; then
+  if tmux -S "$sock" -f "$vdir/conf" new-session -d -s main 2>/dev/null; then
     for i in 1 2 3 4 5 6 7 8 9 10; do
-      keys=$(tmux -L "$sock" list-keys 2>/dev/null || true)
+      keys=$(tmux -S "$sock" list-keys 2>/dev/null || true)
       case "$keys" in *tmux-resurrect/scripts/save.sh*) break ;; esac
       sleep 1
     done
@@ -387,32 +411,42 @@ verify_session_restore() {
       sright=$(tmux show-option -gv status-right 2>/dev/null || true)
     else
       for i in 1 2 3 4 5 6 7 8 9 10; do
-        sright=$(tmux -L "$sock" show-option -gv status-right 2>/dev/null || true)
+        sright=$(tmux -S "$sock" show-option -gv status-right 2>/dev/null || true)
         case "$sright" in *continuum_save*) break ;; esac
         sleep 1
       done
     fi
     # groups UI: second status row on, menu bindings bound, and the menu
     # generator must list this server's groups plus the management actions
-    [ "$(tmux -L "$sock" show -gv status 2>/dev/null)" = "2" ] || groups_ok=0
-    tmux -L "$sock" list-keys 2>/dev/null | grep -q "tmux-groups" || groups_ok=0
-    tmux -L "$sock" new-session -d -s groupcheck 2>/dev/null || true
+    [ "$(tmux -S "$sock" show -gv status 2>/dev/null)" = "2" ] || groups_ok=0
+    tmux -S "$sock" list-keys 2>/dev/null | grep -q "tmux-groups" || groups_ok=0
+    # The UI is display-popup, not display-menu: a menu is dismissed by any
+    # pointer-motion event and xterm.js emits motion with no button held, so
+    # menus flicker away in a browser. A popup needs an attached client, which
+    # a headless verify has none of, so assert the wiring instead.
+    tmux -S "$sock" list-keys 2>/dev/null | grep -q "display-popup.*tmux-groups" || groups_ok=0
+    tmux -S "$sock" list-keys 2>/dev/null | grep -q "display-popup.*tmux-files" || groups_ok=0
+    /usr/local/bin/tmux-files --print browse "$vdir" >/dev/null 2>&1 || groups_ok=0
+    printf 'clipboard probe\n' > "$vdir/probe.txt"
+    /usr/local/bin/tmux-files copy "$vdir" probe.txt >/dev/null 2>&1 || groups_ok=0
+    tmux -S "$sock" new-session -d -s groupcheck 2>/dev/null || true
     # capture via file: tmux 3.4 no longer relays run-shell stdout to a CLI
     # client, so the redirect must happen inside run-shell's own shell
-    tmux -L "$sock" run-shell "/usr/local/bin/tmux-groups --print menu dummy > '$vdir/menu.out' 2>&1" 2>/dev/null || true
+    tmux -S "$sock" run-shell "/usr/local/bin/tmux-groups --print menu dummy > '$vdir/menu.out' 2>&1" 2>/dev/null || true
     groups_menu=$(cat "$vdir/menu.out" 2>/dev/null || true)
     case "$groups_menu" in *groupcheck*) ;; *) groups_ok=0 ;; esac
     case "$groups_menu" in *"new group"*) ;; *) groups_ok=0 ;; esac
+    case "$groups_menu" in *"browse files"*) ;; *) groups_ok=0 ;; esac
 
     # save -> kill -> fresh server -> restore: the layout must come back
-    tmux -L "$sock" new-window -t main -n restoreme 2>/dev/null || true
-    tmux -L "$sock" split-window -t main:restoreme 2>/dev/null || true
-    tmux -L "$sock" run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" >/dev/null 2>&1 || true
-    tmux -L "$sock" kill-server 2>/dev/null || true
-    if tmux -L "$sock2" -f "$vdir/conf" new-session -d -s main 2>/dev/null; then
-      tmux -L "$sock2" run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh" >/dev/null 2>&1 || true
-      restored=$(tmux -L "$sock2" list-windows -t main -F '#{window_name}:#{window_panes}' 2>/dev/null || true)
-      tmux -L "$sock2" kill-server 2>/dev/null || true
+    tmux -S "$sock" new-window -t main -n restoreme 2>/dev/null || true
+    tmux -S "$sock" split-window -t main:restoreme 2>/dev/null || true
+    tmux -S "$sock" run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" >/dev/null 2>&1 || true
+    tmux -S "$sock" kill-server 2>/dev/null || true
+    if tmux -S "$sock2" -f "$vdir/conf" new-session -d -s main 2>/dev/null; then
+      tmux -S "$sock2" run-shell "$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh" >/dev/null 2>&1 || true
+      restored=$(tmux -S "$sock2" list-windows -t main -F '#{window_name}:#{window_panes}' 2>/dev/null || true)
+      tmux -S "$sock2" kill-server 2>/dev/null || true
     fi
   fi
   rm -rf "$vdir"
