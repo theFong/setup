@@ -3,6 +3,27 @@
 Concrete knobs and measured results. Versions move fast — treat numbers as
 illustrative of *shape*, and re-measure on your stack.
 
+## `max_num_seqs` is a hard cap, and 1 serializes everything
+
+A batch cap of 1 does not mean "tuned for latency" — the engine runs exactly one
+sequence at a time no matter how short the requests are. Aggregate throughput is
+then **flat at every concurrency** and extra clients only add queueing:
+
+| concurrency | seqs=1 | seqs=8 |
+|---|---|---|
+| 1 | 94.2 tok/s · TTFT 249 ms | 78.4 · 245 ms |
+| 4 | 101.6 · TTFT 14,865 ms | 157.5 · 342 ms |
+| 8 | **102.2 · TTFT 35,132 ms** | **311.1 · 437 ms** |
+
+3.04x aggregate and 80x better TTFT, from one flag. **Flat aggregate throughput
+with linearly growing TTFT is the signature of serialization, not of a saturated
+GPU** — check the cap before profiling kernels.
+
+The win is workload-shaped: at 50k-token inputs the same change gave only **+24%**,
+because that regime is prefill-bound rather than decode-bound. Raising the cap also
+widens cudagraph capture and shrinks the KV pool, so re-verify that the context
+length still fits — see [memory-budget.md](memory-budget.md).
+
 ## Speculative decoding has a concurrency crossover
 
 The most valuable tuning finding available, and it is rarely documented.

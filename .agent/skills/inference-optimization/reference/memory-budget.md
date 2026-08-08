@@ -79,6 +79,57 @@ Reading "362,713 tokens" at a 300k setting and concluding "360k will fit" is
 wrong — that was a real failed launch. Approach the ceiling in steps and trust
 the engine's own `estimated maximum model length` over your arithmetic.
 
+## Cudagraph capture sizes are charged to the same residual
+
+Raising the batch cap means widening the decode cudagraph capture list, and those
+graphs come out of the pool's budget. Measured: going from one capture size to
+four — to cover 8 sequences where speculative decode makes the decode batch
+`seqs x 5` — cost **~0.23 GiB**. Small in absolute terms, and still enough to push
+a max-model-len that previously fit **below its own minimum**, so the server
+refused to start.
+
+Budget the concurrency change and the context length together. Note also that the
+profiler is not perfectly repeatable: one setting near the edge **started twice
+and failed once on identical config**. Leave real margin instead of sitting on the
+engine's `estimated maximum model length`.
+
+## CPU KV offload extends the cache, not the working set
+
+Offloading KV to host memory is the obvious move when the pool is tight, and on
+coherent-memory parts it looks free — measured **379 GB/s H2D / 375 GB/s D2H**
+GPU↔host, versus ~55 GB/s for PCIe Gen5 x16. The transfers really are that fast: a
+CPU-tier hit promoted a **50k-token prefix in 5 ms** against ~7.7 s to prefill it,
+roughly 1,500x, at a 49.7% hit rate.
+
+It still lost end to end, and the reason generalizes.
+
+**Offload connectors extend the prefix cache, not the number of resident
+sequences.** They are an L2 lookup tier: blocks are copied out on eviction and
+copied back on a later prefix hit. They do not raise the batch cap and do not let
+more sequences decode concurrently. They help **prefill**, and only when requests
+actually share prefixes.
+
+Meanwhile every offload path **costs GPU KV pool**:
+
+- Engines commonly reject KV connectors while the CUDA allocator is in an
+  expandable/VMM mode, because the connector pins KV pages the allocator may
+  remap. Turning that mode off reintroduces fragmentation and forces utilization
+  down — and the resulting OOM message will recommend the very flag you removed.
+- An out-of-process cache server still holds **GPU** memory if it reaches the
+  engine's KV buffers over IPC (measured **~9.5 GiB**), capping utilization via
+  the engine's own free-memory check.
+
+Measured net where weights already filled ~88% of HBM: pool **−49%**, cutting
+resident 50k-token sequences from ~7 to ~3.6. Requests then queued for blocks, and
+that queueing delay swamped the prefill savings — throughput and TTFT both got
+worse than with no offload at all.
+
+**Decide with one question: is the pool binding on admission, or is prefill
+binding on latency?** Offload addresses the second. If sequences are queueing for
+blocks, spending pool to buy a prefill cache trades the scarce resource for the
+abundant one. It becomes attractive with a smaller checkpoint, more HBM or nodes,
+or heavy prefix reuse at low concurrency.
+
 ## The trilemma: pick two
 
 On fixed HBM with the checkpoint chosen, you choose two of **{long context,

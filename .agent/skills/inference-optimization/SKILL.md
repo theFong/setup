@@ -99,6 +99,11 @@ Bad measurements cause worse decisions than no measurements.
 
 - **Drain to idle first** — leftover in-flight requests wreck TTFT.
   Poll `vllm:num_requests_running` / `_waiting` to 0.
+- **Send more requests than the concurrency you asked for.** With
+  `request-count < concurrency` the load generator can never reach the requested
+  concurrency, and at `request-count == concurrency` the window is one wave of
+  pure ramp-up and drain. Both silently understate throughput and fabricate a
+  dip at high concurrency. Use `requests = concurrency x rounds`, no low cap.
 - **Warm up, then re-run** — first touch of each batch/sequence shape pays JIT.
   Cold vs warm measured **175 s vs 3.3 s** TTFT on the same case.
 - **Read decode and prefill separately** — aggregate metrics that divide by
