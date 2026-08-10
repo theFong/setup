@@ -470,4 +470,97 @@ if ! ./webshell/tmux-files view "$scratch" 2>&1 | grep -q "not a file"; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# pi/install.sh
+# ---------------------------------------------------------------------------
+# Sourced in a subshell: it defines its own log/have/record_failure helpers,
+# which would otherwise shadow install.sh's for the tests above.
+
+# resolve_api_key must fail rather than silently writing a keyless config when
+# no key is available and prompting is disabled (cron, provisioning, CI).
+if (
+  export SETUP_SKIP_MAIN=1 PI_NO_PROMPT=1
+  unset PI_API_KEY
+  source ./pi/install.sh
+  resolve_api_key
+) >/dev/null 2>&1; then
+  echo "FAIL: pi resolve_api_key unexpectedly succeeded with no key available" >&2
+  exit 1
+fi
+
+# --key-file must reject an unreadable path instead of configuring an empty key.
+if (
+  export SETUP_SKIP_MAIN=1 PI_NO_PROMPT=1
+  unset PI_API_KEY
+  source ./pi/install.sh
+  KEY_FILE="$scratch/no-such-key"
+  resolve_api_key
+) >/dev/null 2>&1; then
+  echo "FAIL: pi resolve_api_key unexpectedly succeeded with a missing key file" >&2
+  exit 1
+fi
+
+# configure_models must refuse to clobber an unparseable models.json. Losing a
+# hand-edited provider list to a bootstrap re-run is worse than not configuring.
+mkdir -p "$scratch/pi-agent"
+printf 'not json\n' > "$scratch/pi-agent/models.json"
+if (
+  export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent"
+  source ./pi/install.sh
+  API_KEY=test-key
+  configure_models
+) >/dev/null 2>&1; then
+  echo "FAIL: pi configure_models unexpectedly succeeded on invalid JSON" >&2
+  exit 1
+fi
+if [ "$(cat "$scratch/pi-agent/models.json")" != "not json" ]; then
+  echo "FAIL: pi configure_models clobbered an unparseable models.json" >&2
+  exit 1
+fi
+
+# A key the endpoint rejects must be reported, not left for the user to hit as
+# a 401 on their first prompt. Served from loopback so the test needs neither
+# network access nor a real credential.
+rm -f "$scratch/pi-agent/models.json"
+if have python3; then
+  python3 ./pi/test-401-server.py "$scratch/port" &
+  server_pid=$!
+  for _ in $(seq 1 50); do [ -s "$scratch/port" ] && break; sleep 0.1; done
+  if [ -s "$scratch/port" ]; then
+    if (
+      export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent"
+      export PI_BASE_URL="http://127.0.0.1:$(cat "$scratch/port")/v1"
+      source ./pi/install.sh
+      API_KEY=wrong-key
+      configure_models >/dev/null
+      assert_pi_endpoint
+    ) >/dev/null 2>&1; then
+      echo "FAIL: pi assert_pi_endpoint accepted a key the endpoint rejected" >&2
+      kill "$server_pid" 2>/dev/null || true
+      exit 1
+    fi
+  else
+    echo "WARN: skipping pi endpoint rejection test (local server did not start)" >&2
+  fi
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+fi
+
+# models.json holds a live credential and must not be group- or world-readable.
+if (
+  export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent2"
+  source ./pi/install.sh
+  API_KEY=test-key
+  configure_models
+) >/dev/null 2>&1; then
+  perms=$(ls -l "$scratch/pi-agent2/models.json" | cut -c1-10)
+  case "$perms" in
+    -rw-------) ;;
+    *) echo "FAIL: pi models.json is $perms, expected -rw------- (holds an API key)" >&2; exit 1 ;;
+  esac
+else
+  echo "FAIL: pi configure_models failed on a fresh agent directory" >&2
+  exit 1
+fi
+
 log "all negative tests passed"

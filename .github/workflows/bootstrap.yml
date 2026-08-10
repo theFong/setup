@@ -55,6 +55,7 @@ jobs:
           bash -n install.sh
           bash -n test.sh
           bash -n webshell/install.sh
+          bash -n pi/install.sh
 
       - name: Run negative tests
         run: ./test.sh
@@ -81,6 +82,29 @@ jobs:
       # the check. Negative tests live in test.sh. See STYLE_GUIDE.md.
       - name: Verify bootstrap is safe to re-run
         run: bash install.sh
+
+      # pi. The installer's own assertions are the check: provider and default
+      # model as they landed on disk, plus pi starting with the extension
+      # loaded. The endpoint check is skipped because CI has no real key — its
+      # rejection path is covered by test.sh against a loopback 401 server.
+      - name: Install pi
+        env:
+          PI_API_KEY: ci-test-key
+          PI_SKIP_ENDPOINT_CHECK: "1"
+        run: pi/install.sh
+
+      - name: Verify pi health check passes standalone
+        env:
+          PI_SKIP_ENDPOINT_CHECK: "1"
+        run: pi/install.sh --verify-only
+
+      - name: Verify pi install is safe to re-run
+        env:
+          PI_API_KEY: ci-test-key
+          PI_SKIP_ENDPOINT_CHECK: "1"
+        run: |
+          pi/install.sh | tee pi-rerun.log
+          grep -q "tokps-session extension unchanged" pi-rerun.log
 
       # Webshell (Linux-only: requires systemd). The installer's built-in
       # verify() fails nonzero unless the service is active, the deployed unit

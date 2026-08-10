@@ -10,6 +10,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
 - **claude/statusline.sh** — Claude Code status line showing session id and context usage (see below)
+- **pi/install.sh** — Installs the pi coding agent pointed at a hosted OpenAI-compatible endpoint, with a tok/s + model + session-id footer (see below)
 - **webshell/** — Browser terminal (ttyd + tmux) with persistent sessions, clickable tabs, and copy-to-clipboard (see below)
 - **.agent/skills/** — Custom agent skills (brev-cli, cluster-ops, inference-optimization, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
@@ -100,6 +101,60 @@ it actually renders a sample payload. Delete the `statusLine` key from
 Claude Code-specific — Codex CLI has no status line hook. The equivalent Codex
 workflow is `codex resume`, whose session picker (or `--last`) selects a past
 session without needing the id in front of you.
+
+## pi Coding Agent
+
+Installs [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
+and points it at a hosted OpenAI-compatible endpoint, with GLM 5.2 as the
+default model. Not part of the main bootstrap — it needs an API key, so run it
+on its own:
+
+```bash
+pi/install.sh                        # prompts for the key (input hidden)
+PI_API_KEY=sk-... pi/install.sh      # non-interactive
+pi/install.sh --key-file ./key.txt   # read the key from a file
+```
+
+The key is never stored in this repo. It is written only to
+`~/.pi/agent/models.json`, which the installer chmods to `600`.
+
+What it configures:
+
+- **Provider + model** in `~/.pi/agent/models.json`. pi has no endpoint
+  discovery, so the model is declared with the backend's real limits (320K
+  context, 32K output) rather than whatever the proxy advertises — vLLM
+  rejects `max_tokens` above `max_model_len`, and pi reserves output tokens
+  against the context window.
+- **Default model** (`defaultProvider` / `defaultModel`) in
+  `~/.pi/agent/settings.json`.
+- **`tokps-session` extension** in `~/.pi/agent/extensions/`, adding a footer
+  line: `73.4 tok/s • webster/glm-5.2 • 019feddc-fb49-729f-…`. The rate is
+  decode speed — output tokens over the time from first streamed content to
+  end of generation — so tool-execution time doesn't dilute it. Providers only
+  report usage on the final stream event, so it lands at the end of each turn
+  rather than ticking up live. Grab the session id from that line and resume
+  with `pi --session <partial-uuid>`, or `--fork` to branch instead of append.
+
+Flags and overrides:
+
+| Flag / env | Effect |
+| --- | --- |
+| `--exclusive` | Make this the only provider in `models.json` (default merges) |
+| `--verify-only` | Check an existing install, change nothing, exit nonzero on any problem |
+| `--key-file PATH` | Read the key from the first line of a file |
+| `PI_NO_PROMPT=1` | Never prompt; fail if no key was supplied |
+| `PI_PROVIDER`, `PI_BASE_URL`, `PI_MODEL` | Target a different endpoint or model |
+| `PI_CONTEXT_WINDOW`, `PI_MAX_TOKENS` | Override the declared model limits |
+| `PI_SKIP_ENDPOINT_CHECK=1` | Skip the live key check (offline installs) |
+
+The installer verifies its own results on every run: the provider and default
+model as they landed on disk, that `pi` starts with the extension loaded, and
+that the endpoint actually accepts the key. A rejected key (HTTP 401/403) is a
+failure, not a warning — otherwise a typo'd paste only surfaces on your first
+prompt. Unreachable endpoints are warned about and skipped so an offline
+machine can still be configured. Re-running is safe: existing providers are
+preserved, an unparseable config is left untouched, and the extension is only
+rewritten when its content differs.
 
 ## Web Shell (browser terminal)
 
