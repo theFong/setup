@@ -5,7 +5,8 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 ## What's Inside
 
 - **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
-- **test.sh** — Isolated negative tests for install.sh failure paths, run by CI and safe to run locally
+- **omp-setup.sh** — Installs and configures [omp](https://omp.sh) (oh-my-pi) against the Brev-hosted model endpoint (see below)
+- **test.sh** — Isolated negative tests for install.sh and omp-setup.sh failure paths, run by CI and safe to run locally
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
@@ -182,6 +183,58 @@ Notes baked into the setup (hard-won):
   another group; mouse-wheel over the bar cycles groups. Menus come from
   `webshell/tmux-groups`. Groups survive reboots like everything else
   (resurrect saves and restores all sessions).
+
+## omp (oh-my-pi)
+
+`omp-setup.sh` installs [omp](https://omp.sh) if it isn't already present, points
+it at the Brev-hosted `webster` model proxy, defaults it to **GLM 5.2**, and turns
+on **nerd mode** — Nerd Font symbols plus the `nerd` status line preset
+(tok/sec spark, TTFT, context %, cost, cache reads, elapsed time).
+
+```bash
+OMP_WEBSTER_API_KEY=sk-... ~/.setup/omp-setup.sh
+```
+
+Or without the env var — it prompts for the key (hidden input):
+
+```bash
+~/.setup/omp-setup.sh
+```
+
+| Flag | Effect |
+|---|---|
+| _(none)_ | Install + configure + verify |
+| `--check` | Verify an existing install; changes nothing, exits non-zero on drift |
+| `--no-smoke` | Skip the live model round-trip (still checks the endpoint) |
+
+What it writes:
+
+| Where | What |
+|---|---|
+| `~/.omp/agent/models.yml` | `webster` provider: base URL, API key, LiteLLM discovery (mode `0600`) |
+| `~/.omp/agent/config.yml` | `symbolPreset: nerd`, `statusLine.preset: nerd`, `modelRoles.default: webster/glm-5.2` |
+
+It is idempotent and merge-safe: re-running reuses the key already on disk,
+preserves other providers and other model roles (`advisor`, `smol`, `tiny`, …),
+and backs up `models.yml` to `models.yml.bak` before any change.
+
+**The API key is never stored in this repo** — pass it via `OMP_WEBSTER_API_KEY`
+(or `WEBSTER_API_KEY`) or let the script prompt for it.
+
+Verification runs on every install (`assert_omp_config` / `assert_omp_endpoint` /
+`assert_omp_smoke`, per [STYLE_GUIDE.md](STYLE_GUIDE.md)): it reads the settings
+back out of `omp`, lists models from the endpoint to confirm the URL and key are
+good and that `glm-5.2` is served, then sends a real one-shot prompt through the
+*configured default* model and asserts the reply. Failure paths — dead endpoint,
+endpoint missing the model, no API key, stale duplicate provider entry — are
+covered in `test.sh`.
+
+It is not wired into `install.sh`, because it needs a secret the bootstrap does
+not have. Run it separately after the bootstrap.
+
+Nerd mode needs a [Nerd Font](https://nerdfonts.com) selected in your terminal;
+without one the status line renders as tofu boxes. Fall back with
+`omp config set symbolPreset unicode && omp config set statusLine.preset full`.
 
 ## North/South Internet Check
 

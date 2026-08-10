@@ -54,6 +54,7 @@ jobs:
         run: |
           bash -n install.sh
           bash -n test.sh
+          bash -n omp-setup.sh
           bash -n webshell/install.sh
 
       - name: Run negative tests

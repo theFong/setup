@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# test.sh — isolated negative tests for install.sh: prove failure paths return
-# nonzero without running the full bootstrap. Success paths are validated by
-# install.sh itself on every run (assert_installed / assert_* helpers, see
+# test.sh — isolated negative tests for install.sh and omp-setup.sh: prove
+# failure paths return nonzero without running the full bootstrap. Success
+# paths are validated by the scripts themselves on every run (assert_installed
+# / assert_* helpers, see
 # STYLE_GUIDE.md); this script covers only what a passing bootstrap cannot
 # exercise. CI runs it, and it is safe to run locally — everything happens in
 # scratch directories and the real $HOME is never touched.
@@ -467,6 +468,146 @@ fi
 # the viewer must refuse a non-file path rather than paging garbage
 if ! ./webshell/tmux-files view "$scratch" 2>&1 | grep -q "not a file"; then
   echo "FAIL: tmux-files view accepted a directory" >&2
+  exit 1
+fi
+
+# omp-setup.sh: sourced in subshells throughout, because it defines its own
+# log/warn/have and would otherwise replace install.sh's helpers for every test
+# after this point.
+
+# merge_models_yml must not shadow the managed provider with a hand-written
+# entry of the same id. YAML keeps the LAST duplicate key, so leaving an old
+# `webster:` in place would silently point omp at the previous endpoint while
+# the file still reads as correctly configured.
+mkdir -p "$scratch/omp"
+printf 'providers:\n  litellm:\n    baseUrl: https://other.example.com/v1\n  webster:\n    baseUrl: https://STALE.example.com/v1\n    apiKey: sk-stale\n' \
+  > "$scratch/omp/models.yml"
+if ! (
+  export SETUP_SKIP_MAIN=1 OMP_BASE_URL=https://fresh.example.com/v1
+  source ./omp-setup.sh
+  merge_models_yml "$scratch/omp/models.yml" sk-fresh
+) >/dev/null 2>&1; then
+  echo "FAIL: merge_models_yml reported no change when the file needed rewriting" >&2
+  exit 1
+fi
+if grep -q 'STALE.example.com' "$scratch/omp/models.yml"; then
+  echo "FAIL: merge_models_yml left a stale duplicate webster provider in place" >&2
+  exit 1
+fi
+if [ "$(grep -c '^  webster:$' "$scratch/omp/models.yml")" != "1" ]; then
+  echo "FAIL: merge_models_yml produced a duplicate webster key" >&2
+  exit 1
+fi
+if ! grep -q 'other.example.com' "$scratch/omp/models.yml"; then
+  echo "FAIL: merge_models_yml dropped an unrelated provider" >&2
+  exit 1
+fi
+if [ "$(stat -f '%Lp' "$scratch/omp/models.yml" 2>/dev/null || stat -c '%a' "$scratch/omp/models.yml")" != "600" ]; then
+  echo "FAIL: merge_models_yml left an API key world-readable" >&2
+  exit 1
+fi
+
+# ...and a second run must be a no-op (return nonzero for "no change"), so a
+# re-bootstrap neither rewrites the file nor churns a backup.
+if (
+  export SETUP_SKIP_MAIN=1 OMP_BASE_URL=https://fresh.example.com/v1
+  source ./omp-setup.sh
+  merge_models_yml "$scratch/omp/models.yml" sk-fresh
+) >/dev/null 2>&1; then
+  echo "FAIL: merge_models_yml rewrote an already-current models.yml" >&2
+  exit 1
+fi
+
+# key_from_models_yml must read back the key it wrote, or every re-run would
+# re-prompt (and a non-interactive re-run would fail outright).
+omp_key=$(
+  export SETUP_SKIP_MAIN=1
+  source ./omp-setup.sh
+  key_from_models_yml "$scratch/omp/models.yml"
+)
+if [ "$omp_key" != "sk-fresh" ]; then
+  echo "FAIL: key_from_models_yml did not read back the stored key (got '$omp_key')" >&2
+  exit 1
+fi
+
+# assert_omp_endpoint must fail on a dead endpoint rather than reporting a
+# healthy provider. Port 1 on loopback refuses instantly, so this needs no
+# network and cannot hang.
+if (
+  export SETUP_SKIP_MAIN=1
+  source ./omp-setup.sh
+  assert_omp_endpoint "http://127.0.0.1:1/v1" sk-irrelevant
+) >/dev/null 2>&1; then
+  echo "FAIL: assert_omp_endpoint accepted an unreachable endpoint" >&2
+  exit 1
+fi
+
+# ...and must also fail on an endpoint that answers but does not serve the
+# model being made the default — otherwise reachability alone would pass.
+if command -v python3 >/dev/null 2>&1; then
+  omp_port=39997
+  mkdir -p "$scratch/ompsrv/v1"
+  printf '{"data":[{"id":"some-other-model"}]}' > "$scratch/ompsrv/v1/models"
+  python3 -m http.server "$omp_port" --bind 127.0.0.1 --directory "$scratch/ompsrv" >/dev/null 2>&1 &
+  omp_srv=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -s -o /dev/null -m 1 "http://127.0.0.1:$omp_port/" && break
+    sleep 0.3
+  done
+  if (
+    export SETUP_SKIP_MAIN=1
+    source ./omp-setup.sh
+    assert_omp_endpoint "http://127.0.0.1:$omp_port/v1" sk-irrelevant
+  ) >/dev/null 2>&1; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: assert_omp_endpoint accepted an endpoint not serving the default model" >&2
+    exit 1
+  fi
+  # ...and must pass when the model IS served, so the two checks above cannot be
+  # satisfied by an assertion that simply always fails.
+  printf '{"data":[{"id":"glm-5.2"}]}' > "$scratch/ompsrv/v1/models"
+  if ! (
+    export SETUP_SKIP_MAIN=1
+    source ./omp-setup.sh
+    assert_omp_endpoint "http://127.0.0.1:$omp_port/v1" sk-irrelevant
+  ) >/dev/null 2>&1; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: assert_omp_endpoint rejected an endpoint serving the default model" >&2
+    exit 1
+  fi
+  kill "$omp_srv" 2>/dev/null || true
+  wait "$omp_srv" 2>/dev/null || true
+else
+  echo "skip: python3 not available; omp endpoint model-presence test not run" >&2
+fi
+
+# omp-setup.sh must refuse to run with no API key rather than writing a
+# provider entry with an empty key that fails on first use. Runs with a scratch
+# HOME and closed stdin (no tty, so it cannot prompt); the scratch HOME must
+# come back untouched.
+mkdir -p "$scratch/omphome"
+if (
+  export HOME="$scratch/omphome" OMP_SKIP_PROFILE=1
+  export PI_CODING_AGENT_DIR="$scratch/omphome/agent"
+  unset SETUP_SKIP_MAIN OMP_WEBSTER_API_KEY WEBSTER_API_KEY
+  ./omp-setup.sh </dev/null
+) >/dev/null 2>&1; then
+  echo "FAIL: omp-setup.sh ran without an API key" >&2
+  exit 1
+fi
+if [ -f "$scratch/omphome/agent/models.yml" ]; then
+  echo "FAIL: omp-setup.sh wrote models.yml before refusing a missing API key" >&2
+  exit 1
+fi
+
+# An unknown flag must be rejected instead of silently reconfiguring the agent
+# with defaults the caller did not ask for.
+if (
+  export SETUP_SKIP_MAIN=1
+  source ./omp-setup.sh
+  main --bogus-flag
+) >/dev/null 2>&1; then
+  echo "FAIL: omp-setup.sh accepted an unknown flag" >&2
   exit 1
 fi
 
