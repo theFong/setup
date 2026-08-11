@@ -17,6 +17,15 @@ source ./install.sh
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
+# file_mode PATH — octal permission bits, portable across GNU and BSD stat.
+# GNU is probed first on purpose: BSD stat rejects -c and exits nonzero with
+# empty stdout, but GNU stat reads -f as --file-system and cheerfully prints
+# filesystem stats for the file, so a BSD-first probe succeeds on Linux with
+# the wrong answer instead of falling through.
+file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
 # assert_installed must fail for a missing command, and summary must then
 # return nonzero rather than reporting a clean bootstrap.
 FAILED=""
@@ -502,7 +511,7 @@ if ! grep -q 'other.example.com' "$scratch/omp/models.yml"; then
   echo "FAIL: merge_models_yml dropped an unrelated provider" >&2
   exit 1
 fi
-if [ "$(stat -f '%Lp' "$scratch/omp/models.yml" 2>/dev/null || stat -c '%a' "$scratch/omp/models.yml")" != "600" ]; then
+if [ "$(file_mode "$scratch/omp/models.yml")" != "600" ]; then
   echo "FAIL: merge_models_yml left an API key world-readable" >&2
   exit 1
 fi
@@ -608,6 +617,132 @@ if (
   main --bogus-flag
 ) >/dev/null 2>&1; then
   echo "FAIL: omp-setup.sh accepted an unknown flag" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# pi-setup.sh
+# ---------------------------------------------------------------------------
+# Sourced in subshells: it defines its own log/have/record_failure helpers,
+# which would otherwise shadow install.sh's for the tests above.
+
+# resolve_api_key must fail rather than silently writing a keyless config when
+# no key is available and prompting is disabled (cron, provisioning, CI).
+if (
+  export SETUP_SKIP_MAIN=1 PI_NO_PROMPT=1
+  unset PI_API_KEY WEBSTER_API_KEY
+  source ./pi-setup.sh
+  resolve_api_key
+) >/dev/null 2>&1; then
+  echo "FAIL: pi resolve_api_key unexpectedly succeeded with no key available" >&2
+  exit 1
+fi
+
+# --key-file must reject an unreadable path instead of configuring an empty key.
+if (
+  export SETUP_SKIP_MAIN=1 PI_NO_PROMPT=1
+  unset PI_API_KEY WEBSTER_API_KEY
+  source ./pi-setup.sh
+  KEY_FILE="$scratch/no-such-key"
+  resolve_api_key
+) >/dev/null 2>&1; then
+  echo "FAIL: pi resolve_api_key unexpectedly succeeded with a missing key file" >&2
+  exit 1
+fi
+
+# configure_models must refuse to clobber an unparseable models.json. Losing a
+# hand-edited provider list to a re-run is worse than not configuring anything.
+mkdir -p "$scratch/pi-agent"
+printf 'not json\n' > "$scratch/pi-agent/models.json"
+if (
+  export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent"
+  source ./pi-setup.sh
+  API_KEY=test-key
+  configure_models
+) >/dev/null 2>&1; then
+  echo "FAIL: pi configure_models unexpectedly succeeded on invalid JSON" >&2
+  exit 1
+fi
+if [ "$(cat "$scratch/pi-agent/models.json")" != "not json" ]; then
+  echo "FAIL: pi configure_models clobbered an unparseable models.json" >&2
+  exit 1
+fi
+
+# A merge must preserve providers it does not manage; --exclusive is the only
+# way to drop them.
+printf '{"providers":{"other":{"baseUrl":"https://other.example.com/v1"}}}\n' \
+  > "$scratch/pi-agent/models.json"
+if ! (
+  export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent"
+  source ./pi-setup.sh
+  API_KEY=test-key
+  configure_models
+) >/dev/null 2>&1; then
+  echo "FAIL: pi configure_models failed on a config with an existing provider" >&2
+  exit 1
+fi
+if ! grep -q 'other.example.com' "$scratch/pi-agent/models.json"; then
+  echo "FAIL: pi configure_models dropped an unrelated provider during a merge" >&2
+  exit 1
+fi
+
+# A key the endpoint rejects must be reported, not left for the user to hit as
+# a 401 on their first prompt. Served from loopback so this needs neither
+# network access nor a real credential.
+if have python3; then
+  python3 - "$scratch/port" >/dev/null 2>&1 <<'PYEOF' &
+import http.server, socketserver, sys, threading
+
+class RejectAll(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+with socketserver.TCPServer(("127.0.0.1", 0), RejectAll) as srv:
+    with open(sys.argv[1], "w") as fh:
+        fh.write(str(srv.server_address[1]))
+    threading.Timer(20, srv.shutdown).start()
+    srv.serve_forever()
+PYEOF
+  pi_server_pid=$!
+  for _ in $(seq 1 50); do [ -s "$scratch/port" ] && break; sleep 0.1; done
+  if [ -s "$scratch/port" ]; then
+    if (
+      export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent-401"
+      export PI_BASE_URL="http://127.0.0.1:$(cat "$scratch/port")/v1"
+      source ./pi-setup.sh
+      API_KEY=wrong-key
+      configure_models >/dev/null
+      assert_pi_endpoint
+    ) >/dev/null 2>&1; then
+      echo "FAIL: pi assert_pi_endpoint accepted a key the endpoint rejected" >&2
+      kill "$pi_server_pid" 2>/dev/null || true
+      exit 1
+    fi
+  else
+    echo "WARN: skipping pi endpoint rejection test (loopback server did not start)" >&2
+  fi
+  kill "$pi_server_pid" 2>/dev/null || true
+  wait "$pi_server_pid" 2>/dev/null || true
+fi
+
+# models.json holds a live credential and must not be group- or world-readable.
+if (
+  export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent-perms"
+  source ./pi-setup.sh
+  API_KEY=test-key
+  configure_models
+) >/dev/null 2>&1; then
+  if [ "$(file_mode "$scratch/pi-agent-perms/models.json")" != "600" ]; then
+    echo "FAIL: pi configure_models left an API key world-readable" >&2
+    exit 1
+  fi
+else
+  echo "FAIL: pi configure_models failed on a fresh agent directory" >&2
   exit 1
 fi
 
