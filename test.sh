@@ -502,8 +502,14 @@ if ! grep -q 'other.example.com' "$scratch/omp/models.yml"; then
   echo "FAIL: merge_models_yml dropped an unrelated provider" >&2
   exit 1
 fi
-if [ "$(stat -f '%Lp' "$scratch/omp/models.yml" 2>/dev/null || stat -c '%a' "$scratch/omp/models.yml")" != "600" ]; then
-  echo "FAIL: merge_models_yml left an API key world-readable" >&2
+# GNU stat first, then BSD/macOS. The order matters and both must be quieted:
+# GNU reads -f as --file-system and prints a block of filesystem info for the
+# file while failing on the format string, so trying BSD first captures that
+# output *and* falls through, concatenating both.
+omp_mode=$(stat -c '%a' "$scratch/omp/models.yml" 2>/dev/null \
+  || stat -f '%Lp' "$scratch/omp/models.yml" 2>/dev/null || true)
+if [ "$omp_mode" != "600" ]; then
+  echo "FAIL: merge_models_yml left an API key world-readable (mode '$omp_mode')" >&2
   exit 1
 fi
 
@@ -597,6 +603,18 @@ if (
 fi
 if [ -f "$scratch/omphome/agent/models.yml" ]; then
   echo "FAIL: omp-setup.sh wrote models.yml before refusing a missing API key" >&2
+  exit 1
+fi
+
+# --help must work when the script is piped to bash (curl | bash), where there
+# is no script file to read the header comment back out of: $0 is "bash", so
+# the file-based path would grep the shell binary and print nothing usable.
+# SETUP_SKIP_MAIN is exported at the top of this file; it must be unset here or
+# the piped shell would skip main() and print nothing, passing for the wrong
+# reason.
+help_out=$( (unset SETUP_SKIP_MAIN; bash -s -- --help < ./omp-setup.sh) 2>&1 || true)
+if ! printf '%s' "$help_out" | grep -q 'WEBSTER_API_KEY'; then
+  echo "FAIL: omp-setup.sh --help printed nothing usable when piped to bash" >&2
   exit 1
 fi
 

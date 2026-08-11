@@ -191,11 +191,28 @@ it at the Brev-hosted `webster` model proxy, defaults it to **GLM 5.2**, and tur
 on **nerd mode** — Nerd Font symbols plus the `nerd` status line preset
 (tok/sec spark, TTFT, context %, cost, cache reads, elapsed time).
 
+One line on a new machine — note the key goes on the **right** of the pipe, so
+the `bash` running the script sees it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/omp-setup.sh | WEBSTER_API_KEY=sk-... bash
+```
+
+Pass flags after `-s --`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/omp-setup.sh | WEBSTER_API_KEY=sk-... bash -s -- --no-smoke
+```
+
+From a local clone:
+
 ```bash
 OMP_WEBSTER_API_KEY=sk-... ~/.setup/omp-setup.sh
 ```
 
-Or without the env var — it prompts for the key (hidden input):
+Or without the env var — run from a terminal and it prompts for the key (hidden
+input). Piping to `bash` consumes stdin, so a piped run cannot prompt and exits
+non-zero instead of writing an empty key:
 
 ```bash
 ~/.setup/omp-setup.sh
