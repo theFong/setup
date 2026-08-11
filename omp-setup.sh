@@ -299,7 +299,26 @@ assert_omp_smoke() {
 
 # ---------------------------------------------------------------------- main
 
-usage() { grep '^#' "$0" | cut -c 3-; }
+# Piped to bash (curl | bash) there is no script file to read the header
+# comment back out of, so fall back to an inline summary.
+usage() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  if [ -r "$src" ] && head -1 "$src" | grep -q '^#!'; then
+    grep '^#' "$src" | cut -c 3-
+    return 0
+  fi
+  cat <<EOF
+omp-setup.sh — install omp and point it at the Brev-hosted $PROVIDER_ID endpoint,
+defaulting to $MODEL_ID with nerd mode enabled.
+
+  WEBSTER_API_KEY=sk-... omp-setup.sh              install and verify
+  omp-setup.sh --check                             verify only, change nothing
+  omp-setup.sh --no-smoke                          skip the live model round-trip
+
+The key comes from OMP_WEBSTER_API_KEY or WEBSTER_API_KEY; when the script is
+run from a terminal (not piped) it prompts instead.
+EOF
+}
 
 main() {
   local arg
