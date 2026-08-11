@@ -6,7 +6,8 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 
 - **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
 - **omp-setup.sh** — Installs and configures [omp](https://omp.sh) (oh-my-pi) against the Brev-hosted model endpoint (see below)
-- **test.sh** — Isolated negative tests for install.sh and omp-setup.sh failure paths, run by CI and safe to run locally
+- **pi-setup.sh** — Same, for the [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding agent; one-liner installable (see below)
+- **test.sh** — Isolated negative tests for install.sh, omp-setup.sh, and pi-setup.sh failure paths, run by CI and safe to run locally
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
@@ -252,6 +253,74 @@ not have. Run it separately after the bootstrap.
 Nerd mode needs a [Nerd Font](https://nerdfonts.com) selected in your terminal;
 without one the status line renders as tofu boxes. Fall back with
 `omp config set symbolPreset unicode && omp config set statusLine.preset full`.
+
+## pi
+
+`pi-setup.sh` is the sibling of `omp-setup.sh` for the
+[pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding
+agent: same `webster` endpoint, same **GLM 5.2** default, plus a footer status
+line showing generation speed, active model, and session id.
+
+Hand this to someone and they are set up in one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/pi-setup.sh \
+  | WEBSTER_API_KEY=sk-... bash
+```
+
+The env prefix goes on `bash`, not before `curl` — `WEBSTER_API_KEY=sk-... curl … | bash`
+sets a shell variable that never reaches the script. Omit it entirely and it
+prompts for the key with hidden input, reading `/dev/tty` because stdin is the
+pipe carrying the script.
+
+| Flag | Effect |
+|---|---|
+| _(none)_ | Install + configure + verify, merging into any existing config |
+| `--exclusive` | Make `webster` the only provider in `models.json` |
+| `--check` | Verify an existing install; changes nothing, exits non-zero on drift |
+| `--key-file PATH` | Read the key from a file's first line |
+
+What it writes:
+
+| Where | What |
+|---|---|
+| `~/.pi/agent/models.json` | `webster` provider: base URL, API key, `glm-5.2` with real limits (mode `0600`) |
+| `~/.pi/agent/settings.json` | `defaultProvider: webster`, `defaultModel: glm-5.2` |
+| `~/.pi/agent/extensions/tokps-session.ts` | Footer line: `73.4 tok/s • webster/glm-5.2 • 019feddc-…` |
+
+Unlike omp, pi has no endpoint discovery, so the model is declared with the
+backend's real limits rather than the proxy's metadata — the proxy reports a
+null context window, while vLLM rejects `max_tokens` above
+`max_model_len=320000`. Override with `PI_CONTEXT_WINDOW` / `PI_MAX_TOKENS`,
+or target a different endpoint entirely with `PI_PROVIDER` / `PI_BASE_URL` /
+`PI_MODEL`.
+
+The footer rate is **decode speed** — output tokens over the time from first
+streamed content to end of generation — so a turn that runs a slow bash command
+doesn't dilute it. Providers only report usage on the final stream event, so it
+lands at the end of each turn rather than ticking up live. The session id on
+that line is what `pi --session <partial-uuid>` takes to resume (`--fork` to
+branch instead of append).
+
+**The API key is never stored in this repo** — pass it via `WEBSTER_API_KEY`
+(shared with `omp-setup.sh`) or `PI_API_KEY`, use `--key-file`, or let it
+prompt. `PI_NO_PROMPT=1` makes a missing key a hard failure instead, for cron
+and provisioning.
+
+Verification runs on every install and under `--check`, per
+[STYLE_GUIDE.md](STYLE_GUIDE.md): the provider and default model as they landed
+on disk, that `pi` starts with the extension loaded, and that the endpoint
+actually accepts the key. A rejected key (HTTP 401/403) is a failure, not a
+warning — otherwise a typo'd paste only surfaces on the first prompt. An
+unreachable endpoint just warns, so offline machines still get configured
+(`PI_SKIP_ENDPOINT_CHECK=1` skips it outright). Failure paths — no key,
+unreadable `--key-file`, unparseable `models.json`, a rejected key, and
+credential file permissions — are covered in `test.sh`.
+
+Re-running is safe: other providers survive a merge, an unparseable config is
+left untouched, and the extension is only rewritten when its content differs.
+Like `omp-setup.sh`, it is not wired into `install.sh`, because it needs a
+secret the bootstrap does not have.
 
 ## North/South Internet Check
 
