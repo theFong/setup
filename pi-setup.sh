@@ -201,17 +201,82 @@ ensure_jq() {
   assert_installed "jq" jq
 }
 
-ensure_node() {
-  if have npm; then log "npm already present"; return 0; fi
-  log "installing Node.js"
+# pi ships ESM using import attributes (`with { type: "json" }`). Node 18 does
+# not merely lack the feature — it fails to *parse* the module, so the package
+# installs cleanly and then dies on startup with
+# `SyntaxError: Unexpected token 'with'`. Its engines field says >=22.19.0, and
+# the distro nodejs on Ubuntu 22.04/24.04 is 18.x, so "npm exists" is not a
+# sufficient check.
+NODE_MIN_MAJOR=22
+
+# node_major — major version of the node on PATH, or nonzero if there is none.
+node_major() {
+  local version
+  have node || return 1
+  version=$(node --version 2>/dev/null) || return 1
+  version=${version#v}
+  version=${version%%.*}
+  case "$version" in
+    ''|*[!0-9]*) return 1 ;;
+    *) printf '%s' "$version" ;;
+  esac
+}
+
+node_is_current() {
+  local major
+  major=$(node_major) || return 1
+  [ "$major" -ge "$NODE_MIN_MAJOR" ]
+}
+
+# NodeSource is the vendor-supported way to get a current Node on a distro
+# whose packaged one is too old; brew's node is already current.
+install_node() {
+  local setup_url
   case "$PM" in
     brew) pm_install node ;;
-    apt)  pm_install nodejs npm ;;
-    dnf)  pm_install nodejs npm ;;
-    apk)  pm_install nodejs npm ;;
-    *)    warn "no package manager for Node.js; install Node 20+ manually" ;;
-  esac || warn "failed to install Node.js"
-  assert_installed "npm" npm nodejs
+    apt)
+      setup_url="https://deb.nodesource.com/setup_${NODE_MIN_MAJOR}.x"
+      if [ -n "$SUDO" ]; then curl -fsSL "$setup_url" | $SUDO -E bash -
+      else curl -fsSL "$setup_url" | bash -; fi
+      $SUDO apt-get install -y nodejs
+      ;;
+    dnf)
+      setup_url="https://rpm.nodesource.com/setup_${NODE_MIN_MAJOR}.x"
+      if [ -n "$SUDO" ]; then curl -fsSL "$setup_url" | $SUDO bash -
+      else curl -fsSL "$setup_url" | bash -; fi
+      $SUDO dnf install -y nodejs
+      ;;
+    apk) pm_install nodejs npm ;;
+    *)   warn "no supported package manager for Node.js"; return 1 ;;
+  esac
+}
+
+# assert_node_version — turn pi's cryptic startup SyntaxError into an
+# actionable message here, before anything else is configured.
+assert_node_version() {
+  local major
+  if major=$(node_major) && [ "$major" -ge "$NODE_MIN_MAJOR" ]; then
+    log "verified node $(node --version) (>= v$NODE_MIN_MAJOR)"
+    return 0
+  fi
+  warn "node $(node --version 2>/dev/null || echo 'is missing') is too old for pi (needs >= v$NODE_MIN_MAJOR)"
+  record_failure nodejs
+  return 1
+}
+
+ensure_node() {
+  if node_is_current; then
+    log "node $(node --version) already present"
+    return 0
+  fi
+  if have node; then
+    log "node $(node --version) is older than v$NODE_MIN_MAJOR; upgrading"
+  else
+    log "installing Node.js $NODE_MIN_MAJOR"
+  fi
+  install_node || warn "failed to install Node.js $NODE_MIN_MAJOR"
+  hash -r 2>/dev/null || true
+  assert_node_version
 }
 
 # npm's global prefix is root-owned on most distro packages but user-owned
@@ -227,12 +292,22 @@ npm_install_global() {
 }
 
 install_pi() {
-  if have pi; then
-    log "pi already present: $(pi --version 2>/dev/null || echo unknown)"
+  node_is_current || {
+    warn "skipping pi install until Node.js >= v$NODE_MIN_MAJOR is available"
+    record_failure pi
+    return 1
+  }
+  # "Already present" is not enough: a pi installed against an older Node is
+  # on PATH but cannot start, and skipping the install would make a re-run
+  # after upgrading Node fail exactly as the first one did.
+  if have pi && pi --version >/dev/null 2>&1; then
+    log "pi already present: $(pi --version 2>/dev/null)"
   else
     have npm || { warn "npm unavailable; cannot install pi"; record_failure pi; return 1; }
+    if have pi; then log "pi is present but does not run; reinstalling"; fi
     log "installing pi ($NPM_PACKAGE)"
     npm_install_global "$NPM_PACKAGE" || { warn "failed to install $NPM_PACKAGE"; record_failure pi; }
+    hash -r 2>/dev/null || true
   fi
   assert_installed "pi" pi || return 1
   assert_runs "pi" pi pi --version

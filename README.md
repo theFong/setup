@@ -288,6 +288,17 @@ What it writes:
 | `~/.pi/agent/settings.json` | `defaultProvider: webster`, `defaultModel: glm-5.2` |
 | `~/.pi/agent/extensions/tokps-session.ts` | Footer line: `73.4 tok/s • webster/glm-5.2 • 019feddc-…` |
 
+**pi needs Node.js ≥ 22.19**, and the script installs or upgrades it
+(NodeSource on apt/dnf, Homebrew on macOS) rather than trusting whatever `node`
+is on `PATH`. The distro `nodejs` on Ubuntu 22.04/24.04 is 18.x, which is not
+merely missing a feature: pi's ESM uses import attributes
+(`with { type: "json" }`), so Node 18 fails to *parse* it. The package installs
+cleanly through npm and then dies at startup with
+`SyntaxError: Unexpected token 'with'`. The version is asserted up front so
+that surfaces as a clear message here instead. A pi already on `PATH` that
+cannot start is reinstalled rather than reported as present, so re-running
+after a Node upgrade actually repairs it.
+
 Unlike omp, pi has no endpoint discovery, so the model is declared with the
 backend's real limits rather than the proxy's metadata — the proxy reports a
 null context window, while vLLM rejects `max_tokens` above
