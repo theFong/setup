@@ -758,4 +758,59 @@ else
   exit 1
 fi
 
+# Node.js version gate. pi ships ESM with import attributes, which Node 18
+# fails to *parse* — so it installs cleanly via npm and then dies at startup
+# with `SyntaxError: Unexpected token 'with'`. "npm exists" is not a
+# sufficient check, and CI runners always have a current Node, so the old-Node
+# path only exists here. Stub node/npm/pi on PATH to reproduce a stock Ubuntu
+# 22.04/24.04 box.
+pi_stub="$scratch/pi-stubs"
+mkdir -p "$pi_stub"
+printf '#!/bin/sh\necho v18.19.1\n' > "$pi_stub/node"
+printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$scratch/npm-calls" > "$pi_stub/npm"
+printf '#!/bin/sh\necho "SyntaxError: Unexpected token '"'"'with'"'"'" >&2\nexit 1\n' > "$pi_stub/pi"
+chmod +x "$pi_stub/node" "$pi_stub/npm" "$pi_stub/pi"
+
+if (
+  export SETUP_SKIP_MAIN=1
+  source ./pi-setup.sh
+  PATH="$pi_stub:$PATH"
+  assert_node_version
+) >/dev/null 2>&1; then
+  echo "FAIL: pi assert_node_version accepted node 18 (pi needs >= 22)" >&2
+  exit 1
+fi
+
+# ...and with a too-old Node the install must be skipped outright rather than
+# leaving a pi on PATH that cannot start.
+rm -f "$scratch/npm-calls"
+(
+  export SETUP_SKIP_MAIN=1
+  source ./pi-setup.sh
+  PATH="$pi_stub:$PATH"
+  install_pi
+) >/dev/null 2>&1 || true
+if [ -f "$scratch/npm-calls" ]; then
+  echo "FAIL: pi install_pi ran npm on a Node version pi cannot run on" >&2
+  exit 1
+fi
+
+# A pi that is on PATH but does not run must be reinstalled, not reported as
+# "already present" — otherwise re-running after a Node upgrade repeats the
+# original failure. Asserted on the npm invocation, not the exit code: the
+# stubbed pi never runs, so install_pi returns nonzero either way.
+rm -f "$scratch/npm-calls"
+(
+  export SETUP_SKIP_MAIN=1
+  source ./pi-setup.sh
+  PATH="$pi_stub:$PATH"
+  # Report a current Node so install_pi gets past the version gate.
+  node_is_current() { return 0; }
+  install_pi
+) >/dev/null 2>&1 || true
+if ! grep -q "install -g" "$scratch/npm-calls" 2>/dev/null; then
+  echo "FAIL: pi install_pi treated a broken pi as already installed" >&2
+  exit 1
+fi
+
 log "all negative tests passed"
