@@ -813,4 +813,126 @@ if ! grep -q "install -g" "$scratch/npm-calls" 2>/dev/null; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# codex-setup.sh
+# ---------------------------------------------------------------------------
+# Source in isolated subshells because paths are derived from HOME at load time
+# and its helper names intentionally mirror the other installers.
+
+# merge_codex_config must put machine-local provider keys at top level, replace
+# a stale provider block exactly once, preserve unrelated tables and same-named
+# keys inside those tables, and be byte-identical on a re-run.
+codex_home="$scratch/codex-home"
+mkdir -p "$codex_home/.codex"
+cat > "$codex_home/.codex/config.toml" <<'EOF'
+model = "keep-this-model"
+
+[projects."/tmp"]
+trust_level = "trusted"
+model_provider = "table-scoped-value"
+
+[model_providers.openai_webster]
+name = "stale"
+base_url = "https://stale.example/v1"
+
+[model_providers.other]
+name = "keep this provider"
+base_url = "https://other.example/v1"
+wire_api = "responses"
+EOF
+if ! (
+  export HOME="$codex_home" CODEX_SETUP_CODEX_DIR="$codex_home/.codex" SETUP_SKIP_MAIN=1
+  source ./codex-setup.sh
+  mkdir -p "$CODEX_DIR"
+  merge_codex_config "$CODEX_CONFIG"
+  assert_codex_config
+) >/dev/null 2>&1; then
+  echo "FAIL: codex merge_codex_config failed on an existing config" >&2
+  exit 1
+fi
+if ! grep -q '^model = "keep-this-model"$' "$codex_home/.codex/config.toml"; then
+  echo "FAIL: codex merge_codex_config changed the selected model" >&2
+  exit 1
+fi
+if ! grep -q 'table-scoped-value' "$codex_home/.codex/config.toml"; then
+  echo "FAIL: codex merge_codex_config removed a same-named key inside a table" >&2
+  exit 1
+fi
+if ! grep -q 'other.example/v1' "$codex_home/.codex/config.toml"; then
+  echo "FAIL: codex merge_codex_config removed an unrelated provider" >&2
+  exit 1
+fi
+if grep -q 'stale.example/v1' "$codex_home/.codex/config.toml"; then
+  echo "FAIL: codex merge_codex_config retained a stale managed provider" >&2
+  exit 1
+fi
+if [ "$(grep -c '^\[model_providers\.openai_webster\]$' "$codex_home/.codex/config.toml")" != 1 ]; then
+  echo "FAIL: codex merge_codex_config produced duplicate provider sections" >&2
+  exit 1
+fi
+codex_first_pass=$(cat "$codex_home/.codex/config.toml")
+if ! (
+  export HOME="$codex_home" CODEX_SETUP_CODEX_DIR="$codex_home/.codex" SETUP_SKIP_MAIN=1
+  source ./codex-setup.sh
+  merge_codex_config "$CODEX_CONFIG"
+) >/dev/null 2>&1; then
+  echo "FAIL: codex merge_codex_config failed on re-run" >&2
+  exit 1
+fi
+if [ "$(cat "$codex_home/.codex/config.toml")" != "$codex_first_pass" ]; then
+  echo "FAIL: codex merge_codex_config is not idempotent" >&2
+  exit 1
+fi
+
+# The credential writer must JSON-escape arbitrary key text and leave the
+# result owner-only. A hand-written printf-based JSON writer tends to fail one
+# or both of these checks.
+codex_secret="$scratch/webster.json"
+WEBSTER_API_KEY='sk-test-"quoted"' WEBSTER_BASE_URL='https://webster.example/v1/' \
+  node codex-model-proxy/write-webster-config.mjs "$codex_secret"
+if ! WEBSTER_API_KEY='sk-test-"quoted"' node -e '
+    const fs = require("fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (value.apiKey !== process.env.WEBSTER_API_KEY) process.exit(1);
+    if (value.baseUrl !== "https://webster.example/v1") process.exit(1);
+  ' "$codex_secret"; then
+  echo "FAIL: Codex Webster credential writer corrupted its values" >&2
+  exit 1
+fi
+codex_secret_mode=$(stat -c '%a' "$codex_secret" 2>/dev/null \
+  || stat -f '%Lp' "$codex_secret" 2>/dev/null || true)
+if [ "$codex_secret_mode" != 600 ]; then
+  echo "FAIL: Codex Webster credential is not mode 600 (got '$codex_secret_mode')" >&2
+  exit 1
+fi
+
+# --check must fail without an installed key, and an unknown option must be
+# rejected before the script changes anything.
+if (
+  export HOME="$scratch/codex-no-key" CODEX_SETUP_CODEX_DIR="$scratch/codex-no-key/.codex"
+  export SETUP_SKIP_MAIN=1
+  unset WEBSTER_API_KEY
+  source ./codex-setup.sh
+  CHECK_ONLY=1
+  resolve_api_key
+) >/dev/null 2>&1; then
+  echo "FAIL: codex --check accepted a missing Webster key" >&2
+  exit 1
+fi
+if (
+  export SETUP_SKIP_MAIN=1
+  source ./codex-setup.sh
+  main --bogus-option
+) >/dev/null 2>&1; then
+  echo "FAIL: codex-setup.sh accepted an unknown option" >&2
+  exit 1
+fi
+
+# Help must work in the actual curl-pipe execution mode.
+codex_help=$( (unset SETUP_SKIP_MAIN; bash -s -- --help < ./codex-setup.sh) 2>&1 || true)
+if ! printf '%s' "$codex_help" | grep -q 'WEBSTER_API_KEY'; then
+  echo "FAIL: codex-setup.sh --help printed nothing usable when piped to bash" >&2
+  exit 1
+fi
+
 log "all negative tests passed"

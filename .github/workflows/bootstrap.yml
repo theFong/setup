@@ -56,7 +56,11 @@ jobs:
           bash -n test.sh
           bash -n omp-setup.sh
           bash -n pi-setup.sh
+          bash -n codex-setup.sh
           bash -n webshell/install.sh
+
+      - name: Test Codex model proxy
+        run: node --test codex-model-proxy/test/proxy.test.mjs
 
       - name: Run negative tests
         run: ./test.sh
@@ -73,9 +77,11 @@ jobs:
 
       - name: Add user-installed tools to PATH
         run: |
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          {
+            echo "$HOME/.local/bin"
+            echo "$HOME/.opencode/bin"
+            echo "/usr/local/go/bin"
+          } >> "$GITHUB_PATH"
 
       # No success-path assertions here: install.sh proves its own results on
       # every run (assert_installed / assert_runs / assert_* helpers) and exits

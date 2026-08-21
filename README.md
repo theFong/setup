@@ -7,7 +7,8 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
 - **omp-setup.sh** — Installs and configures [omp](https://omp.sh) (oh-my-pi) against the Brev-hosted model endpoint (see below)
 - **pi-setup.sh** — Same, for the [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding agent; one-liner installable (see below)
-- **test.sh** — Isolated negative tests for install.sh, omp-setup.sh, and pi-setup.sh failure paths, run by CI and safe to run locally
+- **codex-setup.sh** — Adds Webster models alongside OpenAI models in Codex CLI and Codex Desktop through a localhost-only proxy (see below)
+- **test.sh** — Isolated negative tests for the installers, run by CI and safe to run locally
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
@@ -253,6 +254,57 @@ not have. Run it separately after the bootstrap.
 Nerd mode needs a [Nerd Font](https://nerdfonts.com) selected in your terminal;
 without one the status line renders as tofu boxes. Fall back with
 `omp config set symbolPreset unicode && omp config set statusLine.preset full`.
+
+## Codex OpenAI + Webster proxy
+
+`codex-setup.sh` installs a localhost-only Responses API router that keeps the
+OpenAI/ChatGPT login already managed by Codex for OpenAI models and substitutes
+the Webster API key only when a Webster model is selected. Both model families
+then appear in the Codex CLI and Codex Desktop model picker.
+
+First sign in once with `codex login`, then run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
+  | WEBSTER_API_KEY=sk-... bash
+```
+
+The environment prefix belongs on `bash`, to the right of the pipe. The script
+can also prompt for the key through `/dev/tty`, or read it with `--key-file`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
+  | bash -s -- --key-file /path/to/webster-key
+```
+
+| Flag | Effect |
+|---|---|
+| _(none)_ | Install + configure + verify |
+| `--check` | Verify source, secret permissions, endpoint, service, catalog, and Codex config without changing anything |
+| `--key-file PATH` | Read the Webster key from a file's first line |
+
+What it writes:
+
+| Where | What |
+|---|---|
+| `~/.codex/model-proxy/` | Dependency-free proxy runtime and Webster config; the config is mode `0600` |
+| `~/.codex/openai-webster-models.json` | Combined model catalog loaded by Codex at startup (mode `0600`) |
+| `~/.codex/config.toml` | Merge-safe `openai_webster` provider and `model_catalog_json` selection |
+| `~/Library/LaunchAgents/com.thefong.codex-model-proxy.plist` | Always-on user service on macOS |
+| `~/.config/systemd/user/codex-model-proxy.service` | Always-on user service on Linux |
+
+The proxy listens only on `127.0.0.1:4815`. It strips the incoming OpenAI
+credential and ChatGPT account header before Webster requests, never logs
+request bodies or headers, and never writes OpenAI credentials anywhere new.
+The Webster key lives only in the owner-readable proxy config.
+
+The installer preserves the current selected model and unrelated Codex config.
+Re-run it to update the proxy and refresh the OpenAI portion of the catalog.
+After an install or catalog refresh, fully quit and reopen Codex Desktop; its
+model catalog is loaded when the app server starts.
+
+It is not wired into `install.sh`, because it needs both a Webster secret and an
+existing Codex login. Run it separately after the bootstrap.
 
 ## pi
 
