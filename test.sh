@@ -29,6 +29,43 @@ if summary >/dev/null 2>&1; then
   exit 1
 fi
 
+# install_one must trust its final executable assertion over a package-manager
+# exit code. Homebrew can install the requested binary and then return nonzero
+# because a dependency post-install hook warned; that must not poison FAILED.
+mkdir -p "$scratch/install-one-bin"
+(
+  export PATH="$scratch/install-one-bin:$PATH"
+  FAILED=""
+  pm_install() {
+    printf '#!/bin/sh\nexit 0\n' > "$scratch/install-one-bin/setup-eventual-tool"
+    chmod +x "$scratch/install-one-bin/setup-eventual-tool"
+    return 1
+  }
+  install_one setup-eventual-package setup-eventual-tool >/dev/null 2>&1
+  [ -z "$FAILED" ]
+) || {
+  echo "FAIL: install_one recorded a failure despite the requested binary being installed" >&2
+  exit 1
+}
+
+# A package-manager error that does leave the binary absent must still fail and
+# be recorded, so the success case above cannot turn genuine misses green.
+(
+  export PATH="$scratch/install-one-bin:$PATH"
+  FAILED=""
+  pm_install() { return 1; }
+  if install_one setup-still-missing-package setup-still-missing-tool >/dev/null 2>&1; then
+    exit 1
+  fi
+  case " $FAILED " in
+    *" setup-still-missing-package "*) ;;
+    *) exit 1 ;;
+  esac
+) || {
+  echo "FAIL: install_one did not record a package that remained missing" >&2
+  exit 1
+}
+
 # configure_claude must fail on an unparseable settings file and leave it
 # untouched rather than clobbering it.
 mkdir -p "$scratch/home/.claude"

@@ -145,7 +145,11 @@ install_one() {
   local tool="$1" bin="${2:-$1}"
   if have "$bin"; then log "$tool already present"; return; fi
   log "installing $tool"
-  if ! pm_install "$tool"; then warn "failed to install $tool"; record_failure "$tool"; fi
+  # Package managers can return nonzero after installing the requested binary
+  # when an unrelated/post-install hook fails (Homebrew ca-certificates has
+  # done this on Intel CI). Treat the on-disk assertion below as authoritative;
+  # otherwise a healthy tool remains permanently recorded as a failure.
+  if ! pm_install "$tool"; then warn "package manager reported an error while installing $tool"; fi
   assert_installed "$tool" "$bin" "$tool"
 }
 
