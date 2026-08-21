@@ -997,6 +997,38 @@ if [ "$claude_secret_mode" != 600 ]; then
   exit 1
 fi
 
+# The combined Desktop config must support either a private Anthropic API key
+# or a keyless pointer to Claude Code OAuth. The OAuth form must never copy the
+# live access/refresh token into the proxy config.
+claude_api_secret="$scratch/claude-api-key.json"
+WEBSTER_API_KEY=webster-test WEBSTER_BASE_URL=https://webster.example/v1 \
+  ANTHROPIC_CREDENTIAL_MODE=api-key ANTHROPIC_API_KEY='sk-ant-"quoted"' \
+  node claude-code-model-proxy/write-webster-config.mjs "$claude_api_secret"
+if ! ANTHROPIC_API_KEY='sk-ant-"quoted"' node -e '
+    const fs = require("fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (value.anthropic?.mode !== "api-key") process.exit(1);
+    if (value.anthropic?.apiKey !== process.env.ANTHROPIC_API_KEY) process.exit(1);
+  ' "$claude_api_secret"; then
+  echo "FAIL: Claude proxy credential writer corrupted the Anthropic API key mode" >&2
+  exit 1
+fi
+claude_oauth_secret="$scratch/claude-oauth.json"
+WEBSTER_API_KEY=webster-test WEBSTER_BASE_URL=https://webster.example/v1 \
+  ANTHROPIC_CREDENTIAL_MODE=claude-code-oauth \
+  node claude-code-model-proxy/write-webster-config.mjs "$claude_oauth_secret"
+if ! node -e '
+    const fs = require("fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (value.anthropic?.mode !== "claude-code-oauth") process.exit(1);
+    if (value.anthropic?.apiKey !== undefined) process.exit(1);
+    if (JSON.stringify(value).includes("accessToken")) process.exit(1);
+    if (JSON.stringify(value).includes("refreshToken")) process.exit(1);
+  ' "$claude_oauth_secret"; then
+  echo "FAIL: Claude proxy OAuth config persisted a token or invalid mode" >&2
+  exit 1
+fi
+
 # A fresh Claude setup can reuse the key already installed by codex-setup,
 # avoiding a second prompt without ever printing the credential.
 claude_home="$scratch/claude-home"
@@ -1061,6 +1093,30 @@ if ! printf '%s' "$claude_help" | grep -q 'WEBSTER_API_KEY'; then
 fi
 if ! printf '%s' "$claude_help" | grep -q -- '--desktop'; then
   echo "FAIL: claude-code-setup.sh --help omitted the Claude Desktop option" >&2
+  exit 1
+fi
+if ! printf '%s' "$claude_help" | grep -q -- '--anthropic-oauth'; then
+  echo "FAIL: claude-code-setup.sh --help omitted the Anthropic OAuth option" >&2
+  exit 1
+fi
+if (
+  export SETUP_SKIP_MAIN=1 ANTHROPIC_API_KEY=sk-ant-test
+  source ./claude-code-setup.sh
+  parse_args --desktop --anthropic-oauth
+  resolve_anthropic_auth
+) >/dev/null 2>&1; then
+  echo "FAIL: Claude setup accepted both Anthropic API-key and OAuth modes" >&2
+  exit 1
+fi
+if (
+  export SETUP_SKIP_MAIN=1
+  unset ANTHROPIC_API_KEY
+  source ./claude-code-setup.sh
+  ANTHROPIC_OAUTH_REQUESTED=1
+  OS=linux
+  resolve_anthropic_auth
+) >/dev/null 2>&1; then
+  echo "FAIL: Claude setup accepted macOS Keychain OAuth reuse on Linux" >&2
   exit 1
 fi
 

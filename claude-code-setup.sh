@@ -22,10 +22,14 @@
 # Usage:
 #   ./claude-code-setup.sh                   install, configure, and verify
 #   ./claude-code-setup.sh --desktop         also enable Claude Desktop Gateway mode
+#   ./claude-code-setup.sh --desktop --anthropic-oauth
+#                                              merge Claude models using Claude Code login
 #   ./claude-code-setup.sh --check           verify only; change nothing
 #   ./claude-code-setup.sh --key-file PATH   read the Webster key from PATH
+#   ./claude-code-setup.sh --anthropic-key-file PATH
+#                                              read an Anthropic API key from PATH
 #
-# Env: WEBSTER_API_KEY, CLAUDE_CODE_WEBSTER_BASE_URL,
+# Env: WEBSTER_API_KEY, ANTHROPIC_API_KEY, CLAUDE_CODE_WEBSTER_BASE_URL,
 #      CLAUDE_CODE_MODEL_PROXY_PORT, CLAUDE_CODE_SETUP_REF,
 #      CLAUDE_CODE_SETUP_RAW_BASE_URL, CLAUDE_CODE_SETUP_CLAUDE_DIR,
 #      CLAUDE_CODE_SETUP_SOURCE_DIR, CLAUDE_CODE_SETUP_SKIP_ENDPOINT_CHECK,
@@ -55,7 +59,7 @@ CLAUDE_DESKTOP_SUPPORT_DIR="${CLAUDE_DESKTOP_SETUP_SUPPORT_DIR:-$HOME/Library/Ap
 SETUP_REF="${CLAUDE_CODE_SETUP_REF:-main}"
 RAW_BASE_URL="${CLAUDE_CODE_SETUP_RAW_BASE_URL:-https://raw.githubusercontent.com/theFong/setup/$SETUP_REF}"
 LOCAL_SOURCE_DIR="${CLAUDE_CODE_SETUP_SOURCE_DIR:-}"
-SOURCE_FILES="proxy.mjs write-webster-config.mjs write-claude-settings.mjs write-gateway-cache.mjs write-claude-desktop-config.mjs"
+SOURCE_FILES="proxy.mjs claude-code-oauth.mjs write-webster-config.mjs write-claude-settings.mjs write-gateway-cache.mjs write-claude-desktop-config.mjs"
 
 NODE_MIN_MAJOR=20
 CLAUDE_DISCOVERY_MIN_VERSION="2.1.129"
@@ -68,6 +72,10 @@ CHECK_ONLY=0
 DESKTOP=0
 KEY_FILE=""
 API_KEY="${WEBSTER_API_KEY:-}"
+ANTHROPIC_KEY_FILE=""
+ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
+ANTHROPIC_MODE=""
+ANTHROPIC_OAUTH_REQUESTED=0
 INSTALL_CHANGED=0
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -89,14 +97,18 @@ claude-code-setup.sh — add Webster models alongside Claude models in Claude Co
 
 Usage:
   claude-code-setup.sh [--check] [--desktop] [--key-file PATH]
+                       [--anthropic-oauth | --anthropic-key-file PATH]
 
 Options:
   --check, --verify-only  Verify the current setup without changing it.
   --desktop               Also configure Claude Desktop/Cowork in Gateway mode (macOS).
   --key-file PATH         Read the Webster API key from PATH.
+  --anthropic-oauth       Reuse and refresh Claude Code OAuth from macOS Keychain.
+  --anthropic-key-file PATH
+                          Read an Anthropic API key from PATH.
   -h, --help              Show this help.
 
-Env: WEBSTER_API_KEY, CLAUDE_CODE_WEBSTER_BASE_URL,
+Env: WEBSTER_API_KEY, ANTHROPIC_API_KEY, CLAUDE_CODE_WEBSTER_BASE_URL,
      CLAUDE_CODE_MODEL_PROXY_PORT, CLAUDE_CODE_SETUP_REF,
      CLAUDE_CODE_SETUP_RAW_BASE_URL, CLAUDE_CODE_SETUP_CLAUDE_DIR,
      CLAUDE_CODE_SETUP_SOURCE_DIR, CLAUDE_CODE_SETUP_SKIP_ENDPOINT_CHECK,
@@ -110,10 +122,19 @@ parse_args() {
     case "$1" in
       --check|--verify-only) CHECK_ONLY=1 ;;
       --desktop) DESKTOP=1 ;;
+      --anthropic-oauth) ANTHROPIC_OAUTH_REQUESTED=1 ;;
       --key-file)
         shift
         KEY_FILE="${1:-}"
         [ -n "$KEY_FILE" ] || { warn "--key-file needs a path"; return 2; }
+        ;;
+      --anthropic-key-file)
+        shift
+        ANTHROPIC_KEY_FILE="${1:-}"
+        [ -n "$ANTHROPIC_KEY_FILE" ] || {
+          warn "--anthropic-key-file needs a path"
+          return 2
+        }
         ;;
       -h|--help) usage; return 10 ;;
       *) warn "unknown option: $1"; usage >&2; return 2 ;;
@@ -291,6 +312,30 @@ key_from_config() {
   ' "$config"
 }
 
+anthropic_mode_from_config() {
+  local config="$1"
+  [ -f "$config" ] || return 0
+  node -e '
+    const fs = require("fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).anthropic?.mode;
+      if (typeof value === "string") process.stdout.write(value);
+    } catch {}
+  ' "$config"
+}
+
+anthropic_key_from_config() {
+  local config="$1"
+  [ -f "$config" ] || return 0
+  node -e '
+    const fs = require("fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).anthropic?.apiKey;
+      if (typeof value === "string") process.stdout.write(value);
+    } catch {}
+  ' "$config"
+}
+
 resolve_api_key() {
   if [ -n "$KEY_FILE" ]; then
     [ -r "$KEY_FILE" ] || { warn "cannot read key file: $KEY_FILE"; return 1; }
@@ -316,6 +361,95 @@ resolve_api_key() {
     warn "no Webster key; set WEBSTER_API_KEY or use --key-file"
     return 1
   }
+}
+
+assert_claude_code_oauth_credential() {
+  [ "$ANTHROPIC_MODE" = "claude-code-oauth" ] || return 0
+  [ "$OS" = "darwin" ] || {
+    warn "Claude Code OAuth reuse is supported only on macOS"
+    return 1
+  }
+  have security || {
+    warn "macOS security command is required for Claude Code OAuth reuse"
+    return 1
+  }
+  if ! security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null |
+      node -e '
+        let input = "";
+        process.stdin.on("data", (chunk) => input += chunk);
+        process.stdin.on("end", () => {
+          try {
+            const oauth = JSON.parse(input).claudeAiOauth;
+            if (typeof oauth?.accessToken !== "string" || !oauth.accessToken) process.exit(1);
+            if (typeof oauth?.refreshToken !== "string" || !oauth.refreshToken) process.exit(1);
+            if (Number.isFinite(oauth?.refreshTokenExpiresAt) && oauth.refreshTokenExpiresAt <= Date.now()) process.exit(1);
+          } catch {
+            process.exit(1);
+          }
+        });
+      '; then
+    warn "Claude Code OAuth credential is missing or expired; run 'claude auth login'"
+    return 1
+  fi
+  ok "Claude Code OAuth credential is available in macOS Keychain"
+}
+
+resolve_anthropic_auth() {
+  local installed_mode=""
+  if [ "$ANTHROPIC_OAUTH_REQUESTED" = 1 ] && [ -n "$ANTHROPIC_KEY" ]; then
+    warn "--anthropic-oauth and ANTHROPIC_API_KEY are mutually exclusive"
+    return 1
+  fi
+  if [ "$ANTHROPIC_OAUTH_REQUESTED" = 1 ] && [ -n "$ANTHROPIC_KEY_FILE" ]; then
+    warn "--anthropic-oauth and --anthropic-key-file are mutually exclusive"
+    return 1
+  fi
+
+  if [ "$ANTHROPIC_OAUTH_REQUESTED" = 1 ]; then
+    ANTHROPIC_MODE="claude-code-oauth"
+  elif [ -n "$ANTHROPIC_KEY_FILE" ]; then
+    [ -r "$ANTHROPIC_KEY_FILE" ] || {
+      warn "cannot read Anthropic key file: $ANTHROPIC_KEY_FILE"
+      return 1
+    }
+    IFS= read -r ANTHROPIC_KEY < "$ANTHROPIC_KEY_FILE" || true
+    [ -n "$ANTHROPIC_KEY" ] || {
+      warn "Anthropic key file is empty: $ANTHROPIC_KEY_FILE"
+      return 1
+    }
+    ANTHROPIC_MODE="api-key"
+  elif [ -n "$ANTHROPIC_KEY" ]; then
+    ANTHROPIC_MODE="api-key"
+  else
+    installed_mode=$(anthropic_mode_from_config "$WEBSTER_CONFIG")
+    case "$installed_mode" in
+      api-key)
+        ANTHROPIC_KEY=$(anthropic_key_from_config "$WEBSTER_CONFIG")
+        [ -n "$ANTHROPIC_KEY" ] || {
+          warn "installed Anthropic API-key mode has no key"
+          return 1
+        }
+        ANTHROPIC_MODE="api-key"
+        ok "reusing the installed Anthropic API key"
+        ;;
+      claude-code-oauth)
+        ANTHROPIC_MODE="claude-code-oauth"
+        ok "reusing installed Claude Code OAuth mode"
+        ;;
+      "") ANTHROPIC_MODE="none" ;;
+      *)
+        warn "unsupported installed Anthropic credential mode: $installed_mode"
+        return 1
+        ;;
+    esac
+  fi
+
+  case "$ANTHROPIC_MODE" in
+    api-key) ok "Anthropic Desktop routing will use an API key" ;;
+    claude-code-oauth) assert_claude_code_oauth_credential ;;
+    none) ok "Anthropic Desktop routing is not enabled" ;;
+    *) warn "unsupported Anthropic credential mode: $ANTHROPIC_MODE"; return 1 ;;
+  esac
 }
 
 assert_webster_endpoint() {
@@ -400,6 +534,7 @@ assert_proxy_sources() {
 write_webster_config() {
   local next="$WEBSTER_CONFIG.next-$$"
   WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" \
+    ANTHROPIC_CREDENTIAL_MODE="$ANTHROPIC_MODE" ANTHROPIC_API_KEY="$ANTHROPIC_KEY" \
     node "$PROXY_DIR/write-webster-config.mjs" "$next"
   if [ -f "$WEBSTER_CONFIG" ] && cmp -s "$next" "$WEBSTER_CONFIG"; then
     rm -f "$next"
@@ -418,13 +553,22 @@ assert_webster_config() {
     warn "$WEBSTER_CONFIG must have mode 600"
     return 1
   }
-  WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" node -e '
+  WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" \
+    ANTHROPIC_CREDENTIAL_MODE="$ANTHROPIC_MODE" ANTHROPIC_API_KEY="$ANTHROPIC_KEY" node -e '
     const fs = require("fs");
     const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     if (value.apiKey !== process.env.WEBSTER_API_KEY) process.exit(1);
     if (value.baseUrl.replace(/\/+$/, "") !== process.env.WEBSTER_BASE_URL.replace(/\/+$/, "")) process.exit(1);
+    const mode = process.env.ANTHROPIC_CREDENTIAL_MODE;
+    if (mode === "none") {
+      if (value.anthropic !== undefined) process.exit(1);
+    } else {
+      if (value.anthropic?.mode !== mode) process.exit(1);
+      if (mode === "api-key" && value.anthropic?.apiKey !== process.env.ANTHROPIC_API_KEY) process.exit(1);
+      if (mode === "claude-code-oauth" && value.anthropic?.apiKey !== undefined) process.exit(1);
+    }
   ' "$WEBSTER_CONFIG" || { warn "Webster credential config does not match"; return 1; }
-  ok "Webster credential config is valid and private"
+  ok "proxy credential config is valid and private"
 }
 
 xml_escape() {
@@ -583,7 +727,7 @@ assert_gateway_catalog() {
     warn "Claude Code gateway model discovery endpoint is unavailable"
     return 1
   fi
-  if ! node -e '
+  if ! ANTHROPIC_CREDENTIAL_MODE="$ANTHROPIC_MODE" node -e '
       const fs = require("fs");
       const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       const required = new Set([
@@ -597,13 +741,24 @@ assert_gateway_catalog() {
         required.delete(model.id);
       }
       if (required.size) process.exit(1);
+      if (process.env.ANTHROPIC_CREDENTIAL_MODE !== "none") {
+        const official = (body.data ?? []).filter(
+          (model) => model.id?.startsWith("claude-") &&
+            !model.display_name?.endsWith("(Webster)"),
+        );
+        if (official.length === 0) process.exit(1);
+      }
     ' "$response_file"; then
     rm -f "$response_file"
-    warn "Claude Code gateway catalog is missing Webster models"
+    warn "gateway catalog is missing required Webster or Anthropic models"
     return 1
   fi
   rm -f "$response_file"
-  ok "gateway advertises all Claude Desktop-compatible Webster models"
+  if [ "$ANTHROPIC_MODE" = "none" ]; then
+    ok "gateway advertises all Claude Desktop-compatible Webster models"
+  else
+    ok "gateway advertises Webster and Anthropic models together"
+  fi
 }
 
 write_gateway_cache() {
@@ -766,6 +921,7 @@ verify_all() {
   assert_proxy_sources   || record_failure proxy-source
   assert_webster_config  || record_failure webster-config
   assert_webster_endpoint || record_failure webster-endpoint
+  assert_claude_code_oauth_credential || record_failure anthropic-oauth
   assert_service         || record_failure proxy-service
   assert_gateway_catalog || record_failure model-catalog
   assert_gateway_cache   || record_failure model-cache
@@ -784,14 +940,22 @@ summary() {
     return 1
   fi
   if [ "$DESKTOP" = 1 ]; then
-    log "Claude Code + Claude Desktop + Webster setup is healthy"
+    if [ "$ANTHROPIC_MODE" = "none" ]; then
+      log "Claude Code + Claude Desktop + Webster setup is healthy"
+    else
+      log "Claude Code + Claude Desktop mixed Anthropic/Webster setup is healthy"
+    fi
   else
     log "Claude Code + Webster setup is healthy"
   fi
   printf '\nStart a new Claude Code process, run /model, and choose a Webster or Claude model.\n'
   printf 'Direct launch example: claude --model claude-webster-glm-5-2\n'
   if [ "$DESKTOP" = 1 ]; then
-    printf 'Claude Desktop is now using the separate Webster Gateway/3P profile.\n'
+    if [ "$ANTHROPIC_MODE" = "none" ]; then
+      printf 'Claude Desktop is using the Webster-only Gateway/3P profile.\n'
+    else
+      printf 'Claude Desktop now shows Anthropic and Webster models in one Gateway picker.\n'
+    fi
   fi
   printf 'Re-run this installer to update the proxy; use --check for a read-only health check.\n'
 }
@@ -809,6 +973,7 @@ main() {
   assert_claude_login || { record_failure claude-login; summary || true; return 1; }
   assert_claude_desktop_supported || { record_failure claude-desktop; summary || true; return 1; }
   resolve_api_key || { record_failure webster-key; summary || true; return 1; }
+  resolve_anthropic_auth || { record_failure anthropic-auth; summary || true; return 1; }
 
   if [ "$CHECK_ONLY" = 1 ]; then
     verify_all

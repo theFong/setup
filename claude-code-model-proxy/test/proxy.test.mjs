@@ -19,8 +19,10 @@ import {
   chatToAnthropicResponse,
   createClaudeCodeModelProxy,
   DEFAULT_WEBSTER_MODELS,
+  loadProxyConfig,
   loadWebsterProvider,
 } from "../proxy.mjs";
+import { createClaudeCodeOAuthProvider } from "../claude-code-oauth.mjs";
 import { writeClaudeDesktopConfig } from "../write-claude-desktop-config.mjs";
 
 const testDirectory = dirname(fileURLToPath(import.meta.url));
@@ -96,12 +98,49 @@ function chatStream(response) {
   response.end("data: [DONE]\n\n");
 }
 
-async function fixture(t) {
+async function fixture(
+  t,
+  { anthropicCredential, anthropicCredentialProvider, rejectOAuthOnce = false } = {},
+) {
   const seen = { anthropic: [], webster: [] };
+  let oauthRejected = false;
   const anthropicServer = createServer(async (request, response) => {
     const body = await readBody(request);
     seen.anthropic.push({ body, headers: request.headers, method: request.method, url: request.url });
+    if (
+      rejectOAuthOnce &&
+      !oauthRejected &&
+      request.method === "POST" &&
+      request.headers.authorization === "Bearer oauth-stale"
+    ) {
+      oauthRejected = true;
+      response.writeHead(401, { "content-type": "application/json" });
+      response.end(JSON.stringify({ type: "error", error: { type: "authentication_error" } }));
+      return;
+    }
     response.writeHead(200, { "content-type": "application/json" });
+    if (request.method === "GET" && request.url?.startsWith("/v1/models")) {
+      response.end(
+        JSON.stringify({
+          data: [
+            {
+              id: "claude-opus-test",
+              type: "model",
+              display_name: "Claude Opus Test",
+              created_at: "2026-08-21T00:00:00Z",
+            },
+            {
+              id: "claude-sonnet-test",
+              type: "model",
+              display_name: "Claude Sonnet Test",
+              created_at: "2026-08-21T00:00:00Z",
+            },
+          ],
+          has_more: false,
+        }),
+      );
+      return;
+    }
     response.end(
       JSON.stringify({
         id: "msg_anthropic",
@@ -146,6 +185,8 @@ async function fixture(t) {
   ]);
   const proxy = createClaudeCodeModelProxy({
     anthropicBaseUrl,
+    anthropicCredential,
+    anthropicCredentialProvider,
     port: 0,
     websterApiKey: "webster-secret",
     websterBaseUrl: `${websterRootUrl}/v1`,
@@ -171,6 +212,35 @@ test("loads the installer-owned Webster config format", (t) => {
   assert.deepEqual(loadWebsterProvider(configPath), {
     baseUrl: "https://webster.example/v1",
     apiKey: "secret",
+  });
+});
+
+test("loads API-key and Claude Code OAuth Anthropic config modes", (t) => {
+  const directory = mkdtempSync(resolve(tmpdir(), "claude-code-model-proxy-auth-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const configPath = resolve(directory, "webster.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      baseUrl: "https://webster.example/v1",
+      apiKey: "webster-secret",
+      anthropic: { mode: "api-key", apiKey: "anthropic-secret" },
+    }),
+  );
+  assert.deepEqual(loadProxyConfig(configPath).anthropic, {
+    mode: "api-key",
+    apiKey: "anthropic-secret",
+  });
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      baseUrl: "https://webster.example/v1",
+      apiKey: "webster-secret",
+      anthropic: { mode: "claude-code-oauth" },
+    }),
+  );
+  assert.deepEqual(loadProxyConfig(configPath).anthropic, {
+    mode: "claude-code-oauth",
   });
 });
 
@@ -260,6 +330,174 @@ test("discovers all Webster models without replacing Claude's built-ins", async 
   );
 });
 
+test("merges Anthropic models and injects a configured API key for Desktop", async (t) => {
+  const { proxyBaseUrl, seen } = await fixture(t, {
+    anthropicCredential: { mode: "api-key", apiKey: "anthropic-secret" },
+  });
+  const catalogResponse = await fetch(`${proxyBaseUrl}/v1/models`);
+  assert.equal(catalogResponse.status, 200);
+  const catalog = await catalogResponse.json();
+  assert.deepEqual(catalog.data.slice(0, 2).map((model) => model.id), [
+    "claude-opus-test",
+    "claude-sonnet-test",
+  ]);
+  assert.deepEqual(
+    catalog.data.slice(2).map((model) => model.id),
+    DEFAULT_WEBSTER_MODELS.map((model) => model.desktopId),
+  );
+  assert.equal(seen.anthropic[0].headers["x-api-key"], "anthropic-secret");
+  assert.equal(seen.anthropic[0].headers.authorization, undefined);
+
+  const response = await fetch(`${proxyBaseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer claude-desktop-local",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-test",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const messageRequest = seen.anthropic.at(-1);
+  assert.equal(messageRequest.headers["x-api-key"], "anthropic-secret");
+  assert.equal(messageRequest.headers.authorization, undefined);
+  assert.equal(messageRequest.headers["anthropic-version"], "2023-06-01");
+});
+
+test("merges Anthropic models and injects Claude Code OAuth only for Desktop", async (t) => {
+  const credentialRequests = [];
+  const { proxyBaseUrl, seen } = await fixture(t, {
+    anthropicCredentialProvider: {
+      async getCredential(options) {
+        credentialRequests.push(options);
+        return { kind: "oauth", secret: "oauth-secret", expiresAt: Date.now() + 60_000 };
+      },
+    },
+  });
+  const catalogResponse = await fetch(`${proxyBaseUrl}/v1/models`);
+  assert.equal(catalogResponse.status, 200);
+  const catalog = await catalogResponse.json();
+  assert.ok(catalog.data.some((model) => model.id === "claude-opus-test"));
+  assert.ok(catalog.data.some((model) => model.display_name.endsWith("(Webster)")));
+  assert.equal(seen.anthropic[0].headers.authorization, "Bearer oauth-secret");
+  assert.equal(seen.anthropic[0].headers["anthropic-beta"], "oauth-2025-04-20");
+
+  const response = await fetch(`${proxyBaseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer claude-desktop-local",
+      "anthropic-beta": "files-api-2025-04-14",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-opus-test",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const messageRequest = seen.anthropic.at(-1);
+  assert.equal(messageRequest.headers.authorization, "Bearer oauth-secret");
+  assert.equal(messageRequest.headers["x-api-key"], undefined);
+  assert.equal(
+    messageRequest.headers["anthropic-beta"],
+    "files-api-2025-04-14,oauth-2025-04-20",
+  );
+  assert.ok(credentialRequests.every((request) => request.forceRefresh === false));
+});
+
+test("refreshes injected OAuth once when Anthropic rejects it", async (t) => {
+  const credentialRequests = [];
+  const { proxyBaseUrl, seen } = await fixture(t, {
+    rejectOAuthOnce: true,
+    anthropicCredentialProvider: {
+      async getCredential({ forceRefresh }) {
+        credentialRequests.push(forceRefresh);
+        return {
+          kind: "oauth",
+          secret: forceRefresh ? "oauth-fresh" : "oauth-stale",
+          expiresAt: Date.now() + 60_000,
+        };
+      },
+    },
+  });
+  const response = await fetch(`${proxyBaseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer claude-desktop-local",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-test",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(credentialRequests, [false, true]);
+  assert.deepEqual(
+    seen.anthropic.map((request) => request.headers.authorization),
+    ["Bearer oauth-stale", "Bearer oauth-fresh"],
+  );
+});
+
+test("refreshes and persists a rotated Claude Code OAuth credential", async () => {
+  const clock = 1_000_000;
+  let stored = {
+    claudeAiOauth: {
+      accessToken: "expired-access",
+      refreshToken: "old-refresh",
+      expiresAt: clock - 1,
+      refreshTokenExpiresAt: clock + 86_400_000,
+      scopes: ["user:inference"],
+    },
+    mcpOAuth: { keep: true },
+  };
+  let refreshCalls = 0;
+  let writes = 0;
+  const provider = createClaudeCodeOAuthProvider({
+    now: () => clock,
+    readCredential: async () => structuredClone(stored),
+    writeCredential: async (next) => {
+      writes += 1;
+      stored = structuredClone(next);
+    },
+    fetchImpl: async (url, options) => {
+      refreshCalls += 1;
+      assert.equal(url, "https://platform.claude.com/v1/oauth/token");
+      assert.equal(options.method, "POST");
+      assert.equal(options.body.get("grant_type"), "refresh_token");
+      assert.equal(options.body.get("refresh_token"), "old-refresh");
+      assert.equal(options.body.get("client_id"), "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
+      return new Response(
+        JSON.stringify({
+          access_token: "fresh-access",
+          refresh_token: "new-refresh",
+          expires_in: 28_800,
+          refresh_token_expires_in: 2_592_000,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+  });
+
+  const [first, second] = await Promise.all([
+    provider.getCredential(),
+    provider.getCredential(),
+  ]);
+  assert.equal(first.secret, "fresh-access");
+  assert.equal(second.secret, "fresh-access");
+  assert.equal(refreshCalls, 1);
+  assert.equal(writes, 1);
+  assert.equal(stored.claudeAiOauth.refreshToken, "new-refresh");
+  assert.equal(stored.claudeAiOauth.expiresAt, clock + 28_800_000);
+  assert.equal(stored.claudeAiOauth.refreshTokenExpiresAt, clock + 2_592_000_000);
+  assert.deepEqual(stored.mcpOAuth, { keep: true });
+});
+
 test("still requires a Claude credential for inference", async (t) => {
   const { proxyBaseUrl, seen } = await fixture(t);
   const response = await fetch(`${proxyBaseUrl}/v1/messages`, {
@@ -276,6 +514,25 @@ test("still requires a Claude credential for inference", async (t) => {
   assert.equal((await response.json()).error.type, "authentication_error");
   assert.equal(seen.anthropic.length, 0);
   assert.equal(seen.webster.length, 0);
+});
+
+test("does not leak the Desktop sentinel to Anthropic without configured auth", async (t) => {
+  const { proxyBaseUrl, seen } = await fixture(t);
+  const response = await fetch(`${proxyBaseUrl}/v1/messages`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer claude-desktop-local",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-test",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+  assert.equal(response.status, 401);
+  assert.match((await response.json()).error.message, /not configured/);
+  assert.equal(seen.anthropic.length, 0);
 });
 
 test("passes normal Claude models and credentials through unchanged", async (t) => {
