@@ -260,7 +260,9 @@ without one the status line renders as tofu boxes. Fall back with
 `codex-setup.sh` installs a localhost-only Responses API router that keeps the
 OpenAI/ChatGPT login already managed by Codex for OpenAI models and substitutes
 the Webster API key only when a Webster model is selected. Both model families
-then appear in the Codex CLI and Codex Desktop model picker.
+then appear in the Codex CLI and Codex Desktop model picker. Setup queries
+Webster's `/v1/models` endpoint with the supplied key, so each user sees only
+the models that key can access; no Webster model IDs are hardcoded.
 
 First sign in once with `codex login`, then run:
 
@@ -287,7 +289,7 @@ What it writes:
 
 | Where | What |
 |---|---|
-| `~/.codex/model-proxy/` | Dependency-free proxy runtime and Webster config; the config is mode `0600` |
+| `~/.codex/model-proxy/` | Dependency-free proxy runtime and Webster key plus its discovered model list; the config is mode `0600` |
 | `~/.codex/openai-webster-models.json` | Combined model catalog loaded by Codex at startup (mode `0600`) |
 | `~/.codex/config.toml` | Merge-safe `openai_webster` provider and `model_catalog_json` selection |
 | `~/Library/LaunchAgents/com.thefong.codex-model-proxy.plist` | Always-on user service on macOS |
@@ -299,7 +301,11 @@ request bodies or headers, and never writes OpenAI credentials anywhere new.
 The Webster key lives only in the owner-readable proxy config.
 
 The installer preserves the current selected model and unrelated Codex config.
-Re-run it to update the proxy and refresh the OpenAI portion of the catalog.
+Re-run it to update the proxy and rediscover both the key's Webster access and
+the OpenAI portion of the catalog. Setup fails instead of installing an empty
+catalog when the key cannot access any models. Generated Webster entries clone
+the complete stock Codex catalog shape so strict Codex Desktop versions can
+deserialize every entry.
 After an install or catalog refresh, fully quit and reopen Codex Desktop; its
 model catalog is loaded when the app server starts.
 

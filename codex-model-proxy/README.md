@@ -5,7 +5,11 @@ OpenAI/ChatGPT models and the Brev-hosted Webster models from one provider.
 
 Install and configure it from the repository root with `codex-setup.sh`. The
 source files in this directory are downloaded to `~/.codex/model-proxy` by the
-installer; there are no npm dependencies.
+installer; there are no npm dependencies. During each install, the setup script
+queries Webster's authenticated `/v1/models` endpoint and stores the returned
+model metadata. Routing and Codex catalog generation use that discovered list,
+so keys with different access receive different pickers and future models are
+picked up on the next re-run.
 
 ## Security
 
