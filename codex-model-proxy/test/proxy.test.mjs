@@ -6,6 +6,23 @@ import { resolve } from "node:path";
 import test from "node:test";
 
 import { createCodexModelProxy, loadWebsterProvider } from "../proxy.mjs";
+import { discoverWebsterModels, normalizeWebsterModels } from "../write-webster-config.mjs";
+
+const TEST_WEBSTER_MODELS = Object.freeze([
+  {
+    id: "future-model-7b",
+    displayName: "Future Model 7B (Webster)",
+    description: "Future Model 7B served by Webster.",
+    contextWindow: 98_304,
+    maxOutputTokens: 16_384,
+  },
+  {
+    id: "key-scoped-model",
+    displayName: "Key Scoped Model (Webster)",
+    description: "A model available to this test key.",
+    contextWindow: 131_072,
+  },
+]);
 
 function listen(server) {
   return new Promise((resolveListen, reject) => {
@@ -51,11 +68,14 @@ function catalogModel() {
     apply_patch_tool_type: "freeform",
     truncation_policy: { mode: "tokens", limit: 10_000 },
     supports_parallel_tool_calls: true,
+    supports_reasoning_summaries: true,
+    minimal_client_version: "0.100.0",
+    available_in_plans: ["plus"],
     experimental_supported_tools: [],
   };
 }
 
-async function fixture(t) {
+async function fixture(t, { websterModels = TEST_WEBSTER_MODELS } = {}) {
   const seen = { chatGpt: [], openAi: [], webster: [] };
 
   const upstream = (bucket, models = false) =>
@@ -86,6 +106,7 @@ async function fixture(t) {
     port: 0,
     websterApiKey: "webster-secret",
     websterBaseUrl,
+    websterModels,
   });
   const address = await proxy.start();
   const proxyBaseUrl = `http://127.0.0.1:${address.port}/v1`;
@@ -103,13 +124,68 @@ test("loads the installer-owned Webster config format", (t) => {
   const configPath = resolve(directory, "webster.json");
   writeFileSync(
     configPath,
-    JSON.stringify({ baseUrl: "https://webster.example/v1/", apiKey: "secret" }),
+    JSON.stringify({
+      baseUrl: "https://webster.example/v1/",
+      apiKey: "secret",
+      models: TEST_WEBSTER_MODELS,
+    }),
   );
 
   assert.deepEqual(loadWebsterProvider(configPath), {
     baseUrl: "https://webster.example/v1",
     apiKey: "secret",
+    models: TEST_WEBSTER_MODELS,
   });
+});
+
+test("rejects legacy Webster config without discovered models", (t) => {
+  const directory = mkdtempSync(resolve(tmpdir(), "codex-model-proxy-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const configPath = resolve(directory, "webster.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({ baseUrl: "https://webster.example/v1", apiKey: "secret" }),
+  );
+
+  assert.throws(() => loadWebsterProvider(configPath), /no discovered models/);
+});
+
+test("discovers and normalizes only the models advertised for the supplied key", async (t) => {
+  const discoveryServer = createServer((request, response) => {
+    assert.equal(request.url, "/v1/models");
+    assert.equal(request.headers.authorization, "Bearer scoped-secret");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        data: [
+          {
+            id: "new-model-h300",
+            max_input_tokens: 222_000,
+            max_output_tokens: 12_000,
+          },
+        ],
+      }),
+    );
+  });
+  const baseUrl = await listen(discoveryServer);
+  t.after(() => close(discoveryServer));
+
+  assert.deepEqual(
+    await discoverWebsterModels({ apiKey: "scoped-secret", baseUrl }),
+    [
+      {
+        id: "new-model-h300",
+        displayName: "New Model H300 (Webster)",
+        description: "New Model H300 served by the Brev Webster endpoint.",
+        contextWindow: 222_000,
+        maxOutputTokens: 12_000,
+      },
+    ],
+  );
+});
+
+test("rejects a successful discovery response with no accessible models", () => {
+  assert.throws(() => normalizeWebsterModels({ data: [] }), /did not advertise any/);
 });
 
 test("routes Webster models and replaces the incoming credential", async (t) => {
@@ -121,7 +197,7 @@ test("routes Webster models and replaces the incoming credential", async (t) => 
       "chatgpt-account-id": "account-123",
       "content-type": "application/json",
     },
-    body: JSON.stringify({ model: "glm-5.2", input: "hello", stream: true }),
+    body: JSON.stringify({ model: "future-model-7b", input: "hello", stream: true }),
   });
 
   assert.equal(response.status, 200);
@@ -181,17 +257,15 @@ test("merges Webster models into the Codex model catalog", async (t) => {
   const body = await response.json();
   assert.deepEqual(
     body.models.map((model) => model.slug),
-    [
-      "gpt-test",
-      "glm-5.2",
-      "deepseek-v4-flash",
-      "glm-5.2-h200",
-      "deepseek-v4-flash-h100",
-    ],
+    ["gpt-test", "future-model-7b", "key-scoped-model"],
   );
-  assert.equal(body.models[1].context_window, 320_000);
+  assert.equal(body.models[1].context_window, 98_304);
   assert.equal(body.models[1].visibility, "list");
   assert.equal(body.models[1].model_messages.instructions_template, "Test instructions");
+  assert.equal(body.models[1].supports_reasoning_summaries, true);
+  for (const key of Object.keys(catalogModel())) {
+    assert.equal(Object.hasOwn(body.models[1], key), true, `missing cloned catalog field ${key}`);
+  }
   assert.equal(seen.chatGpt[0].url, "/v1/models?client_version=0.148.0");
 });
 
@@ -200,7 +274,7 @@ test("rejects unauthenticated and unsupported requests", async (t) => {
   const missingAuth = await fetch(`${proxyBaseUrl}/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "glm-5.2", input: "hello" }),
+    body: JSON.stringify({ model: "future-model-7b", input: "hello" }),
   });
   const unsupported = await fetch(`${proxyBaseUrl}/chat/completions`, {
     method: "POST",

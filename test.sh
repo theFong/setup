@@ -922,24 +922,42 @@ if [ "$(cat "$codex_home/.codex/config.toml")" != "$codex_first_pass" ]; then
 fi
 
 # The credential writer must JSON-escape arbitrary key text and leave the
-# result owner-only. A hand-written printf-based JSON writer tends to fail one
-# or both of these checks.
+# result owner-only. It must also persist only the models returned by discovery.
+# A hand-written printf-based JSON writer tends to fail one or both checks.
 codex_secret="$scratch/webster.json"
+codex_models="$scratch/codex-models.json"
+printf '%s\n' \
+  '{"data":[{"id":"available-to-this-key","max_input_tokens":123456,"max_output_tokens":8192}]}' \
+  > "$codex_models"
 WEBSTER_API_KEY='sk-test-"quoted"' WEBSTER_BASE_URL='https://webster.example/v1/' \
+  WEBSTER_MODELS_FILE="$codex_models" \
   node codex-model-proxy/write-webster-config.mjs "$codex_secret"
 if ! WEBSTER_API_KEY='sk-test-"quoted"' node -e '
     const fs = require("fs");
     const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     if (value.apiKey !== process.env.WEBSTER_API_KEY) process.exit(1);
     if (value.baseUrl !== "https://webster.example/v1") process.exit(1);
+    if (value.models.length !== 1 || value.models[0].id !== "available-to-this-key") process.exit(1);
+    if (value.models[0].contextWindow !== 123456 || value.models[0].maxOutputTokens !== 8192) process.exit(1);
   ' "$codex_secret"; then
-  echo "FAIL: Codex Webster credential writer corrupted its values" >&2
+  echo "FAIL: Codex Webster credential writer corrupted its values or discovery" >&2
   exit 1
 fi
 codex_secret_mode=$(stat -c '%a' "$codex_secret" 2>/dev/null \
   || stat -f '%Lp' "$codex_secret" 2>/dev/null || true)
 if [ "$codex_secret_mode" != 600 ]; then
   echo "FAIL: Codex Webster credential is not mode 600 (got '$codex_secret_mode')" >&2
+  exit 1
+fi
+
+# A valid endpoint response that advertises no models for this key must fail;
+# otherwise setup would install a healthy-looking but unusable empty picker.
+printf '{"data":[]}\n' > "$scratch/codex-no-models.json"
+if WEBSTER_API_KEY='sk-test' WEBSTER_BASE_URL='https://webster.example/v1' \
+  WEBSTER_MODELS_FILE="$scratch/codex-no-models.json" \
+  node codex-model-proxy/write-webster-config.mjs "$scratch/empty-webster.json" \
+  >/dev/null 2>&1; then
+  echo "FAIL: Codex Webster discovery accepted a key with no accessible models" >&2
   exit 1
 fi
 

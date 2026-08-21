@@ -9,7 +9,8 @@
 #
 # The installer:
 #   * installs the dependency-free Node.js proxy under ~/.codex/model-proxy
-#   * stores the Webster key in ~/.codex/model-proxy/webster.json (mode 0600)
+#   * discovers the models accessible to the supplied Webster key
+#   * stores the key and discovered models in ~/.codex/model-proxy/webster.json (mode 0600)
 #   * installs a user LaunchAgent (macOS) or systemd user service (Linux)
 #   * builds a combined OpenAI + Webster model catalog from the existing Codex login
 #   * merge-safely configures ~/.codex/config.toml for CLI and Desktop
@@ -246,26 +247,12 @@ assert_webster_endpoint() {
     ok "skipping Webster endpoint check (CODEX_SETUP_SKIP_ENDPOINT_CHECK=1)"
     return 0
   fi
-  local response_file
-  response_file=$(mktemp)
-  if ! curl -fsS --max-time 20 -H "Authorization: Bearer $API_KEY" \
-      "$WEBSTER_BASE_URL/models" -o "$response_file"; then
-    rm -f "$response_file"
-    warn "Webster endpoint rejected the key or could not be reached"
-    return 1
-  fi
-  if ! node -e '
-      const fs = require("fs");
-      const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      const models = body.data ?? body.models ?? [];
-      if (!models.some((model) => (model.id ?? model.slug) === "glm-5.2")) process.exit(1);
-    ' "$response_file"; then
-    rm -f "$response_file"
-    warn "Webster endpoint does not advertise glm-5.2"
-    return 1
-  fi
-  rm -f "$response_file"
-  ok "Webster endpoint accepts the key and serves glm-5.2"
+  WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" \
+    node "$PROXY_DIR/write-webster-config.mjs" --check "$WEBSTER_CONFIG" || {
+      warn "Webster access changed or the endpoint rejected the key; re-run setup to refresh"
+      return 1
+    }
+  ok "Webster endpoint access matches the installed model list"
 }
 
 install_one_source() {
@@ -321,8 +308,16 @@ assert_proxy_sources() {
 }
 
 write_webster_config() {
-  local next="$WEBSTER_CONFIG.next-$$"
+  local next="$WEBSTER_CONFIG.next-$$" models_file=""
+  if [ "${CODEX_SETUP_SKIP_ENDPOINT_CHECK:-0}" = 1 ]; then
+    [ -f "$WEBSTER_CONFIG" ] || {
+      warn "cannot skip model discovery on a fresh install"
+      return 1
+    }
+    models_file="$WEBSTER_CONFIG"
+  fi
   WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" \
+  WEBSTER_MODELS_FILE="$models_file" \
     node "$PROXY_DIR/write-webster-config.mjs" "$next"
   if [ -f "$WEBSTER_CONFIG" ] && cmp -s "$next" "$WEBSTER_CONFIG"; then
     rm -f "$next"
@@ -346,8 +341,16 @@ assert_webster_config() {
     const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     if (value.apiKey !== process.env.WEBSTER_API_KEY) process.exit(1);
     if (value.baseUrl.replace(/\/+$/, "") !== process.env.WEBSTER_BASE_URL.replace(/\/+$/, "")) process.exit(1);
+    if (!Array.isArray(value.models) || value.models.length === 0) process.exit(1);
+    const ids = new Set();
+    for (const model of value.models) {
+      if (!model || typeof model.id !== "string" || model.id.length === 0 || ids.has(model.id)) process.exit(1);
+      if (typeof model.displayName !== "string" || typeof model.description !== "string") process.exit(1);
+      if (model.contextWindow !== undefined && (!Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0)) process.exit(1);
+      ids.add(model.id);
+    }
   ' "$WEBSTER_CONFIG" || { warn "Webster credential config does not match"; return 1; }
-  ok "Webster credential config is valid and private"
+  ok "Webster credential and discovered model config is valid and private"
 }
 
 xml_escape() {
@@ -536,15 +539,21 @@ assert_catalog() {
   node -e '
     const fs = require("fs");
     const catalog = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const required = new Set(["glm-5.2", "deepseek-v4-flash", "glm-5.2-h200", "deepseek-v4-flash-h100"]);
+    const config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+    const required = new Set(config.models.map((model) => model.id));
     const models = Array.isArray(catalog.models) ? catalog.models : [];
-    for (const model of models) required.delete(model.slug);
-    if (required.size || !models.some((model) => !model.slug.includes("glm-5.2") && !model.slug.includes("deepseek-v4-flash"))) process.exit(1);
-  ' "$CATALOG_FILE" || {
+    for (const model of models) {
+      if (!required.has(model.slug)) continue;
+      if (model.visibility !== "list" || typeof model.supports_reasoning_summaries !== "boolean") process.exit(1);
+      required.delete(model.slug);
+    }
+    const websterIds = new Set(config.models.map((model) => model.id));
+    if (required.size || !models.some((model) => !websterIds.has(model.slug))) process.exit(1);
+  ' "$CATALOG_FILE" "$WEBSTER_CONFIG" || {
     warn "combined catalog is invalid or missing OpenAI/Webster models"
     return 1
   }
-  ok "combined OpenAI + Webster catalog is valid"
+  ok "combined catalog has OpenAI and every discovered Webster model"
 }
 
 toml_escape() {
@@ -681,11 +690,11 @@ main() {
     return
   fi
 
-  assert_webster_endpoint || { record_failure webster-endpoint; summary || true; return 1; }
   install_proxy_sources || { record_failure proxy-source; summary || true; return 1; }
   assert_proxy_sources || { record_failure proxy-source; summary || true; return 1; }
   write_webster_config || { record_failure webster-config; summary || true; return 1; }
   assert_webster_config || { record_failure webster-config; summary || true; return 1; }
+  assert_webster_endpoint || { record_failure webster-endpoint; summary || true; return 1; }
   install_service || { record_failure proxy-service; summary || true; return 1; }
   assert_service || { record_failure proxy-service; summary || true; return 1; }
   generate_catalog || { record_failure model-catalog; summary || true; return 1; }

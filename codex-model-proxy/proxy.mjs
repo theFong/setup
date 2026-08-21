@@ -37,33 +37,6 @@ const RESPONSE_HEADERS_TO_DROP = new Set([
   "transfer-encoding",
 ]);
 
-export const DEFAULT_WEBSTER_MODELS = Object.freeze([
-  {
-    id: "glm-5.2",
-    displayName: "GLM 5.2 (Webster)",
-    description: "GLM 5.2 served by the Brev Webster endpoint.",
-    contextWindow: 320_000,
-  },
-  {
-    id: "deepseek-v4-flash",
-    displayName: "DeepSeek V4 Flash (Webster)",
-    description: "DeepSeek V4 Flash served by the Brev Webster endpoint.",
-    contextWindow: 600_000,
-  },
-  {
-    id: "glm-5.2-h200",
-    displayName: "GLM 5.2 H200 (Webster)",
-    description: "GLM 5.2 on H200 served by the Brev Webster endpoint.",
-    contextWindow: 131_072,
-  },
-  {
-    id: "deepseek-v4-flash-h100",
-    displayName: "DeepSeek V4 Flash H100 (Webster)",
-    description: "DeepSeek V4 Flash on H100 served by the Brev Webster endpoint.",
-    contextWindow: 262_144,
-  },
-]);
-
 function normalizeBaseUrl(value) {
   return value.replace(/\/+$/, "");
 }
@@ -86,11 +59,28 @@ export function loadWebsterProvider(configPath = DEFAULT_WEBSTER_CONFIG) {
   }
 
   const provider = config?.providers?.webster ?? config;
+  if (!Array.isArray(provider?.models) || provider.models.length === 0) {
+    throw new Error(
+      `Webster config at ${configPath} has no discovered models; re-run codex-setup.sh`,
+    );
+  }
   return {
     baseUrl: normalizeBaseUrl(
       requireNonEmptyString(provider?.baseUrl, "Webster config baseUrl"),
     ),
     apiKey: requireNonEmptyString(provider?.apiKey, "Webster config apiKey"),
+    models: provider.models.map((model, index) => ({
+      ...model,
+      id: requireNonEmptyString(model?.id, `Webster config models[${index}].id`),
+      displayName: requireNonEmptyString(
+        model?.displayName,
+        `Webster config models[${index}].displayName`,
+      ),
+      description: requireNonEmptyString(
+        model?.description,
+        `Webster config models[${index}].description`,
+      ),
+    })),
   };
 }
 
@@ -221,6 +211,7 @@ function modelTemplate(catalog) {
 
 function websterCatalogEntry(definition, template, priority) {
   const entry = structuredClone(template);
+  const contextWindow = definition.contextWindow ?? template.context_window;
   Object.assign(entry, {
     slug: definition.id,
     display_name: definition.displayName,
@@ -243,6 +234,10 @@ function websterCatalogEntry(definition, template, priority) {
     include_skills_usage_instructions: false,
     include_plugin_usage_instructions: false,
     include_apps_usage_instructions: false,
+    supports_reasoning_summaries:
+      typeof template.supports_reasoning_summaries === "boolean"
+        ? template.supports_reasoning_summaries
+        : false,
     supports_reasoning_summary_parameter: true,
     default_reasoning_summary: "auto",
     support_verbosity: false,
@@ -252,8 +247,8 @@ function websterCatalogEntry(definition, template, priority) {
     truncation_policy: { mode: "bytes", limit: 10_000 },
     supports_parallel_tool_calls: false,
     supports_image_detail_original: false,
-    context_window: definition.contextWindow,
-    max_context_window: definition.contextWindow,
+    context_window: contextWindow,
+    max_context_window: contextWindow,
     auto_compact_token_limit: null,
     comp_hash: null,
     effective_context_window_percent: 95,
@@ -265,19 +260,17 @@ function websterCatalogEntry(definition, template, priority) {
     model_specialty: null,
     tool_mode: null,
     multi_agent_version: null,
+    prefer_websockets: false,
   });
-
-  delete entry.prefer_websockets;
-  delete entry.minimal_client_version;
-  delete entry.available_in_plans;
-  delete entry.reasoning_summary_format;
-  delete entry.supports_reasoning_summaries;
   return entry;
 }
 
-export function mergeWebsterModels(catalog, definitions = DEFAULT_WEBSTER_MODELS) {
+export function mergeWebsterModels(catalog, definitions) {
   if (!catalog || !Array.isArray(catalog.models) || catalog.models.length === 0) {
     throw new Error("OpenAI model catalog did not contain a non-empty models array");
+  }
+  if (!Array.isArray(definitions) || definitions.length === 0) {
+    throw new Error("Webster config did not contain any discovered models");
   }
 
   const template = modelTemplate(catalog);
@@ -388,10 +381,13 @@ export function createCodexModelProxy({
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   websterApiKey,
   websterBaseUrl,
-  websterModels = DEFAULT_WEBSTER_MODELS,
+  websterModels,
 }) {
   requireNonEmptyString(websterApiKey, "websterApiKey");
   requireNonEmptyString(websterBaseUrl, "websterBaseUrl");
+  if (!Array.isArray(websterModels) || websterModels.length === 0) {
+    throw new Error("websterModels must contain at least one discovered model");
+  }
   const options = {
     bodyLimitBytes,
     chatGptBaseUrl: normalizeBaseUrl(chatGptBaseUrl),
@@ -485,6 +481,7 @@ export async function main() {
     timeoutMs: integerFromEnv("CODEX_MODEL_PROXY_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS),
     websterApiKey: process.env.WEBSTER_API_KEY ?? configProvider.apiKey,
     websterBaseUrl: process.env.WEBSTER_BASE_URL ?? configProvider.baseUrl,
+    websterModels: configProvider.models,
   });
   const address = await proxy.start();
   process.stdout.write(
