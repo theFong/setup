@@ -9,6 +9,8 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 
+import { createClaudeCodeOAuthProvider } from "./claude-code-oauth.mjs";
+
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4816;
 const DEFAULT_CLAUDE_DIR = resolve(homedir(), ".claude");
@@ -16,6 +18,8 @@ const DEFAULT_WEBSTER_CONFIG = resolve(DEFAULT_CLAUDE_DIR, "model-proxy/webster.
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+const CLAUDE_DESKTOP_LOCAL_TOKEN = "claude-desktop-local";
+const CLAUDE_CODE_OAUTH_BETA = "oauth-2025-04-20";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -41,24 +45,28 @@ const RESPONSE_HEADERS_TO_DROP = new Set([
 export const DEFAULT_WEBSTER_MODELS = Object.freeze([
   {
     id: "claude-webster-glm-5-2",
+    desktopId: "claude-sonnet-4-5-webster",
     upstreamId: "glm-5.2",
     displayName: "GLM 5.2 (Webster)",
     contextWindow: 320_000,
   },
   {
     id: "claude-webster-deepseek-v4-flash",
+    desktopId: "claude-sonnet-4-5-webster-flash",
     upstreamId: "deepseek-v4-flash",
     displayName: "DeepSeek V4 Flash (Webster)",
     contextWindow: 600_000,
   },
   {
     id: "claude-webster-glm-5-2-h200",
+    desktopId: "claude-sonnet-4-5-webster-h200",
     upstreamId: "glm-5.2-h200",
     displayName: "GLM 5.2 H200 (Webster)",
     contextWindow: 131_072,
   },
   {
     id: "claude-webster-deepseek-v4-flash-h100",
+    desktopId: "claude-sonnet-4-5-webster-flash-h100",
     upstreamId: "deepseek-v4-flash-h100",
     displayName: "DeepSeek V4 Flash H100 (Webster)",
     contextWindow: 262_144,
@@ -76,7 +84,7 @@ function requireNonEmptyString(value, label) {
   return value;
 }
 
-export function loadWebsterProvider(configPath = DEFAULT_WEBSTER_CONFIG) {
+export function loadProxyConfig(configPath = DEFAULT_WEBSTER_CONFIG) {
   let config;
   try {
     config = JSON.parse(readFileSync(configPath, "utf8"));
@@ -87,12 +95,40 @@ export function loadWebsterProvider(configPath = DEFAULT_WEBSTER_CONFIG) {
   }
 
   const provider = config?.providers?.webster ?? config;
+  const anthropicConfig = config?.providers?.anthropic ?? config?.anthropic;
+  let anthropic;
+  if (anthropicConfig !== undefined) {
+    const mode = requireNonEmptyString(
+      anthropicConfig?.mode,
+      "Anthropic config mode",
+    );
+    if (mode === "api-key") {
+      anthropic = {
+        mode,
+        apiKey: requireNonEmptyString(
+          anthropicConfig?.apiKey,
+          "Anthropic config apiKey",
+        ),
+      };
+    } else if (mode === "claude-code-oauth") {
+      anthropic = { mode };
+    } else {
+      throw new Error(`Unsupported Anthropic config mode: ${mode}`);
+    }
+  }
   return {
-    baseUrl: normalizeBaseUrl(
-      requireNonEmptyString(provider?.baseUrl, "Webster config baseUrl"),
-    ),
-    apiKey: requireNonEmptyString(provider?.apiKey, "Webster config apiKey"),
+    webster: {
+      baseUrl: normalizeBaseUrl(
+        requireNonEmptyString(provider?.baseUrl, "Webster config baseUrl"),
+      ),
+      apiKey: requireNonEmptyString(provider?.apiKey, "Webster config apiKey"),
+    },
+    anthropic,
   };
+}
+
+export function loadWebsterProvider(configPath = DEFAULT_WEBSTER_CONFIG) {
+  return loadProxyConfig(configPath).webster;
 }
 
 function readBody(request, limitBytes) {
@@ -130,6 +166,15 @@ function hasIncomingCredential(request) {
   );
 }
 
+function hasDesktopSentinel(request) {
+  const authorization = request.headers.authorization;
+  return (
+    (typeof authorization === "string" &&
+      authorization.replace(/^Bearer\s+/i, "") === CLAUDE_DESKTOP_LOCAL_TOKEN) ||
+    request.headers["x-api-key"] === CLAUDE_DESKTOP_LOCAL_TOKEN
+  );
+}
+
 function copyRequestHeaders(request, route, websterApiKey) {
   const headers = {};
   for (const [name, value] of Object.entries(request.headers)) {
@@ -159,6 +204,74 @@ function copyRequestHeaders(request, route, websterApiKey) {
     headers["content-type"] = "application/json";
   }
   return headers;
+}
+
+function withOAuthBeta(value) {
+  const entries = String(value ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (!entries.includes(CLAUDE_CODE_OAUTH_BETA)) entries.push(CLAUDE_CODE_OAUTH_BETA);
+  return entries.join(",");
+}
+
+function createAnthropicCredentialProvider(config) {
+  if (!config) return undefined;
+  if (config.mode === "api-key") {
+    return {
+      async getCredential() {
+        return { kind: "api-key", secret: config.apiKey };
+      },
+    };
+  }
+  if (config.mode === "claude-code-oauth") return createClaudeCodeOAuthProvider();
+  throw new Error(`Unsupported Anthropic credential mode: ${config.mode}`);
+}
+
+async function anthropicHeaders(request, options, forceRefresh = false) {
+  const headers = copyRequestHeaders(request, "anthropic", options.websterApiKey);
+  if (!hasDesktopSentinel(request)) return { headers, injectedKind: undefined };
+  if (!options.anthropicCredentialProvider) {
+    throw Object.assign(
+      new Error(
+        "Claude Desktop Anthropic routing is not configured; install with an Anthropic API key or --anthropic-oauth",
+      ),
+      { statusCode: 401 },
+    );
+  }
+
+  delete headers.authorization;
+  delete headers["x-api-key"];
+  const credential = await options.anthropicCredentialProvider.getCredential({ forceRefresh });
+  if (credential.kind === "api-key") {
+    headers["x-api-key"] = credential.secret;
+  } else if (credential.kind === "oauth") {
+    headers.authorization = `Bearer ${credential.secret}`;
+    headers["anthropic-beta"] = withOAuthBeta(headers["anthropic-beta"]);
+  } else {
+    throw new Error(`Unsupported Anthropic credential kind: ${credential.kind}`);
+  }
+  headers["anthropic-version"] ??= "2023-06-01";
+  return { headers, injectedKind: credential.kind };
+}
+
+async function catalogHeaders(options, forceRefresh = false) {
+  if (!options.anthropicCredentialProvider) return undefined;
+  const credential = await options.anthropicCredentialProvider.getCredential({ forceRefresh });
+  const headers = {
+    accept: "application/json",
+    "accept-encoding": "identity",
+    "anthropic-version": "2023-06-01",
+  };
+  if (credential.kind === "api-key") {
+    headers["x-api-key"] = credential.secret;
+  } else if (credential.kind === "oauth") {
+    headers.authorization = `Bearer ${credential.secret}`;
+    headers["anthropic-beta"] = CLAUDE_CODE_OAUTH_BETA;
+  } else {
+    throw new Error(`Unsupported Anthropic credential kind: ${credential.kind}`);
+  }
+  return { headers, injectedKind: credential.kind };
 }
 
 function copyResponseHeaders(headers) {
@@ -571,19 +684,117 @@ async function pipeChatStreamAsAnthropic(upstreamResponse, response, requestedMo
   finalize();
 }
 
-function modelCatalog(models) {
-  const data = models.map((model) => ({
-    id: model.id,
-    type: "model",
-    display_name: model.displayName,
-    created_at: "2026-08-20T00:00:00Z",
-  }));
+function anthropicFamilyTier(modelId) {
+  const id = modelId.toLowerCase();
+  for (const tier of ["opus", "sonnet", "haiku"]) {
+    if (id.includes(`-${tier}-`)) return tier;
+  }
+}
+
+function modelCatalog(websterModels, anthropicModels = []) {
+  const data = [];
+  const seen = new Set();
+  const familyDefaults = new Set();
+  for (const model of anthropicModels) {
+    if (typeof model?.id !== "string" || !model.id.startsWith("claude-") || seen.has(model.id)) {
+      continue;
+    }
+    seen.add(model.id);
+    const family = anthropicFamilyTier(model.id);
+    const entry = {
+      id: model.id,
+      type: "model",
+      display_name: model.display_name ?? model.displayName ?? model.id,
+      ...(model.created_at ? { created_at: model.created_at } : {}),
+      ...(family ? { anthropic_family_tier: family } : {}),
+      ...(family && !familyDefaults.has(family) ? { is_family_default: true } : {}),
+      ...(Number.isFinite(model.max_input_tokens)
+        ? { max_input_tokens: model.max_input_tokens }
+        : {}),
+    };
+    if (family) familyDefaults.add(family);
+    data.push(entry);
+  }
+  for (const [index, model] of websterModels.entries()) {
+    const id = model.desktopId ?? model.id;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    data.push({
+      id,
+      type: "model",
+      display_name: model.displayName,
+      created_at: "2026-08-20T00:00:00Z",
+      anthropic_family_tier: "sonnet",
+      ...(!familyDefaults.has("sonnet") && index === 0
+        ? { is_family_default: true }
+        : {}),
+      max_input_tokens: model.contextWindow,
+    });
+  }
   return {
     data,
     has_more: false,
     first_id: data[0]?.id ?? null,
     last_id: data.at(-1)?.id ?? null,
   };
+}
+
+async function fetchAnthropicModels(options, forceRefresh = false) {
+  const auth = await catalogHeaders(options, forceRefresh);
+  if (!auth) return [];
+  const upstreamResponse = await requestUpstream({
+    headers: auth.headers,
+    method: "GET",
+    timeoutMs: options.timeoutMs,
+    url: `${options.anthropicBaseUrl}/v1/models?limit=100`,
+  });
+  if (
+    upstreamResponse.statusCode === 401 &&
+    auth.injectedKind === "oauth" &&
+    !forceRefresh
+  ) {
+    await collectResponse(upstreamResponse);
+    return fetchAnthropicModels(options, true);
+  }
+  const body = await collectResponse(upstreamResponse);
+  if (upstreamResponse.statusCode < 200 || upstreamResponse.statusCode >= 300) {
+    throw Object.assign(
+      new Error(`Anthropic model discovery failed (${upstreamResponse.statusCode})`),
+      { statusCode: upstreamResponse.statusCode },
+    );
+  }
+  let payload;
+  try {
+    payload = JSON.parse(body.toString("utf8"));
+  } catch {
+    throw new Error("Anthropic model discovery returned invalid JSON");
+  }
+  if (!Array.isArray(payload?.data)) {
+    throw new Error("Anthropic model discovery returned an unexpected body");
+  }
+  return payload.data;
+}
+
+async function combinedModelCatalog(options) {
+  if (!options.anthropicCredentialProvider) {
+    return modelCatalog(options.websterModels);
+  }
+  if (options.anthropicCatalogCache?.expiresAt > Date.now()) {
+    return modelCatalog(options.websterModels, options.anthropicCatalogCache.models);
+  }
+  try {
+    const models = await fetchAnthropicModels(options);
+    options.anthropicCatalogCache = {
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      models,
+    };
+    return modelCatalog(options.websterModels, models);
+  } catch (error) {
+    if (options.anthropicCatalogCache) {
+      return modelCatalog(options.websterModels, options.anthropicCatalogCache.models);
+    }
+    throw error;
+  }
 }
 
 async function handleWebsterMessage(request, response, options, payload, model) {
@@ -608,7 +819,7 @@ async function handleWebsterMessage(request, response, options, payload, model) 
   }
 
   if (payload.stream === true) {
-    await pipeChatStreamAsAnthropic(upstreamResponse, response, model.id);
+    await pipeChatStreamAsAnthropic(upstreamResponse, response, payload.model);
     return;
   }
 
@@ -619,24 +830,40 @@ async function handleWebsterMessage(request, response, options, payload, model) 
   } catch {
     throw new Error("Webster returned invalid JSON");
   }
-  jsonResponse(response, 200, chatToAnthropicResponse(chatResponse, model.id));
+  jsonResponse(response, 200, chatToAnthropicResponse(chatResponse, payload.model));
 }
 
-async function handleAnthropicMessage(request, response, options, body) {
+async function requestAnthropicMessage(request, options, body, forceRefresh = false) {
   const url = new URL(request.url, "http://localhost");
+  const auth = await anthropicHeaders(request, options, forceRefresh);
   const upstreamResponse = await requestUpstream({
     body,
-    headers: copyRequestHeaders(request, "anthropic", options.websterApiKey),
+    headers: auth.headers,
     method: "POST",
     timeoutMs: options.timeoutMs,
     url: `${options.anthropicBaseUrl}${url.pathname}${url.search}`,
   });
+  if (
+    upstreamResponse.statusCode === 401 &&
+    auth.injectedKind === "oauth" &&
+    !forceRefresh
+  ) {
+    await collectResponse(upstreamResponse);
+    return requestAnthropicMessage(request, options, body, true);
+  }
+  return upstreamResponse;
+}
+
+async function handleAnthropicMessage(request, response, options, body) {
+  const upstreamResponse = await requestAnthropicMessage(request, options, body);
   response.writeHead(upstreamResponse.statusCode, copyResponseHeaders(upstreamResponse.headers));
   upstreamResponse.pipe(response);
 }
 
 export function createClaudeCodeModelProxy({
   anthropicBaseUrl = DEFAULT_ANTHROPIC_BASE_URL,
+  anthropicCredential,
+  anthropicCredentialProvider,
   bodyLimitBytes = DEFAULT_BODY_LIMIT_BYTES,
   host = DEFAULT_HOST,
   port = DEFAULT_PORT,
@@ -647,14 +874,25 @@ export function createClaudeCodeModelProxy({
 }) {
   requireNonEmptyString(websterApiKey, "websterApiKey");
   requireNonEmptyString(websterBaseUrl, "websterBaseUrl");
+  if (anthropicCredential && anthropicCredentialProvider) {
+    throw new Error("Configure anthropicCredential or anthropicCredentialProvider, not both");
+  }
   const options = {
     anthropicBaseUrl: normalizeBaseUrl(anthropicBaseUrl),
+    anthropicCatalogCache: undefined,
+    anthropicCredentialProvider:
+      anthropicCredentialProvider ?? createAnthropicCredentialProvider(anthropicCredential),
     bodyLimitBytes,
     timeoutMs,
     websterApiKey,
     websterBaseUrl: normalizeBaseUrl(websterBaseUrl),
     websterModels,
-    websterModelsById: new Map(websterModels.map((model) => [model.id, model])),
+    websterModelsById: new Map(
+      websterModels.flatMap((model) => [
+        [model.id, model],
+        ...(model.desktopId ? [[model.desktopId, model]] : []),
+      ]),
+    ),
   };
 
   const server = createServer(async (request, response) => {
@@ -674,7 +912,7 @@ export function createClaudeCodeModelProxy({
       // and this catalog contains only public model metadata, so serve it
       // before enforcing credentials on inference routes.
       if (request.method === "GET" && url.pathname === "/v1/models") {
-        jsonResponse(response, 200, modelCatalog(options.websterModels));
+        jsonResponse(response, 200, await combinedModelCatalog(options));
         return;
       }
       if (!hasIncomingCredential(request)) {
@@ -749,8 +987,9 @@ function integerFromEnv(name, fallback) {
 
 export async function main() {
   const configPath = process.env.WEBSTER_MODELS_CONFIG ?? DEFAULT_WEBSTER_CONFIG;
-  const configProvider = loadWebsterProvider(configPath);
+  const config = loadProxyConfig(configPath);
   const proxy = createClaudeCodeModelProxy({
+    anthropicCredential: config.anthropic,
     anthropicBaseUrl:
       process.env.ANTHROPIC_UPSTREAM_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL,
     bodyLimitBytes: integerFromEnv(
@@ -763,8 +1002,8 @@ export async function main() {
       "CLAUDE_CODE_MODEL_PROXY_TIMEOUT_MS",
       DEFAULT_REQUEST_TIMEOUT_MS,
     ),
-    websterApiKey: process.env.WEBSTER_API_KEY ?? configProvider.apiKey,
-    websterBaseUrl: process.env.WEBSTER_BASE_URL ?? configProvider.baseUrl,
+    websterApiKey: process.env.WEBSTER_API_KEY ?? config.webster.apiKey,
+    websterBaseUrl: process.env.WEBSTER_BASE_URL ?? config.webster.baseUrl,
   });
   const address = await proxy.start();
   process.stdout.write(
