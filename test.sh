@@ -1059,5 +1059,69 @@ if ! printf '%s' "$claude_help" | grep -q 'WEBSTER_API_KEY'; then
   echo "FAIL: claude-code-setup.sh --help printed nothing usable when piped to bash" >&2
   exit 1
 fi
+if ! printf '%s' "$claude_help" | grep -q -- '--desktop'; then
+  echo "FAIL: claude-code-setup.sh --help omitted the Claude Desktop option" >&2
+  exit 1
+fi
+
+# The Desktop writer and the installer's real-machine assertion must agree on
+# the persisted 3P profile. Corrupting an applied field must make verification
+# fail, and --desktop must remain opt-in and macOS-only.
+claude_desktop_support="$scratch/Claude-3p"
+node claude-code-model-proxy/write-claude-desktop-config.mjs \
+  "$claude_desktop_support" http://127.0.0.1:4816 >/dev/null
+if ! (
+  export SETUP_SKIP_MAIN=1
+  export CLAUDE_DESKTOP_SETUP_SUPPORT_DIR="$claude_desktop_support"
+  source ./claude-code-setup.sh
+  DESKTOP=1
+  assert_claude_desktop_config
+) >/dev/null; then
+  echo "FAIL: Claude Desktop setup rejected its own generated profile" >&2
+  exit 1
+fi
+claude_desktop_profile=$(node -e '
+  const fs = require("fs");
+  const path = require("path");
+  const support = process.argv[1];
+  const meta = JSON.parse(fs.readFileSync(path.join(support, "configLibrary", "_meta.json"), "utf8"));
+  process.stdout.write(path.join(support, "configLibrary", `${meta.appliedId}.json`));
+' "$claude_desktop_support")
+node -e '
+  const fs = require("fs");
+  const file = process.argv[1];
+  const profile = JSON.parse(fs.readFileSync(file, "utf8"));
+  profile.inferenceGatewayBaseUrl = "http://127.0.0.1:9999";
+  fs.writeFileSync(file, `${JSON.stringify(profile, null, 2)}\n`);
+' "$claude_desktop_profile"
+if (
+  export SETUP_SKIP_MAIN=1
+  export CLAUDE_DESKTOP_SETUP_SUPPORT_DIR="$claude_desktop_support"
+  source ./claude-code-setup.sh
+  DESKTOP=1
+  assert_claude_desktop_config
+) >/dev/null 2>&1; then
+  echo "FAIL: Claude Desktop setup accepted a mismatched Gateway profile" >&2
+  exit 1
+fi
+if ! (
+  export SETUP_SKIP_MAIN=1
+  source ./claude-code-setup.sh
+  parse_args --desktop
+  [ "$DESKTOP" = 1 ]
+); then
+  echo "FAIL: claude-code-setup.sh did not parse --desktop" >&2
+  exit 1
+fi
+if (
+  export SETUP_SKIP_MAIN=1
+  source ./claude-code-setup.sh
+  DESKTOP=1
+  OS=linux
+  assert_claude_desktop_supported
+) >/dev/null 2>&1; then
+  echo "FAIL: Claude Desktop setup accepted a non-macOS platform" >&2
+  exit 1
+fi
 
 log "all negative tests passed"

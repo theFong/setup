@@ -41,24 +41,28 @@ const RESPONSE_HEADERS_TO_DROP = new Set([
 export const DEFAULT_WEBSTER_MODELS = Object.freeze([
   {
     id: "claude-webster-glm-5-2",
+    desktopId: "claude-sonnet-4-5-webster",
     upstreamId: "glm-5.2",
     displayName: "GLM 5.2 (Webster)",
     contextWindow: 320_000,
   },
   {
     id: "claude-webster-deepseek-v4-flash",
+    desktopId: "claude-sonnet-4-5-webster-flash",
     upstreamId: "deepseek-v4-flash",
     displayName: "DeepSeek V4 Flash (Webster)",
     contextWindow: 600_000,
   },
   {
     id: "claude-webster-glm-5-2-h200",
+    desktopId: "claude-sonnet-4-5-webster-h200",
     upstreamId: "glm-5.2-h200",
     displayName: "GLM 5.2 H200 (Webster)",
     contextWindow: 131_072,
   },
   {
     id: "claude-webster-deepseek-v4-flash-h100",
+    desktopId: "claude-sonnet-4-5-webster-flash-h100",
     upstreamId: "deepseek-v4-flash-h100",
     displayName: "DeepSeek V4 Flash H100 (Webster)",
     contextWindow: 262_144,
@@ -572,11 +576,14 @@ async function pipeChatStreamAsAnthropic(upstreamResponse, response, requestedMo
 }
 
 function modelCatalog(models) {
-  const data = models.map((model) => ({
-    id: model.id,
+  const data = models.map((model, index) => ({
+    id: model.desktopId ?? model.id,
     type: "model",
     display_name: model.displayName,
     created_at: "2026-08-20T00:00:00Z",
+    anthropic_family_tier: "sonnet",
+    is_family_default: index === 0,
+    max_input_tokens: model.contextWindow,
   }));
   return {
     data,
@@ -608,7 +615,7 @@ async function handleWebsterMessage(request, response, options, payload, model) 
   }
 
   if (payload.stream === true) {
-    await pipeChatStreamAsAnthropic(upstreamResponse, response, model.id);
+    await pipeChatStreamAsAnthropic(upstreamResponse, response, payload.model);
     return;
   }
 
@@ -619,7 +626,7 @@ async function handleWebsterMessage(request, response, options, payload, model) 
   } catch {
     throw new Error("Webster returned invalid JSON");
   }
-  jsonResponse(response, 200, chatToAnthropicResponse(chatResponse, model.id));
+  jsonResponse(response, 200, chatToAnthropicResponse(chatResponse, payload.model));
 }
 
 async function handleAnthropicMessage(request, response, options, body) {
@@ -654,7 +661,12 @@ export function createClaudeCodeModelProxy({
     websterApiKey,
     websterBaseUrl: normalizeBaseUrl(websterBaseUrl),
     websterModels,
-    websterModelsById: new Map(websterModels.map((model) => [model.id, model])),
+    websterModelsById: new Map(
+      websterModels.flatMap((model) => [
+        [model.id, model],
+        ...(model.desktopId ? [[model.desktopId, model]] : []),
+      ]),
+    ),
   };
 
   const server = createServer(async (request, response) => {

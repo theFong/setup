@@ -21,6 +21,7 @@
 #
 # Usage:
 #   ./claude-code-setup.sh                   install, configure, and verify
+#   ./claude-code-setup.sh --desktop         also enable Claude Desktop Gateway mode
 #   ./claude-code-setup.sh --check           verify only; change nothing
 #   ./claude-code-setup.sh --key-file PATH   read the Webster key from PATH
 #
@@ -28,7 +29,8 @@
 #      CLAUDE_CODE_MODEL_PROXY_PORT, CLAUDE_CODE_SETUP_REF,
 #      CLAUDE_CODE_SETUP_RAW_BASE_URL, CLAUDE_CODE_SETUP_CLAUDE_DIR,
 #      CLAUDE_CODE_SETUP_SOURCE_DIR, CLAUDE_CODE_SETUP_SKIP_ENDPOINT_CHECK,
-#      CLAUDE_CODE_SETUP_SKIP_AUTH_CHECK
+#      CLAUDE_CODE_SETUP_SKIP_AUTH_CHECK, CLAUDE_DESKTOP_SETUP_APP,
+#      CLAUDE_DESKTOP_SETUP_SUPPORT_DIR, CLAUDE_DESKTOP_SETUP_SKIP_RELAUNCH
 
 set -euo pipefail
 
@@ -47,11 +49,13 @@ CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
 GATEWAY_CACHE="$CLAUDE_DIR/cache/gateway-models.json"
 CODEX_DIR="${CLAUDE_CODE_SETUP_CODEX_DIR:-${CODEX_HOME:-$HOME/.codex}}"
 CODEX_WEBSTER_CONFIG="$CODEX_DIR/model-proxy/webster.json"
+CLAUDE_DESKTOP_APP="${CLAUDE_DESKTOP_SETUP_APP:-/Applications/Claude.app}"
+CLAUDE_DESKTOP_SUPPORT_DIR="${CLAUDE_DESKTOP_SETUP_SUPPORT_DIR:-$HOME/Library/Application Support/Claude-3p}"
 
 SETUP_REF="${CLAUDE_CODE_SETUP_REF:-main}"
 RAW_BASE_URL="${CLAUDE_CODE_SETUP_RAW_BASE_URL:-https://raw.githubusercontent.com/theFong/setup/$SETUP_REF}"
 LOCAL_SOURCE_DIR="${CLAUDE_CODE_SETUP_SOURCE_DIR:-}"
-SOURCE_FILES="proxy.mjs write-webster-config.mjs write-claude-settings.mjs write-gateway-cache.mjs"
+SOURCE_FILES="proxy.mjs write-webster-config.mjs write-claude-settings.mjs write-gateway-cache.mjs write-claude-desktop-config.mjs"
 
 NODE_MIN_MAJOR=20
 CLAUDE_DISCOVERY_MIN_VERSION="2.1.129"
@@ -61,6 +65,7 @@ SUDO=""
 APT_UPDATED=0
 FAILED=""
 CHECK_ONLY=0
+DESKTOP=0
 KEY_FILE=""
 API_KEY="${WEBSTER_API_KEY:-}"
 INSTALL_CHANGED=0
@@ -83,10 +88,11 @@ usage() {
 claude-code-setup.sh — add Webster models alongside Claude models in Claude Code.
 
 Usage:
-  claude-code-setup.sh [--check] [--key-file PATH]
+  claude-code-setup.sh [--check] [--desktop] [--key-file PATH]
 
 Options:
   --check, --verify-only  Verify the current setup without changing it.
+  --desktop               Also configure Claude Desktop/Cowork in Gateway mode (macOS).
   --key-file PATH         Read the Webster API key from PATH.
   -h, --help              Show this help.
 
@@ -94,7 +100,8 @@ Env: WEBSTER_API_KEY, CLAUDE_CODE_WEBSTER_BASE_URL,
      CLAUDE_CODE_MODEL_PROXY_PORT, CLAUDE_CODE_SETUP_REF,
      CLAUDE_CODE_SETUP_RAW_BASE_URL, CLAUDE_CODE_SETUP_CLAUDE_DIR,
      CLAUDE_CODE_SETUP_SOURCE_DIR, CLAUDE_CODE_SETUP_SKIP_ENDPOINT_CHECK,
-     CLAUDE_CODE_SETUP_SKIP_AUTH_CHECK
+     CLAUDE_CODE_SETUP_SKIP_AUTH_CHECK, CLAUDE_DESKTOP_SETUP_APP,
+     CLAUDE_DESKTOP_SETUP_SUPPORT_DIR, CLAUDE_DESKTOP_SETUP_SKIP_RELAUNCH
 USAGE
 }
 
@@ -102,6 +109,7 @@ parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --check|--verify-only) CHECK_ONLY=1 ;;
+      --desktop) DESKTOP=1 ;;
       --key-file)
         shift
         KEY_FILE="${1:-}"
@@ -243,6 +251,28 @@ assert_claude_login() {
     return 1
   fi
   ok "Claude Code login is available"
+}
+
+assert_claude_desktop_supported() {
+  [ "$DESKTOP" = 1 ] || return 0
+  [ "$OS" = "darwin" ] || {
+    warn "--desktop is supported only on macOS"
+    return 1
+  }
+  [ -d "$CLAUDE_DESKTOP_APP" ] || {
+    warn "Claude Desktop is not installed at $CLAUDE_DESKTOP_APP"
+    return 1
+  }
+  local asar="$CLAUDE_DESKTOP_APP/Contents/Resources/app.asar"
+  [ -r "$asar" ] || {
+    warn "Claude Desktop resources are missing at $asar"
+    return 1
+  }
+  LC_ALL=C grep -aq 'inferenceGatewayBaseUrl' "$asar" || {
+    warn "this Claude Desktop build does not expose third-party Gateway configuration"
+    return 1
+  }
+  ok "Claude Desktop supports third-party Gateway mode"
 }
 
 mode_of() {
@@ -557,12 +587,15 @@ assert_gateway_catalog() {
       const fs = require("fs");
       const body = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       const required = new Set([
-        "claude-webster-glm-5-2",
-        "claude-webster-deepseek-v4-flash",
-        "claude-webster-glm-5-2-h200",
-        "claude-webster-deepseek-v4-flash-h100",
+        "claude-sonnet-4-5-webster",
+        "claude-sonnet-4-5-webster-flash",
+        "claude-sonnet-4-5-webster-h200",
+        "claude-sonnet-4-5-webster-flash-h100",
       ]);
-      for (const model of body.data ?? []) required.delete(model.id);
+      for (const model of body.data ?? []) {
+        if (model.anthropic_family_tier !== "sonnet") continue;
+        required.delete(model.id);
+      }
       if (required.size) process.exit(1);
     ' "$response_file"; then
     rm -f "$response_file"
@@ -570,7 +603,7 @@ assert_gateway_catalog() {
     return 1
   fi
   rm -f "$response_file"
-  ok "Claude Code gateway advertises all Webster models"
+  ok "gateway advertises all Claude Desktop-compatible Webster models"
 }
 
 write_gateway_cache() {
@@ -646,6 +679,87 @@ assert_claude_settings() {
   ok "Claude Code user settings point at the combined provider"
 }
 
+configure_claude_desktop() {
+  [ "$DESKTOP" = 1 ] || return 0
+  CLAUDE_CODE_MODEL_PROXY_URL="$PROXY_URL" \
+    node "$PROXY_DIR/write-claude-desktop-config.mjs" \
+      "$CLAUDE_DESKTOP_SUPPORT_DIR" "$PROXY_URL" >/dev/null
+  ok "configured Claude Desktop Webster Gateway profile"
+}
+
+assert_claude_desktop_config() {
+  [ "$DESKTOP" = 1 ] || return 0
+  CLAUDE_CODE_MODEL_PROXY_URL="$PROXY_URL" node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const support = process.argv[1];
+    const expected = process.env.CLAUDE_CODE_MODEL_PROXY_URL.replace(/\/+$/, "");
+    const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+    const desktop = read(path.join(support, "claude_desktop_config.json"));
+    const meta = read(path.join(support, "configLibrary", "_meta.json"));
+    if (desktop.deploymentMode !== "3p") process.exit(1);
+    if (!/^[0-9a-f-]{36}$/i.test(meta.appliedId ?? "")) process.exit(1);
+    const profile = read(path.join(support, "configLibrary", `${meta.appliedId}.json`));
+    if (profile.inferenceProvider !== "gateway") process.exit(1);
+    if (profile.inferenceCredentialKind !== "static") process.exit(1);
+    if (profile.inferenceGatewayBaseUrl?.replace(/\/+$/, "") !== expected) process.exit(1);
+    if (profile.inferenceGatewayApiKey !== "claude-desktop-local") process.exit(1);
+    if (profile.inferenceGatewayAuthScheme !== "bearer") process.exit(1);
+    if (profile.modelDiscoveryEnabled !== true) process.exit(1);
+  ' "$CLAUDE_DESKTOP_SUPPORT_DIR" || {
+    warn "Claude Desktop Gateway profile is missing or incorrect"
+    return 1
+  }
+
+  local desktop_config="$CLAUDE_DESKTOP_SUPPORT_DIR/claude_desktop_config.json"
+  local meta="$CLAUDE_DESKTOP_SUPPORT_DIR/configLibrary/_meta.json"
+  local profile_id profile
+  profile_id=$(node -e '
+    const fs = require("fs");
+    process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).appliedId ?? "");
+  ' "$meta") || return 1
+  profile="$CLAUDE_DESKTOP_SUPPORT_DIR/configLibrary/$profile_id.json"
+  [ "$(mode_of "$desktop_config")" = 600 ] &&
+    [ "$(mode_of "$meta")" = 600 ] &&
+    [ "$(mode_of "$profile")" = 600 ] || {
+      warn "Claude Desktop Gateway configuration must use mode 600"
+      return 1
+    }
+  ok "Claude Desktop is persisted in private Gateway/3P configuration"
+}
+
+relaunch_claude_desktop() {
+  [ "$DESKTOP" = 1 ] || return 0
+  if [ "${CLAUDE_DESKTOP_SETUP_SKIP_RELAUNCH:-0}" = 1 ]; then
+    ok "skipping Claude Desktop relaunch (CLAUDE_DESKTOP_SETUP_SKIP_RELAUNCH=1)"
+    return 0
+  fi
+  if pgrep -x Claude >/dev/null 2>&1; then
+    osascript -e 'tell application id "com.anthropic.claudefordesktop" to quit' || return 1
+    local stop_attempt=0
+    while pgrep -x Claude >/dev/null 2>&1 && [ "$stop_attempt" -lt 30 ]; do
+      stop_attempt=$((stop_attempt + 1))
+      sleep 0.5
+    done
+    pgrep -x Claude >/dev/null 2>&1 && {
+      warn "Claude Desktop did not quit for the Gateway-mode relaunch"
+      return 1
+    }
+  fi
+  open "$CLAUDE_DESKTOP_APP" || return 1
+  local start_attempt=0
+  while [ "$start_attempt" -lt 30 ]; do
+    start_attempt=$((start_attempt + 1))
+    if ps ax -o command= | grep -F '"deploymentMode":"3p"' | grep -v grep >/dev/null 2>&1; then
+      ok "Claude Desktop relaunched in Gateway/3P mode"
+      return 0
+    fi
+    sleep 0.5
+  done
+  warn "Claude Desktop did not relaunch in Gateway/3P mode"
+  return 1
+}
+
 verify_all() {
   assert_claude_code     || record_failure claude-code
   assert_claude_login    || record_failure claude-login
@@ -656,6 +770,10 @@ verify_all() {
   assert_gateway_catalog || record_failure model-catalog
   assert_gateway_cache   || record_failure model-cache
   assert_claude_settings || record_failure claude-settings
+  if [ "$DESKTOP" = 1 ]; then
+    assert_claude_desktop_supported || record_failure claude-desktop
+    assert_claude_desktop_config || record_failure claude-desktop-config
+  fi
 }
 
 summary() {
@@ -665,9 +783,16 @@ summary() {
     warn "fix the reported issue and re-run claude-code-setup.sh"
     return 1
   fi
-  log "Claude Code + Webster setup is healthy"
+  if [ "$DESKTOP" = 1 ]; then
+    log "Claude Code + Claude Desktop + Webster setup is healthy"
+  else
+    log "Claude Code + Webster setup is healthy"
+  fi
   printf '\nStart a new Claude Code process, run /model, and choose a Webster or Claude model.\n'
   printf 'Direct launch example: claude --model claude-webster-glm-5-2\n'
+  if [ "$DESKTOP" = 1 ]; then
+    printf 'Claude Desktop is now using the separate Webster Gateway/3P profile.\n'
+  fi
   printf 'Re-run this installer to update the proxy; use --check for a read-only health check.\n'
 }
 
@@ -682,6 +807,7 @@ main() {
   ensure_node || { record_failure node; summary || true; return 1; }
   assert_claude_code || { record_failure claude-code; summary || true; return 1; }
   assert_claude_login || { record_failure claude-login; summary || true; return 1; }
+  assert_claude_desktop_supported || { record_failure claude-desktop; summary || true; return 1; }
   resolve_api_key || { record_failure webster-key; summary || true; return 1; }
 
   if [ "$CHECK_ONLY" = 1 ]; then
@@ -702,6 +828,11 @@ main() {
   write_gateway_cache || { record_failure model-cache; summary || true; return 1; }
   assert_gateway_cache || record_failure model-cache
   assert_claude_settings || record_failure claude-settings
+  if [ "$DESKTOP" = 1 ]; then
+    configure_claude_desktop || { record_failure claude-desktop-config; summary || true; return 1; }
+    assert_claude_desktop_config || { record_failure claude-desktop-config; summary || true; return 1; }
+    relaunch_claude_desktop || record_failure claude-desktop-runtime
+  fi
   summary
 }
 

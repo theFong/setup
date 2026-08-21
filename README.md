@@ -8,6 +8,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **omp-setup.sh** — Installs and configures [omp](https://omp.sh) (oh-my-pi) against the Brev-hosted model endpoint (see below)
 - **pi-setup.sh** — Same, for the [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding agent; one-liner installable (see below)
 - **codex-setup.sh** — Adds Webster models alongside OpenAI models in Codex CLI and Codex Desktop through a localhost-only proxy (see below)
+- **claude-code-setup.sh** — Adds Webster models to Claude Code, with opt-in programmatic Claude Desktop/Cowork Gateway setup (see below)
 - **test.sh** — Isolated negative tests for the installers, run by CI and safe to run locally
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
@@ -323,6 +324,27 @@ curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/claude-code-setu
   | WEBSTER_API_KEY=sk-... bash
 ```
 
+To configure Claude Desktop/Cowork programmatically at the same time, add the
+explicit macOS-only `--desktop` flag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/claude-code-setup.sh \
+  | WEBSTER_API_KEY=sk-... bash -s -- --desktop
+```
+
+This creates and applies an owner-readable Webster profile under Claude's
+separate `Claude-3p` application-support directory, enables model discovery,
+persists `deploymentMode: 3p`, and relaunches Claude Desktop. No UI automation
+or Developer menu is required. The static credential stored in the Desktop
+profile is only a non-secret loopback sentinel; the real Webster key remains in
+the proxy's mode-`0600` config and is substituted only for Webster requests.
+
+Desktop Gateway mode is intentionally opt-in because it replaces the
+first-party Desktop model picker rather than mixing with it. Claude Code still
+shows Webster alongside the normal Claude choices, and the original
+first-party Desktop profile remains untouched in its separate application data
+directory.
+
 The installer also reuses the Webster key installed by `codex-setup.sh` when it
 is available, so a machine with the Codex proxy already configured can omit the
 environment variable:
@@ -335,6 +357,7 @@ curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/claude-code-setu
 |---|---|
 | _(none)_ | Install + configure + verify |
 | `--check` | Verify Claude login, source, secret permissions, endpoint, service, catalog, and settings without changing anything |
+| `--desktop` | Also configure and relaunch Claude Desktop/Cowork in the separate Webster Gateway/3P profile (macOS only) |
 | `--key-file PATH` | Read the Webster key from a file's first line |
 
 What it writes:
@@ -345,6 +368,7 @@ What it writes:
 | `~/.claude/settings.json` | Merge-safe gateway URL, model-discovery switch, and tool-search setting |
 | `~/.claude/cache/gateway-models.json` | Seeded Webster catalog for `/model`, including Claude.ai subscription logins |
 | `~/Library/LaunchAgents/com.thefong.claude-code-model-proxy.plist` | Always-on user service on macOS |
+| `~/Library/Application Support/Claude-3p/` | With `--desktop`, merge-safe Gateway profile, applied-profile metadata, and the 3P deployment-mode switch |
 | `~/.config/systemd/user/claude-code-model-proxy.service` | Always-on user service on Linux |
 
 The installer seeds Claude Code's gateway cache as well as enabling live model
@@ -357,6 +381,11 @@ headers. For Webster models it strips the incoming Claude bearer token, API
 key, and Anthropic headers before adding the Webster credential. For Claude
 models it passes the original request and login through unchanged. The
 Webster key lives only in the owner-readable proxy config.
+
+Claude Desktop accepts only model routes that look like Anthropic model IDs.
+The proxy therefore advertises Desktop-safe `claude-sonnet-4-5-webster*`
+aliases while retaining the existing `claude-webster-*` IDs used by Claude
+Code direct launches. Both names route to the same Webster models.
 
 Start a new Claude Code process after installation and run `/model`. The four
 Webster entries appear with the built-in Claude entries and are labeled
