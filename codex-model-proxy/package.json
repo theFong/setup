@@ -1,0 +1,15 @@
+{
+  "name": "codex-model-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Responses API router for Codex, OpenAI, and Webster models",
+  "scripts": {
+    "catalog": "node write-catalog.mjs",
+    "start": "node proxy.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
