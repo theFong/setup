@@ -972,4 +972,92 @@ if ! printf '%s' "$codex_help" | grep -q 'WEBSTER_API_KEY'; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# claude-code-setup.sh
+# ---------------------------------------------------------------------------
+
+# The credential writer must JSON-escape arbitrary key text and leave the
+# Claude-specific copy owner-only, just like the Codex installer.
+claude_secret="$scratch/claude-webster.json"
+WEBSTER_API_KEY='sk-test-"quoted"' WEBSTER_BASE_URL='https://webster.example/v1/' \
+  node claude-code-model-proxy/write-webster-config.mjs "$claude_secret"
+if ! WEBSTER_API_KEY='sk-test-"quoted"' node -e '
+    const fs = require("fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (value.apiKey !== process.env.WEBSTER_API_KEY) process.exit(1);
+    if (value.baseUrl !== "https://webster.example/v1") process.exit(1);
+  ' "$claude_secret"; then
+  echo "FAIL: Claude Code Webster credential writer corrupted its values" >&2
+  exit 1
+fi
+claude_secret_mode=$(stat -c '%a' "$claude_secret" 2>/dev/null \
+  || stat -f '%Lp' "$claude_secret" 2>/dev/null || true)
+if [ "$claude_secret_mode" != 600 ]; then
+  echo "FAIL: Claude Code Webster credential is not mode 600 (got '$claude_secret_mode')" >&2
+  exit 1
+fi
+
+# A fresh Claude setup can reuse the key already installed by codex-setup,
+# avoiding a second prompt without ever printing the credential.
+claude_home="$scratch/claude-home"
+mkdir -p "$claude_home/.codex/model-proxy"
+printf '{"baseUrl":"https://webster.example/v1","apiKey":"shared-test-key"}\n' \
+  > "$claude_home/.codex/model-proxy/webster.json"
+claude_reused_key=$(
+  export HOME="$claude_home" CLAUDE_CODE_SETUP_CLAUDE_DIR="$claude_home/.claude"
+  export CLAUDE_CODE_SETUP_CODEX_DIR="$claude_home/.codex" SETUP_SKIP_MAIN=1
+  unset WEBSTER_API_KEY
+  source ./claude-code-setup.sh
+  resolve_api_key >/dev/null
+  printf '%s' "$API_KEY"
+)
+if [ "$claude_reused_key" != "shared-test-key" ]; then
+  echo "FAIL: Claude Code setup did not reuse the installed Codex Webster key" >&2
+  exit 1
+fi
+
+# --check must fail without any installed key, malformed user settings must be
+# left untouched, and an unknown option must be rejected before mutation.
+if (
+  export HOME="$scratch/claude-no-key"
+  export CLAUDE_CODE_SETUP_CLAUDE_DIR="$scratch/claude-no-key/.claude"
+  export CLAUDE_CODE_SETUP_CODEX_DIR="$scratch/claude-no-key/.codex"
+  export SETUP_SKIP_MAIN=1
+  unset WEBSTER_API_KEY
+  source ./claude-code-setup.sh
+  CHECK_ONLY=1
+  resolve_api_key
+) >/dev/null 2>&1; then
+  echo "FAIL: claude-code --check accepted a missing Webster key" >&2
+  exit 1
+fi
+mkdir -p "$scratch/claude-invalid"
+printf 'not json\n' > "$scratch/claude-invalid/settings.json"
+if CLAUDE_CODE_MODEL_PROXY_URL=http://127.0.0.1:4816 \
+  node claude-code-model-proxy/write-claude-settings.mjs \
+    "$scratch/claude-invalid/settings.json" "$scratch/claude-invalid/settings.next" \
+    >/dev/null 2>&1; then
+  echo "FAIL: Claude settings writer accepted malformed JSON" >&2
+  exit 1
+fi
+if [ "$(cat "$scratch/claude-invalid/settings.json")" != "not json" ]; then
+  echo "FAIL: Claude settings writer clobbered malformed settings" >&2
+  exit 1
+fi
+if (
+  export SETUP_SKIP_MAIN=1
+  source ./claude-code-setup.sh
+  main --bogus-option
+) >/dev/null 2>&1; then
+  echo "FAIL: claude-code-setup.sh accepted an unknown option" >&2
+  exit 1
+fi
+
+# Help must work in the actual curl-pipe execution mode.
+claude_help=$( (unset SETUP_SKIP_MAIN; bash -s -- --help < ./claude-code-setup.sh) 2>&1 || true)
+if ! printf '%s' "$claude_help" | grep -q 'WEBSTER_API_KEY'; then
+  echo "FAIL: claude-code-setup.sh --help printed nothing usable when piped to bash" >&2
+  exit 1
+fi
+
 log "all negative tests passed"

@@ -57,10 +57,14 @@ jobs:
           bash -n omp-setup.sh
           bash -n pi-setup.sh
           bash -n codex-setup.sh
+          bash -n claude-code-setup.sh
           bash -n webshell/install.sh
 
       - name: Test Codex model proxy
         run: node --test codex-model-proxy/test/proxy.test.mjs
+
+      - name: Test Claude Code model proxy
+        run: node --test claude-code-model-proxy/test/proxy.test.mjs
 
       - name: Run negative tests
         run: ./test.sh

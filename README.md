@@ -306,6 +306,70 @@ model catalog is loaded when the app server starts.
 It is not wired into `install.sh`, because it needs both a Webster secret and an
 existing Codex login. Run it separately after the bootstrap.
 
+## Claude Code + Webster proxy
+
+`claude-code-setup.sh` installs a localhost-only Anthropic Messages gateway
+that adds Webster models to Claude Code's `/model` picker without replacing the
+built-in Claude choices. Normal Sonnet, Opus, Haiku, and other Claude requests
+continue to Anthropic with the login already managed by Claude Code. Only model
+IDs beginning with `claude-webster-` are translated to Webster's OpenAI Chat
+Completions API, with the Webster key substituted at that boundary.
+
+First run `claude` and sign in once. Claude Code 2.1.129 or newer is required
+for gateway model discovery. Then run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/claude-code-setup.sh \
+  | WEBSTER_API_KEY=sk-... bash
+```
+
+The installer also reuses the Webster key installed by `codex-setup.sh` when it
+is available, so a machine with the Codex proxy already configured can omit the
+environment variable:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/claude-code-setup.sh | bash
+```
+
+| Flag | Effect |
+|---|---|
+| _(none)_ | Install + configure + verify |
+| `--check` | Verify Claude login, source, secret permissions, endpoint, service, catalog, and settings without changing anything |
+| `--key-file PATH` | Read the Webster key from a file's first line |
+
+What it writes:
+
+| Where | What |
+|---|---|
+| `~/.claude/model-proxy/` | Dependency-free proxy runtime and Webster config; the config is mode `0600` |
+| `~/.claude/settings.json` | Merge-safe gateway URL, model-discovery switch, and tool-search setting |
+| `~/.claude/cache/gateway-models.json` | Seeded Webster catalog for `/model`, including Claude.ai subscription logins |
+| `~/Library/LaunchAgents/com.thefong.claude-code-model-proxy.plist` | Always-on user service on macOS |
+| `~/.config/systemd/user/claude-code-model-proxy.service` | Always-on user service on Linux |
+
+The installer seeds Claude Code's gateway cache as well as enabling live model
+discovery. This keeps the Webster entries visible for Claude.ai subscription
+logins, whose discovery request has no `ANTHROPIC_AUTH_TOKEN` or
+`ANTHROPIC_API_KEY` environment credential to send.
+
+The proxy listens only on `127.0.0.1:4816`. It never logs request bodies or
+headers. For Webster models it strips the incoming Claude bearer token, API
+key, and Anthropic headers before adding the Webster credential. For Claude
+models it passes the original request and login through unchanged. The
+Webster key lives only in the owner-readable proxy config.
+
+Start a new Claude Code process after installation and run `/model`. The four
+Webster entries appear with the built-in Claude entries and are labeled
+`(Webster)`. You can also launch one directly:
+
+```bash
+claude --model claude-webster-glm-5-2
+```
+
+The installer preserves unrelated Claude settings and is byte-identical on a
+safe re-run. It is not wired into `install.sh`, because it needs a Webster
+secret and an existing Claude login.
+
 ## pi
 
 `pi-setup.sh` is the sibling of `omp-setup.sh` for the

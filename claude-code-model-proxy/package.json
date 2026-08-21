@@ -1,0 +1,14 @@
+{
+  "name": "claude-code-model-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Anthropic Messages router for Claude Code and Webster models",
+  "scripts": {
+    "start": "node proxy.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
