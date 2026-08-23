@@ -235,11 +235,20 @@ handy when the agent is wedged and you are on a phone. Use
 [theFong/setup `webshell/`](https://github.com/theFong/setup/tree/main/webshell):
 ```bash
 sudo apt-get install -y cmake libwebsockets-dev libjson-c-dev   # build deps first
-./install.sh          # private mode: 127.0.0.1:7681 + generated password
+./install.sh                       # private: loopback + generated password
+./install.sh --public --iface lo   # loopback, NO password (auth proxy assumed)
 ```
-Keep **private** mode (loopback + password) and front it with nginx + secure link +
-firewall exactly like the dashboard. It builds ttyd from source deliberately — release
-builds ship an xterm.js with no OSC 52, so clipboard silently fails.
+**Bind loopback either way** and front it with nginx + secure link + firewall exactly
+like the dashboard. It builds ttyd from source deliberately — release builds ship an
+xterm.js with no OSC 52, so clipboard silently fails.
+
+Whether to keep its password is a real judgement call, not a default. A second factor
+only helps if the firewall fails — so it is worth keeping **unless** a co-located
+surface is already unauthenticated behind that same firewall (e.g. the Hermes dashboard,
+whose `/api/pty` is also a shell). In that case the password buys inconsistency rather
+than defense, and dropping it is defensible. Note "public" mode means *no built-in auth,
+an auth proxy is assumed* — it does **not** mean bind `0.0.0.0`; pair it with
+`--iface lo`.
 
 ⚠️ **This is a root shell** wherever the service user has passwordless sudo, and it has
 **no approval layer** — `approvals.deny` does not apply. Treat the firewall + SSO as

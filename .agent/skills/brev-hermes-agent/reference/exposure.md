@@ -155,7 +155,21 @@ Same treatment, one extra warning: **ttyd has no approval layer** — `approvals
 governs the Hermes agent, not a raw terminal. Where the service user has passwordless
 sudo it is a root shell.
 
-Keep webshell's **private** mode (loopback + generated password), front it with nginx
-(ttyd needs no Origin rewrite — it does not check origin unless `--check-origin`), add
-its port to `PORTS` **in the same change**, and give it its own SSO link. Three layers:
-SSO, firewall, ttyd password.
+Bind it to **loopback** regardless of mode, front it with nginx (ttyd needs no Origin
+rewrite — it does not check origin unless `--check-origin`), add its port to `PORTS`
+**in the same change**, and give it its own SSO link.
+
+Its own password is optional and worth thinking about rather than defaulting:
+
+| | with ttyd password | without |
+|---|---|---|
+| normal path | SSO → firewall → password | SSO → firewall |
+| **if the firewall fails** | password still stands | instant root shell |
+
+So keep it **unless** something co-located is already unauthenticated behind the same
+firewall — a Hermes dashboard exposes `/api/pty`, which is itself a shell, so a firewall
+failure already yields root and the extra password buys inconsistency, not defense.
+Decide once and apply it to every surface on the host.
+
+`--public --iface lo` gives loopback with no credential; "public" here means *no
+built-in auth, an auth proxy is assumed*, **not** bind `0.0.0.0`.
