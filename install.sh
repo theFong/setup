@@ -4,7 +4,8 @@
 #
 # Installs: Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, tmux,
 # git, gh, jq, ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links
-# this repo's Claude config and agent skills (brev-cli, cluster-ops) into the
+# this repo's Claude config and agent skills (brev-cli, cluster-ops,
+# inference-optimization, brev-hermes-agent) into the
 # supported agent directories.
 #
 # Usage (one-liner):
@@ -522,7 +523,7 @@ link_dotfiles() {
 # Repo-managed skills linked into every supported agent's skills directory.
 # Add a skill here and it becomes available to Claude Code, Codex, and any
 # other agent that reads ~/.agents/skills.
-AGENT_SKILLS="brev-cli cluster-ops inference-optimization"
+AGENT_SKILLS="brev-cli cluster-ops inference-optimization brev-hermes-agent"
 
 # The agent skill directories the bootstrap wires up. ~/.claude/skills is
 # normally a symlink to the repo's .agent/skills (see link_dotfiles), so skills
