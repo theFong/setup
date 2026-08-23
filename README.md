@@ -14,7 +14,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **CLAUDE.md** — Claude Code instructions that reference the shared style guide
 - **claude/statusline.sh** — Claude Code status line showing session id and context usage (see below)
 - **webshell/** — Browser terminal (ttyd + tmux) with persistent sessions, clickable tabs, and copy-to-clipboard (see below)
-- **.agent/skills/** — Custom agent skills (brev-cli, cluster-ops, inference-optimization, skill-creator, etc.)
+- **.agent/skills/** — Custom agent skills (brev-cli, cluster-ops, inference-optimization, brev-hermes-agent, skill-creator, etc.)
 - **setup.md** — Shell/zsh prompt configuration notes
 
 ## Quick Start (new machine)
@@ -38,8 +38,9 @@ wrong-architecture build still satisfies `command -v`). The bootstrap continues
 attempting the remaining tools after a failure, then exits nonzero if anything
 is still missing or does not run.
 
-The repo-managed skills (**brev-cli**, **cluster-ops**, and
-**inference-optimization**) are linked into Claude Code (`~/.claude/skills`),
+The repo-managed skills (**brev-cli**, **cluster-ops**,
+**inference-optimization**, and **brev-hermes-agent**) are linked into Claude
+Code (`~/.claude/skills`),
 Codex (`~/.codex/skills`), and the shared agent skill directory
 (`~/.agents/skills`). Existing skill installations are preserved. Each path is
 then checked to resolve to a **readable** `SKILL.md` — a dangling symlink would
@@ -58,6 +59,14 @@ bootstrap instead of surfacing later.
   `reference/` for a case study where identical GPUs differed 7x). Also covers
   sizing a model against the KV-cache budget, tensor-parallel and NCCL pitfalls,
   and validating that tool calling survives every hop to the client.
+- **brev-hermes-agent** — build a Hermes Agent on a Brev instance end to end:
+  provision the VM in the region you actually want (the CLI cannot set one),
+  install Hermes, point it at a self-hosted OpenAI-compatible model, expose the
+  web UI behind SSO *and* a firewall, connect Telegram, write skills, and
+  schedule jobs. Leads with the failure modes, because nearly all of them are
+  silent — the installer "succeeds" having done nothing, the model rejects a key
+  you never set, and a skill in the wrong directory is invisible to the agent
+  while looking installed.
 
 It also sets Claude Code's default permission mode to **auto mode** by writing
 `"permissions": {"defaultMode": "auto"}` into `~/.claude/settings.json`
