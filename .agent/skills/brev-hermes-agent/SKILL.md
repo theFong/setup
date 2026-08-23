@@ -1,6 +1,6 @@
 ---
 name: brev-hermes-agent
-description: Build a Hermes Agent on a Brev instance end to end - provision the VM in the region you actually want, install Hermes, point it at a self-hosted OpenAI-compatible model, expose its web UI safely behind SSO, connect Telegram, write skills and a personality, and schedule recurring jobs. Use when creating any new agent on Brev, adding a monitoring/ops/research bot, exposing an agent UI securely, or debugging a Hermes install. Trigger keywords - hermes agent, nous, build an agent, agent on brev, ops bot, monitoring agent, telegram bot, ttyd, webshell, secure link, agent skill, cron job, gateway, reasoning effort, dashboard 1006, agent personality, system prompt.
+description: Build a Hermes Agent on a Brev instance end to end - provision the VM in the region you actually want, install Hermes, point it at a self-hosted OpenAI-compatible model, expose its web UI safely behind SSO, connect Telegram, write skills and a personality, and schedule recurring jobs. Use when creating any new agent on Brev, adding a monitoring/ops/research bot, exposing an agent UI securely, or debugging a Hermes install. Trigger keywords - hermes agent, nous, build an agent, agent on brev, ops bot, monitoring agent, telegram bot, channels, pairing, QR code, ttyd, webshell, secure link, agent skill, cron job, gateway, reasoning effort, dashboard 1006, agent personality, system prompt.
 allowed-tools: Bash, Read, Edit, Write, WebFetch, AskUserQuestion
 ---
 <!--
@@ -149,20 +149,28 @@ Firewall every exposed port to the brev ingress peers, via a `systemd` oneshot
 own mesh IP routes over `lo` and gives a false 200). Full script:
 [reference/exposure.md](reference/exposure.md).
 
-## 6. Telegram (do this in the web UI)
+## 6. Messaging — connect Telegram from the dashboard
 
-Easiest path, and it handles pairing for you:
+**Do this in the web UI, not the CLI.** In the dashboard open **Channels** →
+**create with QR**. Scanning the QR hands off to Telegram on your phone and drives the
+**@BotFather** bot creation for you — you do not create a bot or copy a token by hand.
+Then set that chat as the **home channel** so scheduled jobs have somewhere to deliver.
 
-1. Get a bot token from **@BotFather** in Telegram.
-2. Open the dashboard → messaging/platform settings → **Telegram** → paste the token.
-3. **Set the allowed users before starting it.** Otherwise the first stranger to
-   message the bot claims it (first-DM-wins pairing).
-4. Scan the **QR code** the UI shows to open the chat on your phone, then set your
-   chat as the **home channel** so cron jobs have somewhere to deliver.
-5. `hermes gateway install && hermes gateway start` (real systemd unit).
+Start the gateway once connected:
+```bash
+hermes gateway install && hermes gateway start   # real systemd unit
+```
 
-Equivalent env keys if scripting: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`,
-`TELEGRAM_HOME_CHANNEL` in `~/.hermes/.env`. Long-polling by default — no inbound ports.
+Access control is worth a moment: DM access is **first-DM-wins pairing** unless you
+constrain it. Manage it with `hermes pairing {list,approve,revoke,clear-pending}` —
+`list` shows pending and approved users — or pin an allowlist up front via
+`TELEGRAM_ALLOWED_USERS`. Do this before the bot is reachable by anyone else.
+
+If you are scripting the whole box instead, the same settings live in `~/.hermes/.env`
+(`TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `TELEGRAM_HOME_CHANNEL`) — but the QR
+flow is faster and less error-prone for a one-off. Telegram uses long polling by
+default, so the agent needs **no inbound ports** and no public hostname; this works even
+with the UI firewalled to an SSO ingress.
 
 ## 7. Skills and personality — where the agent becomes itself
 
