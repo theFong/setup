@@ -69,8 +69,6 @@ curl -X POST "$BASE/api/organizations/$ORG/workspaces" \
 Sizing: 2 vCPU / 8 GB is plenty (Hermes' own floor is 1 GB / 1 core without browser
 tools). Skip Playwright and it is a light process.
 
-⚠️ **`brev delete` has hung repeatedly.** Use `DELETE /api/workspaces/{id}` → 202.
-
 ## 2. Provision the box — with `sudo`, not `--startup-script`
 
 **Brev lifecycle scripts run as NON-ROOT.** A `--startup-script` that does anything

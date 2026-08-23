@@ -27,10 +27,6 @@ brev gateway on the API's `sshPort` field. Put a corrected `Host` block **above*
 brev `Include` in `~/.ssh/config` (ssh is first-match-wins), and re-read `sshPort` after
 any recreate — it changes.
 
-**`brev delete` hangs.** Repeatedly, on multiple instances, even with stdin closed,
-while the API answered the same query in <1 s. Not reproducible on demand.
-→ Fallback: `DELETE /api/workspaces/{id}` → 202.
-
 ## Hermes install
 
 **Missing `libatomic1` → `exit 127` + infinite Node re-download.**
