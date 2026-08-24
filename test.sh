@@ -597,11 +597,32 @@ fi
 # Model discovery must support a key that cannot access the preferred model,
 # choose a deterministic fallback, and reject explicit inaccessible defaults.
 if command -v python3 >/dev/null 2>&1; then
-  omp_port=39997
   mkdir -p "$scratch/ompsrv/v1"
   printf '{"data":[{"id":"zeta-model"},{"id":"some-other-model"}]}' > "$scratch/ompsrv/v1/models"
-  python3 -m http.server "$omp_port" --bind 127.0.0.1 --directory "$scratch/ompsrv" >/dev/null 2>&1 &
+  omp_port_file="$scratch/omp-port"
+  python3 - "$scratch/ompsrv" "$omp_port_file" >"$scratch/omp-server.log" 2>&1 <<'PYEOF' &
+import functools
+import http.server
+import socketserver
+import sys
+
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
+with socketserver.TCPServer(("127.0.0.1", 0), handler) as server:
+    with open(sys.argv[2], "w") as handle:
+        handle.write(str(server.server_address[1]))
+    server.serve_forever()
+PYEOF
   omp_srv=$!
+  for _ in $(seq 1 50); do
+    [ -s "$omp_port_file" ] && break
+    sleep 0.1
+  done
+  if [ ! -s "$omp_port_file" ]; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP loopback model server did not start: $(cat "$scratch/omp-server.log")" >&2
+    exit 1
+  fi
+  omp_port=$(cat "$omp_port_file")
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     curl -s -o /dev/null -m 1 "http://127.0.0.1:$omp_port/" && break
     sleep 0.3
