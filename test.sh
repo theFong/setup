@@ -539,6 +539,14 @@ if ! grep -q 'other.example.com' "$scratch/omp/models.yml"; then
   echo "FAIL: merge_models_yml dropped an unrelated provider" >&2
   exit 1
 fi
+if ! grep -A8 '^  webster:$' "$scratch/omp/models.yml" | grep -q '^      type: litellm$'; then
+  echo "FAIL: merge_models_yml did not enable LiteLLM model discovery" >&2
+  exit 1
+fi
+if grep -A10 '^  webster:$' "$scratch/omp/models.yml" | grep -q 'modelOverrides:'; then
+  echo "FAIL: merge_models_yml still hardcodes a Webster model override" >&2
+  exit 1
+fi
 # GNU stat first, then BSD/macOS. The order matters and both must be quieted:
 # GNU reads -f as --file-system and prints a block of filesystem info for the
 # file while failing on the format string, so trying BSD first captures that
@@ -579,43 +587,173 @@ fi
 if (
   export SETUP_SKIP_MAIN=1
   source ./omp-setup.sh
+  MODEL_ID=glm-5.2
   assert_omp_endpoint "http://127.0.0.1:1/v1" sk-irrelevant
 ) >/dev/null 2>&1; then
   echo "FAIL: assert_omp_endpoint accepted an unreachable endpoint" >&2
   exit 1
 fi
 
-# ...and must also fail on an endpoint that answers but does not serve the
-# model being made the default — otherwise reachability alone would pass.
+# Model discovery must support a key that cannot access the preferred model,
+# choose a deterministic fallback, and reject explicit inaccessible defaults.
 if command -v python3 >/dev/null 2>&1; then
-  omp_port=39997
   mkdir -p "$scratch/ompsrv/v1"
-  printf '{"data":[{"id":"some-other-model"}]}' > "$scratch/ompsrv/v1/models"
-  python3 -m http.server "$omp_port" --bind 127.0.0.1 --directory "$scratch/ompsrv" >/dev/null 2>&1 &
+  printf '{"data":[{"id":"zeta-model"},{"id":"some-other-model"}]}' > "$scratch/ompsrv/v1/models"
+  omp_port_file="$scratch/omp-port"
+  python3 - "$scratch/ompsrv" "$omp_port_file" >"$scratch/omp-server.log" 2>&1 <<'PYEOF' &
+import functools
+import http.server
+import socketserver
+import sys
+
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
+with socketserver.TCPServer(("127.0.0.1", 0), handler) as server:
+    with open(sys.argv[2], "w") as handle:
+        handle.write(str(server.server_address[1]))
+    server.serve_forever()
+PYEOF
   omp_srv=$!
+  for _ in $(seq 1 50); do
+    [ -s "$omp_port_file" ] && break
+    sleep 0.1
+  done
+  if [ ! -s "$omp_port_file" ]; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP loopback model server did not start: $(cat "$scratch/omp-server.log")" >&2
+    exit 1
+  fi
+  omp_port=$(cat "$omp_port_file")
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     curl -s -o /dev/null -m 1 "http://127.0.0.1:$omp_port/" && break
     sleep 0.3
   done
+
+  omp_dynamic_default=$(
+    export SETUP_SKIP_MAIN=1 OMP_BASE_URL="http://127.0.0.1:$omp_port/v1"
+    source ./omp-setup.sh
+    API_KEY=sk-irrelevant
+    role_default() { :; }
+    discover_models
+    select_default_model
+    printf '%s\n' "$DEFAULT_MODEL"
+  )
+  omp_dynamic_default=$(printf '%s\n' "$omp_dynamic_default" | tail -n 1)
+  if [ "$omp_dynamic_default" != "webster/some-other-model" ]; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP discovery did not select the first accessible model (got '$omp_dynamic_default')" >&2
+    exit 1
+  fi
+
+  # Endpoint verification still checks that the selected default remains in
+  # the key's current catalog, rather than accepting reachability alone.
   if (
     export SETUP_SKIP_MAIN=1
     source ./omp-setup.sh
+    MODEL_ID=glm-5.2
     assert_omp_endpoint "http://127.0.0.1:$omp_port/v1" sk-irrelevant
   ) >/dev/null 2>&1; then
     kill "$omp_srv" 2>/dev/null || true
     echo "FAIL: assert_omp_endpoint accepted an endpoint not serving the default model" >&2
     exit 1
   fi
-  # ...and must pass when the model IS served, so the two checks above cannot be
-  # satisfied by an assertion that simply always fails.
-  printf '{"data":[{"id":"glm-5.2"}]}' > "$scratch/ompsrv/v1/models"
+  # ...and pass for the access-aware fallback.
   if ! (
     export SETUP_SKIP_MAIN=1
     source ./omp-setup.sh
+    MODEL_ID=some-other-model
     assert_omp_endpoint "http://127.0.0.1:$omp_port/v1" sk-irrelevant
   ) >/dev/null 2>&1; then
     kill "$omp_srv" 2>/dev/null || true
-    echo "FAIL: assert_omp_endpoint rejected an endpoint serving the default model" >&2
+    echo "FAIL: assert_omp_endpoint rejected an accessible dynamic default" >&2
+    exit 1
+  fi
+
+  if (
+    export SETUP_SKIP_MAIN=1 OMP_BASE_URL="http://127.0.0.1:$omp_port/v1" OMP_MODEL=missing-model
+    source ./omp-setup.sh
+    API_KEY=sk-irrelevant
+    role_default() { :; }
+    discover_models
+    select_default_model
+  ) >/dev/null 2>&1; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP accepted an explicit model inaccessible to the key" >&2
+    exit 1
+  fi
+
+  # An accessible installed Webster default wins over both the preference and
+  # alphabetical fallback, so a re-run does not unexpectedly switch models.
+  omp_preserved_default=$(
+    export SETUP_SKIP_MAIN=1 OMP_BASE_URL="http://127.0.0.1:$omp_port/v1"
+    source ./omp-setup.sh
+    API_KEY=sk-irrelevant
+    role_default() { printf 'webster/zeta-model:max\n'; }
+    discover_models
+    select_default_model
+    printf '%s\n' "$DEFAULT_MODEL"
+  )
+  omp_preserved_default=$(printf '%s\n' "$omp_preserved_default" | tail -n 1)
+  if [ "$omp_preserved_default" != "webster/zeta-model:max" ]; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP did not preserve an accessible installed default and reasoning preset" >&2
+    exit 1
+  fi
+
+  omp_explicit_default=$(
+    export SETUP_SKIP_MAIN=1 OMP_BASE_URL="http://127.0.0.1:$omp_port/v1" OMP_MODEL=some-other-model:high
+    source ./omp-setup.sh
+    API_KEY=sk-irrelevant
+    role_default() { :; }
+    discover_models
+    select_default_model
+    printf '%s\n' "$DEFAULT_MODEL"
+  )
+  omp_explicit_default=$(printf '%s\n' "$omp_explicit_default" | tail -n 1)
+  if [ "$omp_explicit_default" != "webster/some-other-model:high" ]; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP did not preserve an accessible explicit reasoning preset" >&2
+    exit 1
+  fi
+
+  printf '{"models":["zeta-model",{"id":"glm-5.2"}]}' > "$scratch/ompsrv/v1/models"
+  omp_preferred_default=$(
+    export SETUP_SKIP_MAIN=1 OMP_BASE_URL="http://127.0.0.1:$omp_port/v1"
+    source ./omp-setup.sh
+    API_KEY=sk-irrelevant
+    role_default() { :; }
+    discover_models
+    select_default_model
+    printf '%s\n' "$DEFAULT_MODEL"
+  )
+  omp_preferred_default=$(printf '%s\n' "$omp_preferred_default" | tail -n 1)
+  if [ "$omp_preferred_default" != "webster/glm-5.2" ]; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP did not prefer glm-5.2 when accessible (got '$omp_preferred_default')" >&2
+    exit 1
+  fi
+
+  # A valid but empty catalog means the key has no usable access and must fail.
+  printf '{"data":[]}' > "$scratch/ompsrv/v1/models"
+  if (
+    export SETUP_SKIP_MAIN=1 OMP_BASE_URL="http://127.0.0.1:$omp_port/v1"
+    source ./omp-setup.sh
+    API_KEY=sk-irrelevant
+    discover_models
+  ) >/dev/null 2>&1; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP accepted an empty model catalog" >&2
+    exit 1
+  fi
+
+  printf '{not-json' > "$scratch/ompsrv/v1/models"
+  if (
+    export SETUP_SKIP_MAIN=1 OMP_BASE_URL="http://127.0.0.1:$omp_port/v1"
+    source ./omp-setup.sh
+    API_KEY=sk-irrelevant
+    discover_models
+  ) >/dev/null 2>&1; then
+    kill "$omp_srv" 2>/dev/null || true
+    echo "FAIL: OMP accepted an invalid model catalog" >&2
     exit 1
   fi
   kill "$omp_srv" 2>/dev/null || true
