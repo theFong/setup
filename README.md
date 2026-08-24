@@ -198,9 +198,11 @@ Notes baked into the setup (hard-won):
 ## omp (oh-my-pi)
 
 `omp-setup.sh` installs [omp](https://omp.sh) if it isn't already present, points
-it at the Brev-hosted `webster` model proxy, defaults it to **GLM 5.2**, and turns
-on **nerd mode** — Nerd Font symbols plus the `nerd` status line preset
-(tok/sec spark, TTFT, context %, cost, cache reads, elapsed time).
+it at the Brev-hosted `webster` model proxy, discovers the models accessible to
+the supplied key, and turns on **nerd mode** — Nerd Font symbols plus the `nerd`
+status line preset (tok/sec spark, TTFT, context %, cost, cache reads, elapsed
+time). OMP's model picker refreshes from the proxy, so newly granted models show
+up without editing this repository or installer.
 
 One line on a new machine — note the key goes on the **right** of the pipe, so
 the `bash` running the script sees it:
@@ -221,6 +223,12 @@ From a local clone:
 OMP_WEBSTER_API_KEY=sk-... ~/.setup/omp-setup.sh
 ```
 
+The installer preserves the current `webster/...` default when that model is
+still accessible. On a fresh install it prefers `glm-5.2` when available, then
+falls back to the first accessible model. Set `OMP_MODEL=<model-selector>` to
+require a particular accessible default (reasoning suffixes such as `:max` are
+preserved); the install fails clearly if the key cannot use its base model.
+
 Or without the env var — run from a terminal and it prompts for the key (hidden
 input). Piping to `bash` consumes stdin, so a piped run cannot prompt and exits
 non-zero instead of writing an empty key:
@@ -240,7 +248,7 @@ What it writes:
 | Where | What |
 |---|---|
 | `~/.omp/agent/models.yml` | `webster` provider: base URL, API key, LiteLLM discovery (mode `0600`) |
-| `~/.omp/agent/config.yml` | `symbolPreset: nerd`, `statusLine.preset: nerd`, `modelRoles.default: webster/glm-5.2` |
+| `~/.omp/agent/config.yml` | `symbolPreset: nerd`, `statusLine.preset: nerd`, and the access-aware `modelRoles.default` |
 
 It is idempotent and merge-safe: re-running reuses the key already on disk,
 preserves other providers and other model roles (`advisor`, `smol`, `tiny`, …),
@@ -251,11 +259,11 @@ and backs up `models.yml` to `models.yml.bak` before any change.
 
 Verification runs on every install (`assert_omp_config` / `assert_omp_endpoint` /
 `assert_omp_smoke`, per [STYLE_GUIDE.md](STYLE_GUIDE.md)): it reads the settings
-back out of `omp`, lists models from the endpoint to confirm the URL and key are
-good and that `glm-5.2` is served, then sends a real one-shot prompt through the
-*configured default* model and asserts the reply. Failure paths — dead endpoint,
-endpoint missing the model, no API key, stale duplicate provider entry — are
-covered in `test.sh`.
+back out of `omp`, authenticates to the endpoint and confirms the configured
+default is in that key's non-empty live model catalog, then sends a real one-shot
+prompt through the *configured default* model and asserts the reply. Failure
+paths — dead endpoint, empty or invalid catalog, inaccessible explicit/default
+model, no API key, stale duplicate provider entry — are covered in `test.sh`.
 
 It is not wired into `install.sh`, because it needs a secret the bootstrap does
 not have. Run it separately after the bootstrap.

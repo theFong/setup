@@ -5,7 +5,8 @@
 #
 #   * installs omp if it is not already on PATH
 #   * registers the webster provider (OpenAI-compatible LiteLLM proxy)
-#   * defaults the agent to glm-5.2
+#   * discovers every model accessible to the supplied key
+#   * preserves an accessible Webster default, otherwise prefers glm-5.2
 #   * turns on "nerd mode": Nerd Font symbols + the nerd status line preset
 #     (tok/sec spark, TTFT, context %, cost, cache reads, elapsed time)
 #
@@ -14,6 +15,9 @@
 #   ./omp-setup.sh                      # prompts for the key
 #   ./omp-setup.sh --check              # verify an existing install, change nothing
 #   ./omp-setup.sh --no-smoke           # skip the live model round-trip
+#
+# Env overrides: OMP_WEBSTER_API_KEY / WEBSTER_API_KEY, OMP_BASE_URL,
+#                OMP_MODEL, OMP_SKIP_PROFILE
 #
 # Every run asserts the resulting on-disk state and the live endpoint, per
 # STYLE_GUIDE.md. Negative paths are covered in test.sh, which sources this
@@ -26,8 +30,14 @@ set -euo pipefail
 
 BASE_URL="${OMP_BASE_URL:-https://webster-models-extnode-3gdrajbr0hiykknxzitck9yaiwo.apps.run.brev.nvidia.com/v1}"
 PROVIDER_ID="webster"
-MODEL_ID="glm-5.2"
-DEFAULT_MODEL="${PROVIDER_ID}/${MODEL_ID}"
+PREFERRED_MODEL_ID="glm-5.2"
+REQUESTED_MODEL="${OMP_MODEL:-}"
+MODEL_ID=""
+MODEL_EXPLICIT=0
+[ -n "$REQUESTED_MODEL" ] && MODEL_EXPLICIT=1
+DEFAULT_MODEL=""
+DISCOVERED_MODEL_IDS=""
+DISCOVERY_STATUS=""
 NPM_PKG="@oh-my-pi/pi-coding-agent"
 
 MARK_BEGIN="  # >>> theFong/setup: ${PROVIDER_ID} provider (managed) >>>"
@@ -129,6 +139,164 @@ resolve_key() {
   [ -n "$API_KEY" ] || die "empty API key"
 }
 
+# ------------------------------------------------------------- model discovery
+
+# normalize_model_ids RESPONSE_FILE — print one sorted model id per line from
+# either the OpenAI `.data` shape or LiteLLM's `.models` shape. jq is preferred,
+# with python3 as a portability fallback for standalone one-line installs.
+normalize_model_ids() {
+  local response_file="$1"
+  if have jq; then
+    jq -r '
+      (.data // .models // []) as $models
+      | if ($models | type) != "array" then error("model list is not an array") else $models end
+      | [
+          .[]
+          | if type == "string" then .
+            elif type == "object" then (.id // .slug // .model // empty)
+            else empty
+            end
+          | select(type == "string" and length > 0)
+        ]
+      | unique
+      | sort
+      | .[]
+    ' "$response_file"
+    return
+  fi
+  if have python3; then
+    python3 - "$response_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+models = payload.get("data", payload.get("models", []))
+if not isinstance(models, list):
+    raise SystemExit("model list is not an array")
+ids = set()
+for item in models:
+    if isinstance(item, str):
+        model_id = item
+    elif isinstance(item, dict):
+        model_id = item.get("id") or item.get("slug") or item.get("model")
+    else:
+        continue
+    if isinstance(model_id, str) and model_id:
+        ids.add(model_id)
+print("\n".join(sorted(ids)))
+PY
+    return
+  fi
+  warn "need jq or python3 to parse the endpoint's model catalog"
+  return 1
+}
+
+# fetch_omp_models URL KEY — authenticate to /models and update the discovered
+# catalog. The key is supplied to curl over stdin rather than exposed in argv.
+fetch_omp_models() {
+  local url="$1" key="$2" response_file http_status normalized
+  have curl || { DISCOVERY_STATUS="no-curl"; return 1; }
+  if ! have jq && ! have python3; then
+    DISCOVERY_STATUS="no-parser"
+    return 1
+  fi
+  response_file="$(mktemp)"
+  DISCOVERY_STATUS=""
+  if ! http_status=$(printf 'Authorization: Bearer %s\n' "$key" \
+      | curl -sS -o "$response_file" -w '%{http_code}' --max-time 30 \
+          --header @- "$url/models" 2>/dev/null); then
+    DISCOVERY_STATUS="unreachable"
+    rm -f "$response_file"
+    return 1
+  fi
+
+  case "$http_status" in
+    2*)
+      if normalized="$(normalize_model_ids "$response_file" 2>/dev/null)"; then
+        if [ -n "$normalized" ]; then
+          DISCOVERED_MODEL_IDS="$normalized"
+          DISCOVERY_STATUS="ok"
+          rm -f "$response_file"
+          return 0
+        fi
+        DISCOVERY_STATUS="empty"
+      else
+        DISCOVERY_STATUS="invalid"
+      fi
+      ;;
+    401|403) DISCOVERY_STATUS="auth-$http_status" ;;
+    *)       DISCOVERY_STATUS="http-$http_status" ;;
+  esac
+  rm -f "$response_file"
+  return 1
+}
+
+model_is_discovered() {
+  [ -n "$1" ] && printf '%s\n' "$DISCOVERED_MODEL_IDS" | grep -Fqx -- "$1"
+}
+
+discover_models() {
+  local count
+  if fetch_omp_models "$BASE_URL" "$API_KEY"; then
+    count=$(printf '%s\n' "$DISCOVERED_MODEL_IDS" | awk 'NF { n++ } END { print n + 0 }')
+    log "discovered $count Webster model(s) accessible to this key"
+    return 0
+  fi
+  case "$DISCOVERY_STATUS" in
+    auth-*)  warn "endpoint rejected the configured key (HTTP ${DISCOVERY_STATUS#auth-})" ;;
+    empty)   warn "endpoint accepted the key but advertised no accessible models" ;;
+    invalid) warn "endpoint returned an invalid model catalog" ;;
+    no-curl) warn "curl not found; cannot discover accessible models" ;;
+    no-parser) warn "need jq or python3 to parse the endpoint's model catalog" ;;
+    http-*)  warn "endpoint returned HTTP ${DISCOVERY_STATUS#http-} while listing models" ;;
+    *)       warn "endpoint unreachable while listing models" ;;
+  esac
+  return 1
+}
+
+select_default_model() {
+  local installed_default installed_selector installed_id
+  if [ "$MODEL_EXPLICIT" = 1 ]; then
+    if model_is_discovered "$REQUESTED_MODEL"; then
+      MODEL_ID="$REQUESTED_MODEL"
+    else
+      MODEL_ID="${REQUESTED_MODEL%:*}"
+      if [ "$MODEL_ID" = "$REQUESTED_MODEL" ] || ! model_is_discovered "$MODEL_ID"; then
+        warn "OMP_MODEL=$REQUESTED_MODEL is not accessible to this key"
+        return 1
+      fi
+    fi
+    DEFAULT_MODEL="${PROVIDER_ID}/${REQUESTED_MODEL}"
+  else
+    installed_default="$(role_default)"
+    case "$installed_default" in
+      "$PROVIDER_ID"/*) installed_selector="${installed_default#"$PROVIDER_ID"/}" ;;
+      *) installed_selector="" ;;
+    esac
+    if [ -n "$installed_selector" ] && model_is_discovered "$installed_selector"; then
+      MODEL_ID="$installed_selector"
+      DEFAULT_MODEL="$installed_default"
+    else
+      installed_id="${installed_selector%:*}"
+    fi
+    if [ -z "$MODEL_ID" ]; then
+      if [ -n "$installed_id" ] && [ "$installed_id" != "$installed_selector" ] \
+          && model_is_discovered "$installed_id"; then
+        MODEL_ID="$installed_id"
+        DEFAULT_MODEL="$installed_default"
+      elif model_is_discovered "$PREFERRED_MODEL_ID"; then
+        MODEL_ID="$PREFERRED_MODEL_ID"
+      else
+        MODEL_ID="$(printf '%s\n' "$DISCOVERED_MODEL_IDS" | sed -n '1p')"
+      fi
+    fi
+  fi
+  [ -n "$MODEL_ID" ] || { warn "could not select a default Webster model"; return 1; }
+  [ -n "$DEFAULT_MODEL" ] || DEFAULT_MODEL="${PROVIDER_ID}/${MODEL_ID}"
+  log "selected default model $DEFAULT_MODEL"
+}
+
 # ------------------------------------------------------------------ models.yml
 
 # merge_models_yml FILE KEY — splice the managed provider block into FILE,
@@ -141,8 +309,8 @@ merge_models_yml() {
 
   cat >"$block" <<-YAML
 	$MARK_BEGIN
-	  # Brev-hosted LiteLLM proxy (OpenAI-compatible). Models are discovered from
-	  # the proxy and selectable as ${PROVIDER_ID}/<model-id>, e.g. ${DEFAULT_MODEL}.
+	  # Brev-hosted LiteLLM proxy (OpenAI-compatible). OMP discovers every model
+	  # accessible to this key and exposes it as ${PROVIDER_ID}/<model-id>.
 	  ${PROVIDER_ID}:
 	    baseUrl: ${BASE_URL}
 	    apiKey: ${key}
@@ -150,9 +318,6 @@ merge_models_yml() {
 	    authHeader: true
 	    discovery:
 	      type: litellm
-	    modelOverrides:
-	      ${MODEL_ID}:
-	        contextWindow: 350000
 	$MARK_END
 	YAML
 
@@ -263,22 +428,27 @@ assert_omp_config() {
   grep -q "^    baseUrl: $BASE_URL$" "$AGENT_DIR/models.yml" 2>/dev/null \
     || { warn "baseUrl is not set to $BASE_URL in models.yml"; return 1; }
   ok "baseUrl = $BASE_URL"
+  grep -A8 "^  ${PROVIDER_ID}:$" "$AGENT_DIR/models.yml" 2>/dev/null \
+    | grep -q '^      type: litellm$' \
+    || { warn "LiteLLM discovery is not enabled for $PROVIDER_ID in models.yml"; return 1; }
+  ok "LiteLLM model discovery is enabled"
 }
 
 # assert_omp_endpoint URL KEY — the base URL and key must actually serve the
 # model we just made the default. A config pointing at a dead or wrong endpoint
 # looks fine on disk and fails on first use.
 assert_omp_endpoint() {
-  local url="$1" key="$2" out
-  have curl || { warn "curl not found; cannot verify the endpoint"; return 1; }
-  if ! out="$(curl -fsS --max-time 30 -H "Authorization: Bearer $key" "$url/models" 2>&1)"; then
-    warn "endpoint unreachable or key rejected: $out"
+  local url="$1" key="$2" count
+  if ! fetch_omp_models "$url" "$key"; then
+    warn "could not refresh endpoint model catalog ($DISCOVERY_STATUS)"
     return 1
   fi
-  case "$out" in
-    *"\"$MODEL_ID\""*) ok "endpoint reachable, $MODEL_ID is served"; return 0 ;;
-    *) warn "endpoint reachable but does not serve '$MODEL_ID'"; return 1 ;;
-  esac
+  model_is_discovered "$MODEL_ID" || {
+    warn "endpoint is reachable but no longer serves the configured default '$MODEL_ID'"
+    return 1
+  }
+  count=$(printf '%s\n' "$DISCOVERED_MODEL_IDS" | awk 'NF { n++ } END { print n + 0 }')
+  ok "endpoint serves $count accessible model(s), including $MODEL_ID"
 }
 
 # assert_omp_smoke — one real round-trip. No --model flag: this exercises the
@@ -309,14 +479,15 @@ usage() {
   fi
   cat <<EOF
 omp-setup.sh — install omp and point it at the Brev-hosted $PROVIDER_ID endpoint,
-defaulting to $MODEL_ID with nerd mode enabled.
+discovering accessible models and enabling nerd mode.
 
   WEBSTER_API_KEY=sk-... omp-setup.sh              install and verify
   omp-setup.sh --check                             verify only, change nothing
   omp-setup.sh --no-smoke                          skip the live model round-trip
 
-The key comes from OMP_WEBSTER_API_KEY or WEBSTER_API_KEY; when the script is
-run from a terminal (not piped) it prompts instead.
+The key comes from OMP_WEBSTER_API_KEY or WEBSTER_API_KEY; OMP_MODEL optionally
+selects an accessible default. When run from a terminal, the script prompts for
+the key if neither key variable is set.
 EOF
 }
 
@@ -338,6 +509,8 @@ main() {
   mkdir -p "$AGENT_DIR"
 
   resolve_key
+  discover_models || die "model discovery failed"
+  select_default_model || die "default model selection failed"
 
   if [ "$CHECK_ONLY" = 0 ]; then
     log "registering the $PROVIDER_ID provider"
