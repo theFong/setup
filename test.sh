@@ -672,6 +672,8 @@ fi
 # Sourced in subshells: it defines its own log/have/record_failure helpers,
 # which would otherwise shadow install.sh's for the tests above.
 
+pi_test_models='[{"id":"test-model","name":"Test Model (Webster)","reasoning":true,"input":["text"],"contextWindow":131072,"maxTokens":8192}]'
+
 # resolve_api_key must fail rather than silently writing a keyless config when
 # no key is available and prompting is disabled (cron, provisioning, CI).
 if (
@@ -704,6 +706,7 @@ if (
   export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent"
   source ./pi-setup.sh
   API_KEY=test-key
+  DISCOVERED_MODELS="$pi_test_models"
   configure_models
 ) >/dev/null 2>&1; then
   echo "FAIL: pi configure_models unexpectedly succeeded on invalid JSON" >&2
@@ -722,6 +725,7 @@ if ! (
   export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent"
   source ./pi-setup.sh
   API_KEY=test-key
+  DISCOVERED_MODELS="$pi_test_models"
   configure_models
 ) >/dev/null 2>&1; then
   echo "FAIL: pi configure_models failed on a config with an existing provider" >&2
@@ -729,6 +733,145 @@ if ! (
 fi
 if ! grep -q 'other.example.com' "$scratch/pi-agent/models.json"; then
   echo "FAIL: pi configure_models dropped an unrelated provider during a merge" >&2
+  exit 1
+fi
+
+# Discovery must write exactly the models returned for this key, carry through
+# per-model limits, choose an accessible default when glm-5.2 is absent, and be
+# byte-identical on a safe re-run.
+pi_dynamic_dir="$scratch/pi-agent-dynamic"
+if have python3; then
+  python3 - "$scratch/pi-discovery-port" >/dev/null 2>&1 <<'PYEOF' &
+import http.server, json, socketserver, sys, threading
+
+class ScopedModels(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.headers.get("Authorization") == "Bearer empty-key":
+            body = json.dumps({"data": []}).encode()
+            self.send_response(200)
+        elif self.headers.get("Authorization") == "Bearer scoped-key":
+            body = json.dumps({"data": [
+                {"id": "future-model", "max_input_tokens": 222000, "max_output_tokens": 12000},
+                {"id": "access-only", "max_input_tokens": 64000, "max_output_tokens": 4096},
+                {"id": "metadata-light"},
+            ]}).encode()
+            self.send_response(200)
+        else:
+            body = b""
+            self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+with socketserver.TCPServer(("127.0.0.1", 0), ScopedModels) as srv:
+    with open(sys.argv[1], "w") as fh:
+        fh.write(str(srv.server_address[1]))
+    threading.Timer(30, srv.shutdown).start()
+    srv.serve_forever()
+PYEOF
+  pi_discovery_pid=$!
+  for _ in $(seq 1 50); do [ -s "$scratch/pi-discovery-port" ] && break; sleep 0.1; done
+  if [ -s "$scratch/pi-discovery-port" ]; then
+    if ! (
+      export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$pi_dynamic_dir"
+      export PI_BASE_URL="http://127.0.0.1:$(cat "$scratch/pi-discovery-port")/v1"
+      source ./pi-setup.sh
+      API_KEY=scoped-key
+      discover_models
+      select_default_model
+      configure_models
+      configure_settings
+      assert_pi_provider
+      assert_pi_default_model
+      assert_pi_endpoint
+    ) >/dev/null 2>&1; then
+      echo "FAIL: pi dynamic model discovery/configuration failed" >&2
+      kill "$pi_discovery_pid" 2>/dev/null || true
+      exit 1
+    fi
+    if ! jq -e '
+        (.providers.webster.models | map(.id)) == ["access-only", "future-model", "metadata-light"]
+        and (.providers.webster.models[0].contextWindow == 64000)
+        and (.providers.webster.models[0].maxTokens == 4096)
+        and (.providers.webster.models[1].contextWindow == 222000)
+        and (.providers.webster.models[1].maxTokens == 12000)
+        and (.providers.webster.models[2].contextWindow == 320000)
+        and (.providers.webster.models[2].maxTokens == 32768)
+      ' "$pi_dynamic_dir/models.json" >/dev/null || \
+      [ "$(jq -r '.defaultModel' "$pi_dynamic_dir/settings.json")" != "access-only" ]; then
+      echo "FAIL: pi did not persist the key-scoped models, limits, and accessible default" >&2
+      kill "$pi_discovery_pid" 2>/dev/null || true
+      exit 1
+    fi
+    pi_dynamic_first=$(cat "$pi_dynamic_dir/models.json")
+    if ! (
+      export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$pi_dynamic_dir"
+      export PI_BASE_URL="http://127.0.0.1:$(cat "$scratch/pi-discovery-port")/v1"
+      source ./pi-setup.sh
+      API_KEY=scoped-key
+      discover_models
+      select_default_model
+      configure_models
+    ) >/dev/null 2>&1 || [ "$(cat "$pi_dynamic_dir/models.json")" != "$pi_dynamic_first" ]; then
+      echo "FAIL: pi dynamic model discovery is not idempotent" >&2
+      kill "$pi_discovery_pid" 2>/dev/null || true
+      exit 1
+    fi
+    if (
+      export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent-empty"
+      export PI_BASE_URL="http://127.0.0.1:$(cat "$scratch/pi-discovery-port")/v1"
+      source ./pi-setup.sh
+      API_KEY=empty-key
+      discover_models
+    ) >/dev/null 2>&1; then
+      echo "FAIL: pi discovery accepted a key with no accessible models" >&2
+      kill "$pi_discovery_pid" 2>/dev/null || true
+      exit 1
+    fi
+  else
+    echo "WARN: skipping pi dynamic discovery tests (loopback server did not start)" >&2
+  fi
+  kill "$pi_discovery_pid" 2>/dev/null || true
+  wait "$pi_discovery_pid" 2>/dev/null || true
+fi
+
+# A transiently unreachable endpoint must preserve an already installed model
+# list so an offline re-run does not erase working configuration.
+if [ -f "$pi_dynamic_dir/models.json" ] && ! (
+  export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent-dynamic"
+  export PI_BASE_URL="http://127.0.0.1:9/v1"
+  source ./pi-setup.sh
+  API_KEY=scoped-key
+  discover_models
+  [ "$(printf '%s' "$DISCOVERED_MODELS" | jq 'length')" = 3 ]
+) >/dev/null 2>&1; then
+  echo "FAIL: pi offline discovery did not reuse the installed model list" >&2
+  exit 1
+fi
+
+# An explicit default must be authorized, and a fresh discovery-skipped install
+# must not silently fall back to a hardcoded model.
+if (
+  export SETUP_SKIP_MAIN=1 PI_MODEL=not-authorized
+  source ./pi-setup.sh
+  DISCOVERED_MODELS="$pi_test_models"
+  select_default_model
+) >/dev/null 2>&1; then
+  echo "FAIL: pi accepted an explicit default that was not discovered" >&2
+  exit 1
+fi
+if (
+  export SETUP_SKIP_MAIN=1 PI_SKIP_ENDPOINT_CHECK=1
+  export PI_CODING_AGENT_DIR="$scratch/pi-agent-fresh-skipped"
+  unset PI_MODEL
+  source ./pi-setup.sh
+  discover_models
+) >/dev/null 2>&1; then
+  echo "FAIL: pi fresh install skipped discovery without an explicit model" >&2
   exit 1
 fi
 
@@ -762,6 +905,7 @@ PYEOF
       export PI_BASE_URL="http://127.0.0.1:$(cat "$scratch/port")/v1"
       source ./pi-setup.sh
       API_KEY=wrong-key
+      DISCOVERED_MODELS="$pi_test_models"
       configure_models >/dev/null
       assert_pi_endpoint
     ) >/dev/null 2>&1; then
@@ -781,6 +925,7 @@ if (
   export SETUP_SKIP_MAIN=1 PI_CODING_AGENT_DIR="$scratch/pi-agent-perms"
   source ./pi-setup.sh
   API_KEY=test-key
+  DISCOVERED_MODELS="$pi_test_models"
   configure_models
 ) >/dev/null 2>&1; then
   # Same GNU-then-BSD stat ordering as the omp check above.

@@ -104,6 +104,7 @@ jobs:
         env:
           WEBSTER_API_KEY: ci-test-key
           PI_SKIP_ENDPOINT_CHECK: "1"
+          PI_MODEL: ci-test-model
         run: cat pi-setup.sh | bash
 
       - name: Verify pi health check passes standalone
@@ -115,6 +116,7 @@ jobs:
         env:
           WEBSTER_API_KEY: ci-test-key
           PI_SKIP_ENDPOINT_CHECK: "1"
+          PI_MODEL: ci-test-model
         run: |
           ./pi-setup.sh | tee pi-rerun.log
           grep -q "tokps-session extension unchanged" pi-rerun.log

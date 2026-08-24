@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # pi-setup.sh — install the pi coding agent and point it at the Brev-hosted
-# "webster" model endpoint, with glm-5.2 as the default model and a footer
-# status line (tok/s, active model, session id).
+# "webster" model endpoint, discovering the models accessible to the supplied
+# key and adding a footer status line (tok/s, active model, session id).
 #
-# The sibling of omp-setup.sh: same endpoint and model, different agent.
+# The sibling of omp-setup.sh: same endpoint, different agent.
 #
 # Installs the npm package, writes ~/.pi/agent/models.json (provider + models),
 # sets the default provider/model in ~/.pi/agent/settings.json, and drops the
@@ -96,12 +96,21 @@ DEFAULT_BASE_URL="https://webster-models-extnode-3gdrajbr0hiykknxzitck9yaiwo.app
 
 PROVIDER="${PI_PROVIDER:-webster}"
 BASE_URL="${PI_BASE_URL:-$DEFAULT_BASE_URL}"
-MODEL="${PI_MODEL:-glm-5.2}"
-# The endpoint's real limits: vLLM rejects max_tokens beyond max_model_len,
-# and pi reserves output tokens against the context window, so these must
-# match the backend rather than the proxy's advertised metadata.
-CONTEXT_WINDOW="${PI_CONTEXT_WINDOW:-320000}"
-MAX_TOKENS="${PI_MAX_TOKENS:-32768}"
+PREFERRED_MODEL="glm-5.2"
+MODEL="${PI_MODEL:-}"
+MODEL_EXPLICIT=0
+[ -n "$MODEL" ] && MODEL_EXPLICIT=1
+
+# Discovery normally supplies each model's context limit. These values are
+# only a fallback for an explicit manual model or a cap on advertised output;
+# pi reserves maxTokens inside contextWindow, so an endpoint that advertises
+# both as the same huge number would otherwise leave no useful prompt space.
+DEFAULT_CONTEXT_WINDOW=320000
+DEFAULT_MAX_TOKENS=32768
+CONTEXT_WINDOW_OVERRIDE="${PI_CONTEXT_WINDOW:-}"
+MAX_TOKENS_OVERRIDE="${PI_MAX_TOKENS:-}"
+DISCOVERED_MODELS='[]'
+DISCOVERY_STATUS=""
 
 # pi reads its config from PI_CODING_AGENT_DIR, defaulting to ~/.pi/agent.
 AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
@@ -122,7 +131,7 @@ VERIFY_ONLY=0
 # `curl ... | bash` there is no script on disk to read.
 usage() {
   cat <<'USAGE'
-pi-setup.sh — install pi and point it at the Brev-hosted webster endpoint.
+pi-setup.sh — install pi and discover models from the Brev-hosted webster endpoint.
 
   ./pi-setup.sh                    configure, merging into any existing setup
   ./pi-setup.sh --exclusive        make webster the ONLY configured provider
@@ -364,10 +373,214 @@ jq_edit() {
   return 1
 }
 
-# The provider entry plus the model definitions pi needs. pi has no endpoint
-# discovery, so every model has to be declared with its real limits.
+# normalize_models_response RESPONSE_FILE — convert the OpenAI-compatible
+# /models response into the model definitions pi requires. The API supplies a
+# context limit per model. Output is capped unless PI_MAX_TOKENS explicitly
+# overrides it because pi reserves maxTokens inside contextWindow.
+normalize_models_response() {
+  local response_file="$1"
+  jq -ce \
+    --arg context_override "$CONTEXT_WINDOW_OVERRIDE" \
+    --arg max_override "$MAX_TOKENS_OVERRIDE" \
+    --argjson fallback_context "$DEFAULT_CONTEXT_WINDOW" \
+    --argjson fallback_max "$DEFAULT_MAX_TOKENS" '
+    def positive_number($value; $fallback):
+      (try ($value | tonumber) catch $fallback)
+      | if type == "number" and . > 0 then . else $fallback end;
+    [
+      (.data // .models // [])[]?
+      | if type == "string" then {id: .} elif type == "object" then . else empty end
+      | (.id // .slug // .model // "") as $id
+      | select(($id | type) == "string" and ($id | length) > 0)
+      | (if $context_override != ""
+          then positive_number($context_override; 0)
+          else positive_number((.max_input_tokens // .context_window // .contextWindow // .context_length); $fallback_context)
+        end) as $context
+      | select($context > 0)
+      | (if $max_override != ""
+          then positive_number($max_override; 0)
+          else ([positive_number((.max_output_tokens // .maxOutputTokens); $fallback_max), $fallback_max] | min)
+        end) as $output
+      | ((.display_name // .displayName // .name // $id)
+          | if type == "string" and length > 0 then . else $id end) as $name
+      | {
+          id: $id,
+          name: (if ($name | endswith("(Webster)")) then $name else ($name + " (Webster)") end),
+          reasoning: (if (.reasoning | type) == "boolean" then .reasoning else true end),
+          input: ["text"],
+          contextWindow: $context,
+          maxTokens: ([$output, $context] | min)
+        }
+    ]
+    | unique_by(.id)
+    | sort_by(.id)
+    | if length > 0 then . else error("no usable models in endpoint response") end
+  ' "$response_file"
+}
+
+# fetch_webster_models KEY — update DISCOVERED_MODELS from the live endpoint.
+# DISCOVERY_STATUS distinguishes authentication and empty-access failures from
+# transient/unparseable responses that may safely reuse an installed catalog.
+fetch_webster_models() {
+  local key="$1" response_file http_status normalized
+  response_file=$(mktemp)
+  DISCOVERY_STATUS=""
+  if ! http_status=$(printf 'Authorization: Bearer %s\n' "$key" \
+      | curl -sS -o "$response_file" -w '%{http_code}' -m 20 \
+          --header @- "$BASE_URL/models" 2>/dev/null); then
+    DISCOVERY_STATUS="unreachable"
+    rm -f "$response_file"
+    return 1
+  fi
+
+  case "$http_status" in
+    2*)
+      if normalized=$(normalize_models_response "$response_file" 2>/dev/null); then
+        DISCOVERED_MODELS="$normalized"
+        DISCOVERY_STATUS="ok"
+        rm -f "$response_file"
+        return 0
+      fi
+      if jq -e '((.data // .models // []) | type == "array" and length == 0)' \
+          "$response_file" >/dev/null 2>&1; then
+        DISCOVERY_STATUS="empty"
+      else
+        DISCOVERY_STATUS="invalid"
+      fi
+      ;;
+    401|403) DISCOVERY_STATUS="auth-$http_status" ;;
+    *)       DISCOVERY_STATUS="http-$http_status" ;;
+  esac
+  rm -f "$response_file"
+  return 1
+}
+
+reuse_installed_models() {
+  local installed
+  [ -f "$MODELS_JSON" ] || return 1
+  installed=$(jq -ce --arg p "$PROVIDER" '
+    [.providers[$p].models[]?
+      | select(
+          (.id | type) == "string" and (.id | length) > 0
+          and (.contextWindow | type) == "number" and .contextWindow > 0
+          and (.maxTokens | type) == "number" and .maxTokens > 0
+        )]
+    | unique_by(.id)
+    | sort_by(.id)
+    | if length > 0 then . else error("no installed models") end
+  ' "$MODELS_JSON" 2>/dev/null) || return 1
+  DISCOVERED_MODELS="$installed"
+}
+
+configure_explicit_model_without_discovery() {
+  [ "$MODEL_EXPLICIT" = 1 ] || return 1
+  local context max
+  context="${CONTEXT_WINDOW_OVERRIDE:-$DEFAULT_CONTEXT_WINDOW}"
+  max="${MAX_TOKENS_OVERRIDE:-$DEFAULT_MAX_TOKENS}"
+  DISCOVERED_MODELS=$(jq -cne \
+    --arg id "$MODEL" --arg ctx "$context" --arg max "$max" '
+      ($ctx | tonumber) as $context
+      | ($max | tonumber) as $output
+      | select($context > 0 and $output > 0)
+      | [{
+          id: $id,
+          name: ($id + " (Webster)"),
+          reasoning: true,
+          input: ["text"],
+          contextWindow: $context,
+          maxTokens: ([$output, $context] | min)
+        }]
+    ') || return 1
+}
+
+discover_models() {
+  if [ "${PI_SKIP_ENDPOINT_CHECK:-0}" = 1 ]; then
+    if reuse_installed_models; then
+      log "reusing installed Webster models (PI_SKIP_ENDPOINT_CHECK=1)"
+      return 0
+    fi
+    if configure_explicit_model_without_discovery; then
+      warn "model discovery skipped; configuring only explicit PI_MODEL=$MODEL"
+      return 0
+    fi
+    warn "cannot skip model discovery on a fresh install without PI_MODEL"
+    record_failure pi-models
+    return 1
+  fi
+
+  if fetch_webster_models "$API_KEY"; then
+    log "discovered $(printf '%s' "$DISCOVERED_MODELS" | jq 'length') model(s) accessible to this key"
+    return 0
+  fi
+
+  case "$DISCOVERY_STATUS" in
+    auth-*)
+      warn "endpoint rejected the configured key (HTTP ${DISCOVERY_STATUS#auth-}) — check the key and re-run"
+      record_failure pi-api-key
+      return 1
+      ;;
+    empty)
+      warn "endpoint accepted the key but advertised no accessible models"
+      record_failure pi-models
+      return 1
+      ;;
+  esac
+
+  if reuse_installed_models; then
+    warn "model discovery failed ($DISCOVERY_STATUS); reusing the installed model list"
+    return 0
+  fi
+  if configure_explicit_model_without_discovery; then
+    warn "model discovery failed ($DISCOVERY_STATUS); configuring only explicit PI_MODEL=$MODEL"
+    return 0
+  fi
+  warn "model discovery failed ($DISCOVERY_STATUS) and there is no installed model list to reuse"
+  record_failure pi-models
+  return 1
+}
+
+model_is_discovered() {
+  printf '%s' "$DISCOVERED_MODELS" | jq -e --arg model "$1" \
+    'map(.id) | index($model) != null' >/dev/null 2>&1
+}
+
+select_default_model() {
+  local installed_default=""
+  if [ "$MODEL_EXPLICIT" = 1 ]; then
+    model_is_discovered "$MODEL" || {
+      warn "PI_MODEL=$MODEL is not accessible to this key"
+      record_failure pi-settings
+      return 1
+    }
+  else
+    if [ -f "$SETTINGS_JSON" ]; then
+      installed_default=$(jq -r '.defaultModel // empty' "$SETTINGS_JSON" 2>/dev/null || true)
+    fi
+    if [ -n "$installed_default" ] && model_is_discovered "$installed_default"; then
+      MODEL="$installed_default"
+    elif model_is_discovered "$PREFERRED_MODEL"; then
+      MODEL="$PREFERRED_MODEL"
+    else
+      MODEL=$(printf '%s' "$DISCOVERED_MODELS" | jq -r '.[0].id')
+    fi
+  fi
+  [ -n "$MODEL" ] || {
+    warn "could not select a default Webster model"
+    record_failure pi-settings
+    return 1
+  }
+  log "selected default model $PROVIDER/$MODEL"
+}
+
+# Pi does not perform provider discovery itself, so the installer writes every
+# model returned for this key into models.json with endpoint-derived limits.
 configure_models() {
-  log "configuring provider '$PROVIDER' in $MODELS_JSON"
+  log "configuring provider '$PROVIDER' with discovered models in $MODELS_JSON"
+  printf '%s' "$DISCOVERED_MODELS" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1 || {
+    warn "no discovered models are available to configure"
+    record_failure pi-models
+    return 1
+  }
   # The key goes through the environment, not argv: anyone on the box can read
   # a command line out of `ps`.
   local filter='
@@ -379,19 +592,11 @@ configure_models() {
         apiKey: $ENV.PI_INSTALL_API_KEY,
         authHeader: true,
         compat: { supportsDeveloperRole: false, supportsReasoningEffort: true },
-        models: [ {
-          id: $model,
-          name: $model,
-          reasoning: true,
-          input: ["text"],
-          contextWindow: ($ctx | tonumber),
-          maxTokens: ($max | tonumber)
-        } ]
+        models: $models
       }'
   PI_INSTALL_API_KEY="$API_KEY" jq_edit "$MODELS_JSON" '{"providers":{}}' "$filter" \
-    --arg p "$PROVIDER" --arg url "$BASE_URL" --arg model "$MODEL" \
-    --arg ctx "$CONTEXT_WINDOW" --arg max "$MAX_TOKENS" \
-    --argjson exclusive "$EXCLUSIVE" \
+    --arg p "$PROVIDER" --arg url "$BASE_URL" \
+    --argjson models "$DISCOVERED_MODELS" --argjson exclusive "$EXCLUSIVE" \
     || { record_failure pi-models; return 1; }
   # The file holds a live credential.
   chmod 600 "$MODELS_JSON" 2>/dev/null || warn "could not chmod 600 $MODELS_JSON"
@@ -524,27 +729,41 @@ TOKPS_EOF
 # usable key. A models.json whose apiKey is empty (or still the literal env
 # var name) makes pi fail at request time, long after this script exits.
 assert_pi_provider() {
-  if have jq && jq -e --arg p "$PROVIDER" --arg url "$BASE_URL" --arg model "$MODEL" '
+  local count
+  if have jq && jq -e --arg p "$PROVIDER" --arg url "$BASE_URL" '
         .providers[$p].baseUrl == $url
         and (.providers[$p].apiKey | type == "string" and length > 0)
-        and (.providers[$p].models | map(.id) | index($model) != null)
+        and (.providers[$p].models | type == "array" and length > 0)
+        and (.providers[$p].models
+          | (map(.id) | length) == (map(.id) | unique | length))
+        and all(.providers[$p].models[];
+          (.id | type) == "string" and (.id | length) > 0
+          and (.contextWindow | type) == "number" and .contextWindow > 0
+          and (.maxTokens | type) == "number" and .maxTokens > 0
+          and .maxTokens <= .contextWindow)
       ' "$MODELS_JSON" >/dev/null 2>&1; then
-    log "verified provider $PROVIDER serves $MODEL in $MODELS_JSON"
+    count=$(jq -r --arg p "$PROVIDER" '.providers[$p].models | length' "$MODELS_JSON")
+    log "verified provider $PROVIDER has $count discovered model(s) in $MODELS_JSON"
     return 0
   fi
-  warn "provider $PROVIDER is not configured for $MODEL in $MODELS_JSON"
+  warn "provider $PROVIDER has no valid discovered model list in $MODELS_JSON"
   record_failure pi-models
   return 1
 }
 
 assert_pi_default_model() {
-  if have jq && jq -e --arg p "$PROVIDER" --arg model "$MODEL" \
-      '.defaultProvider == $p and .defaultModel == $model' \
-      "$SETTINGS_JSON" >/dev/null 2>&1; then
-    log "verified default model $PROVIDER/$MODEL in $SETTINGS_JSON"
+  local default_model
+  default_model=$(jq -r '.defaultModel // empty' "$SETTINGS_JSON" 2>/dev/null || true)
+  if have jq && [ -n "$default_model" ] && \
+      jq -e --arg p "$PROVIDER" --arg model "$default_model" \
+        '.providers[$p].models | map(.id) | index($model) != null' \
+        "$MODELS_JSON" >/dev/null 2>&1 && \
+      jq -e --arg p "$PROVIDER" '.defaultProvider == $p' \
+        "$SETTINGS_JSON" >/dev/null 2>&1; then
+    log "verified default model $PROVIDER/$default_model is in the discovered model list"
     return 0
   fi
-  warn "default model is not $PROVIDER/$MODEL in $SETTINGS_JSON"
+  warn "default model is not an installed $PROVIDER model in $SETTINGS_JSON"
   record_failure pi-settings
   return 1
 }
@@ -566,10 +785,9 @@ assert_pi_extension() {
   return 1
 }
 
-# assert_pi_endpoint — prove the key is actually accepted. This is the only
-# check that catches a typo'd paste, which otherwise surfaces as a 401 on the
-# user's first prompt. Network problems are a warning; an explicit auth
-# rejection is a failure.
+# assert_pi_endpoint — prove the key is accepted and its live model list still
+# matches models.json. Network problems preserve installed state as a warning;
+# authentication, empty access, and confirmed catalog drift are failures.
 assert_pi_endpoint() {
   if [ "${PI_SKIP_ENDPOINT_CHECK:-0}" = 1 ]; then
     log "skipping endpoint check (PI_SKIP_ENDPOINT_CHECK=1)"
@@ -577,21 +795,33 @@ assert_pi_endpoint() {
   fi
   have curl || { warn "curl unavailable; skipping endpoint check"; return 0; }
 
-  local key http_status
+  local key installed live
   key=$(jq -r --arg p "$PROVIDER" '.providers[$p].apiKey // ""' "$MODELS_JSON" 2>/dev/null || echo "")
   [ -n "$key" ] || { warn "no API key on disk; skipping endpoint check"; return 0; }
 
-  http_status=$(curl -s -o /dev/null -w '%{http_code}' -m 20 \
-    -H "Authorization: Bearer $key" "$BASE_URL/models" 2>/dev/null || echo "000")
+  if fetch_webster_models "$key"; then
+    installed=$(jq -cS --arg p "$PROVIDER" '.providers[$p].models | sort_by(.id)' \
+      "$MODELS_JSON" 2>/dev/null || echo "")
+    live=$(printf '%s' "$DISCOVERED_MODELS" | jq -cS 'sort_by(.id)')
+    if [ "$installed" = "$live" ]; then
+      log "verified installed models match current endpoint access"
+      return 0
+    fi
+    warn "installed Webster models differ from current endpoint access; re-run pi-setup.sh"
+    record_failure pi-models
+    return 1
+  fi
 
-  case "$http_status" in
-    2*)   log "verified $BASE_URL accepts the configured key (HTTP $http_status)"; return 0 ;;
-    401|403)
-          warn "endpoint rejected the configured key (HTTP $http_status) — check the key and re-run"
+  case "$DISCOVERY_STATUS" in
+    auth-*)
+          warn "endpoint rejected the configured key (HTTP ${DISCOVERY_STATUS#auth-}) — check the key and re-run"
           record_failure pi-api-key
           return 1 ;;
-    000)  warn "could not reach $BASE_URL; skipping endpoint check"; return 0 ;;
-    *)    warn "unexpected response from $BASE_URL (HTTP $http_status); skipping endpoint check"; return 0 ;;
+    empty)
+          warn "endpoint accepts the configured key but advertises no accessible models"
+          record_failure pi-models
+          return 1 ;;
+    *)    warn "could not validate live model access ($DISCOVERY_STATUS); keeping installed models"; return 0 ;;
   esac
 }
 
@@ -635,8 +865,10 @@ main() {
   ensure_node || warn "Node.js install failed"
   install_pi  || warn "pi install failed"
 
-  resolve_api_key   || { summary; return; }
-  configure_models  || warn "writing models.json failed"
+  resolve_api_key      || { summary; return; }
+  discover_models      || { summary; return; }
+  select_default_model || { summary; return; }
+  configure_models     || warn "writing models.json failed"
   configure_settings || warn "writing settings.json failed"
   install_extension || warn "installing the tokps-session extension failed"
 

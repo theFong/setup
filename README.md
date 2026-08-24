@@ -389,8 +389,10 @@ secret and an existing Claude login.
 
 `pi-setup.sh` is the sibling of `omp-setup.sh` for the
 [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding
-agent: same `webster` endpoint, same **GLM 5.2** default, plus a footer status
-line showing generation speed, active model, and session id.
+agent: same `webster` endpoint, every model accessible to the supplied key,
+plus a footer status line showing generation speed, active model, and session
+id. The installer preserves an accessible existing default, otherwise prefers
+`glm-5.2` when available, then falls back to the first discovered model.
 
 Hand this to someone and they are set up in one command:
 
@@ -415,8 +417,8 @@ What it writes:
 
 | Where | What |
 |---|---|
-| `~/.pi/agent/models.json` | `webster` provider: base URL, API key, `glm-5.2` with real limits (mode `0600`) |
-| `~/.pi/agent/settings.json` | `defaultProvider: webster`, `defaultModel: glm-5.2` |
+| `~/.pi/agent/models.json` | `webster` provider: base URL, API key, and the key's discovered models with per-model limits (mode `0600`) |
+| `~/.pi/agent/settings.json` | `defaultProvider: webster`, plus an accessible discovered default model |
 | `~/.pi/agent/extensions/tokps-session.ts` | Footer line: `73.4 tok/s • webster/glm-5.2 • 019feddc-…` |
 
 **pi needs Node.js ≥ 22.19**, and the script installs or upgrades it
@@ -430,12 +432,16 @@ that surfaces as a clear message here instead. A pi already on `PATH` that
 cannot start is reinstalled rather than reported as present, so re-running
 after a Node upgrade actually repairs it.
 
-Unlike omp, pi has no endpoint discovery, so the model is declared with the
-backend's real limits rather than the proxy's metadata — the proxy reports a
-null context window, while vLLM rejects `max_tokens` above
-`max_model_len=320000`. Override with `PI_CONTEXT_WINDOW` / `PI_MAX_TOKENS`,
-or target a different endpoint entirely with `PI_PROVIDER` / `PI_BASE_URL` /
-`PI_MODEL`.
+Pi itself has no endpoint discovery, so the installer queries the authenticated
+`/v1/models` endpoint and writes every returned model into Pi's configuration.
+Context windows come from each model's endpoint metadata, with the previous
+320,000-token default used only when metadata is absent. Advertised output is
+capped at 32,768 tokens by default because Pi reserves output inside the
+context window; smaller advertised limits are honored. `PI_CONTEXT_WINDOW` and
+`PI_MAX_TOKENS` override those values for every discovered model, while
+`PI_MODEL` explicitly chooses the default and fails if that model is not
+accessible. `PI_PROVIDER` and `PI_BASE_URL` can target another compatible
+endpoint.
 
 The footer rate is **decode speed** — output tokens over the time from first
 streamed content to end of generation — so a turn that runs a slow bash command
@@ -451,13 +457,14 @@ and provisioning.
 
 Verification runs on every install and under `--check`, per
 [STYLE_GUIDE.md](STYLE_GUIDE.md): the provider and default model as they landed
-on disk, that `pi` starts with the extension loaded, and that the endpoint
-actually accepts the key. A rejected key (HTTP 401/403) is a failure, not a
-warning — otherwise a typo'd paste only surfaces on the first prompt. An
-unreachable endpoint just warns, so offline machines still get configured
-(`PI_SKIP_ENDPOINT_CHECK=1` skips it outright). Failure paths — no key,
-unreadable `--key-file`, unparseable `models.json`, a rejected key, and
-credential file permissions — are covered in `test.sh`.
+on disk, that `pi` starts with the extension loaded, and that the installed
+model list still exactly matches the key's current endpoint access. A rejected
+key (HTTP 401/403) or an accepted key with no models is a failure. An offline
+re-run preserves the previously installed list; a fresh offline install needs
+an explicit `PI_MODEL`. `PI_SKIP_ENDPOINT_CHECK=1` uses the same fallback.
+Failure paths — no key, unreadable `--key-file`, unparseable `models.json`, a
+rejected or empty-access key, and credential file permissions — are covered in
+`test.sh`.
 
 Re-running is safe: other providers survive a merge, an unparseable config is
 left untouched, and the extension is only rewritten when its content differs.
