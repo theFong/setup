@@ -323,8 +323,14 @@ the OpenAI portion of the catalog. Setup fails instead of installing an empty
 catalog when the key cannot access any models. Generated Webster entries clone
 the complete stock Codex catalog shape so strict Codex Desktop versions can
 deserialize every entry.
-After an install or catalog refresh, fully quit and reopen Codex Desktop; its
-model catalog is loaded when the app server starts.
+The installer changes the catalog only when its contents actually differ. If a
+running Codex app-server has therefore become stale, setup detects whether it
+is daemon-managed and prints the required order: restart it with
+`codex app-server daemon restart`, then disconnect and reconnect that machine
+in Codex Desktop (or fully quit and reopen Desktop). For a legacy unmanaged
+server, disconnect Desktop before running the restart command. No restart
+notice is printed when the catalog and managed provider configuration are
+unchanged or when a newer daemon has already loaded them.
 
 It is not wired into `install.sh`, because it needs both a Webster secret and an
 existing Codex login. Run it separately after the bootstrap.

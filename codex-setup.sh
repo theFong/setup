@@ -14,11 +14,12 @@
 #   * installs a user LaunchAgent (macOS) or systemd user service (Linux)
 #   * builds a combined OpenAI + Webster model catalog from the existing Codex login
 #   * merge-safely configures ~/.codex/config.toml for CLI and Desktop
+#   * detects a running app-server with stale model settings and prints reload steps
 #   * verifies source, secret permissions, endpoint, service, catalog, and config
 #
-# Run `codex login` before this installer. Re-running is safe. Codex Desktop
-# must be fully quit and reopened after a successful install because the model
-# catalog is loaded at app-server startup.
+# Run `codex login` before this installer. Re-running is safe. When model
+# settings change beneath a running app-server, the installer prints the exact
+# daemon restart and Codex Desktop reconnect steps required to load them.
 #
 # Usage:
 #   ./codex-setup.sh                   install, configure, and verify
@@ -45,6 +46,7 @@ WEBSTER_CONFIG="$PROXY_DIR/webster.json"
 CATALOG_FILE="$CODEX_DIR/openai-webster-models.json"
 CODEX_CONFIG="$CODEX_DIR/config.toml"
 AUTH_FILE="$CODEX_DIR/auth.json"
+RELOAD_MARKER="$CODEX_DIR/app-server-model-reload-required"
 
 SETUP_REF="${CODEX_SETUP_REF:-main}"
 RAW_BASE_URL="${CODEX_SETUP_RAW_BASE_URL:-https://raw.githubusercontent.com/theFong/setup/$SETUP_REF}"
@@ -67,6 +69,90 @@ ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+resolve_codex_binary() {
+  local candidate
+  if [ -n "${CODEX_SETUP_CODEX_BIN:-}" ] && [ -x "$CODEX_SETUP_CODEX_BIN" ]; then
+    printf '%s' "$CODEX_SETUP_CODEX_BIN"
+    return 0
+  fi
+  if have codex; then
+    command -v codex
+    return 0
+  fi
+  for candidate in \
+    "$CODEX_DIR/packages/standalone/current/codex" \
+    "/Applications/ChatGPT.app/Contents/Resources/codex"
+  do
+    if [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+codex_daemon_state() {
+  local codex_bin daemon_json
+  codex_bin=$(resolve_codex_binary) || { printf 'unavailable'; return 0; }
+  daemon_json=$("$codex_bin" app-server daemon version 2>/dev/null) || {
+    printf 'stopped'
+    return 0
+  }
+  printf '%s' "$daemon_json" | node -e '
+    const fs = require("fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(0, "utf8"));
+      if (value.status !== "running") process.stdout.write("stopped");
+      else if (value.backend === "pid") process.stdout.write("managed");
+      else process.stdout.write("unmanaged");
+    } catch {
+      process.stdout.write("unavailable");
+    }
+  '
+}
+
+mark_codex_client_reload() {
+  touch "$RELOAD_MARKER"
+  chmod 600 "$RELOAD_MARKER"
+}
+
+report_codex_client_reload() {
+  local state pid_file
+  [ -f "$RELOAD_MARKER" ] || return 0
+  state=$(codex_daemon_state)
+  pid_file="$CODEX_DIR/app-server-daemon/app-server.pid"
+
+  if [ "$state" = managed ] && [ -f "$pid_file" ] && [ "$pid_file" -nt "$RELOAD_MARKER" ]; then
+    [ "$CHECK_ONLY" = 1 ] || rm -f "$RELOAD_MARKER"
+    return 0
+  fi
+  if [ "$state" = stopped ]; then
+    [ "$CHECK_ONLY" = 1 ] || rm -f "$RELOAD_MARKER"
+    printf '\nCodex app-server is not running; the new models will load on its next start.\n'
+    return 0
+  fi
+
+  printf '\n'
+  if [ "$state" = unmanaged ]; then
+    warn "a legacy, unmanaged Codex app-server is still using the previous model catalog"
+    printf '1. Disconnect this machine in Codex Desktop (or fully quit Desktop).\n'
+    printf '2. On this machine, run:\n\n'
+  elif [ "$state" = managed ]; then
+    warn "the running Codex app-server is still using the previous model catalog"
+    printf 'Run on this machine:\n\n'
+  else
+    warn "model settings changed, but the Codex app-server state could not be inspected"
+    printf 'If Codex Desktop is open, run on this machine:\n\n'
+  fi
+  printf '  codex app-server daemon restart\n\n'
+  if [ "$state" = unmanaged ]; then
+    printf '3. Reconnect this machine in Codex Desktop (or reopen Desktop).\n'
+  else
+    printf 'Then disconnect and reconnect this machine in Codex Desktop '
+    printf '(or fully quit and reopen Desktop).\n'
+  fi
+}
+
 record_failure() {
   local item="$1"
   case " $FAILED " in
@@ -87,7 +173,7 @@ One-liner (env prefix goes on bash, not curl):
   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
     | WEBSTER_API_KEY=sk-... bash
 
-Run `codex login` first. After setup, fully quit and reopen Codex Desktop.
+Run `codex login` first. Setup prints restart/reconnect steps only when needed.
 
 Env: WEBSTER_API_KEY, CODEX_WEBSTER_BASE_URL, CODEX_MODEL_PROXY_PORT,
      CODEX_SETUP_REF, CODEX_SETUP_RAW_BASE_URL, CODEX_SETUP_CODEX_DIR,
@@ -519,15 +605,36 @@ assert_service() {
 }
 
 generate_catalog() {
+  local candidate
   [ -f "$AUTH_FILE" ] || {
     warn "Codex login not found at $AUTH_FILE; run 'codex login' and re-run setup"
     return 1
   }
+  candidate=$(mktemp "$CODEX_DIR/.openai-webster-models.XXXXXX")
   CODEX_MODEL_PROXY_CODEX_DIR="$CODEX_DIR" \
   CODEX_AUTH_FILE="$AUTH_FILE" \
-  CODEX_MODEL_CATALOG_FILE="$CATALOG_FILE" \
+  CODEX_MODEL_CATALOG_FILE="$candidate" \
   CODEX_MODEL_PROXY_URL="$PROXY_URL" \
-    node "$PROXY_DIR/write-catalog.mjs"
+    node "$PROXY_DIR/write-catalog.mjs" >/dev/null || {
+      rm -f "$candidate"
+      return 1
+    }
+  install_catalog_candidate "$candidate"
+}
+
+install_catalog_candidate() {
+  local candidate="$1"
+  [ -s "$candidate" ] || { warn "generated model catalog is empty"; return 1; }
+  if [ -f "$CATALOG_FILE" ] && cmp -s "$candidate" "$CATALOG_FILE"; then
+    rm -f "$candidate"
+    chmod 600 "$CATALOG_FILE"
+    ok "combined model catalog unchanged"
+    return 0
+  fi
+  mv "$candidate" "$CATALOG_FILE"
+  chmod 600 "$CATALOG_FILE"
+  mark_codex_client_reload
+  ok "wrote combined model catalog to $CATALOG_FILE"
 }
 
 assert_catalog() {
@@ -623,6 +730,7 @@ merge_codex_config() {
   [ -f "$file" ] && cp -p "$file" "$file.bak"
   mv "$merged" "$file"
   chmod 600 "$file"
+  mark_codex_client_reload
   ok "merged provider settings into $file"
 }
 
@@ -669,7 +777,7 @@ summary() {
     return 1
   fi
   log "Codex OpenAI + Webster setup is healthy"
-  printf '\nFully quit and reopen Codex Desktop, then choose a Webster or OpenAI model.\n'
+  report_codex_client_reload
   printf 'Re-run this installer to refresh the model catalog; use --check for a read-only health check.\n'
 }
 
