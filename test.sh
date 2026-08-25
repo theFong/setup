@@ -1204,6 +1204,63 @@ if [ "$(cat "$codex_home/.codex/config.toml")" != "$codex_first_pass" ]; then
   exit 1
 fi
 
+# Catalog installation must mark only a material model change as requiring an
+# app-server reload. Otherwise every safe re-run would incorrectly tell users
+# to restart and reconnect Codex Desktop.
+codex_reload_home="$scratch/codex-reload-home"
+mkdir -p "$codex_reload_home/.codex"
+if ! (
+  export HOME="$codex_reload_home" CODEX_SETUP_CODEX_DIR="$codex_reload_home/.codex"
+  export SETUP_SKIP_MAIN=1
+  source ./codex-setup.sh
+  printf '{"models":[{"slug":"same"}]}\n' > "$CATALOG_FILE"
+  printf '{"models":[{"slug":"same"}]}\n' > "$scratch/catalog-same.json"
+  install_catalog_candidate "$scratch/catalog-same.json" >/dev/null
+  [ ! -e "$RELOAD_MARKER" ]
+  printf '{"models":[{"slug":"changed"}]}\n' > "$scratch/catalog-changed.json"
+  install_catalog_candidate "$scratch/catalog-changed.json" >/dev/null
+  [ -f "$RELOAD_MARKER" ]
+  grep -q '"slug":"changed"' "$CATALOG_FILE"
+); then
+  echo "FAIL: Codex catalog reload marker does not track material changes" >&2
+  exit 1
+fi
+
+# Detect managed versus legacy unmanaged app-servers from Codex's lifecycle
+# response, and make a stale managed daemon produce both required user steps.
+codex_daemon_stub="$scratch/codex-daemon-stub"
+cat > "$codex_daemon_stub" <<'EOF'
+#!/usr/bin/env bash
+case "${TEST_CODEX_DAEMON_STATE:-stopped}" in
+  managed) printf '{"status":"running","backend":"pid"}\n' ;;
+  unmanaged) printf '{"status":"running"}\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$codex_daemon_stub"
+if ! (
+  export HOME="$codex_reload_home" CODEX_SETUP_CODEX_DIR="$codex_reload_home/.codex"
+  export CODEX_SETUP_CODEX_BIN="$codex_daemon_stub" SETUP_SKIP_MAIN=1 CHECK_ONLY=1
+  source ./codex-setup.sh
+  export TEST_CODEX_DAEMON_STATE=managed
+  [ "$(codex_daemon_state)" = managed ]
+  export TEST_CODEX_DAEMON_STATE=unmanaged
+  [ "$(codex_daemon_state)" = unmanaged ]
+  unmanaged_notice=$(report_codex_client_reload 2>&1)
+  printf '%s' "$unmanaged_notice" | grep -q '1. Disconnect'
+  printf '%s' "$unmanaged_notice" | grep -q '3. Reconnect'
+  mkdir -p "$CODEX_DIR/app-server-daemon"
+  touch -t 202001010000 "$CODEX_DIR/app-server-daemon/app-server.pid"
+  touch -t 202101010000 "$RELOAD_MARKER"
+  export TEST_CODEX_DAEMON_STATE=managed
+  reload_notice=$(report_codex_client_reload 2>&1)
+  printf '%s' "$reload_notice" | grep -q 'codex app-server daemon restart'
+  printf '%s' "$reload_notice" | grep -q 'disconnect and reconnect'
+); then
+  echo "FAIL: Codex stale-daemon detection omitted restart/reconnect guidance" >&2
+  exit 1
+fi
+
 # The credential writer must JSON-escape arbitrary key text and leave the
 # result owner-only. It must also persist only the models returned by discovery.
 # A hand-written printf-based JSON writer tends to fail one or both checks.
