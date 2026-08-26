@@ -332,6 +332,13 @@ server, disconnect Desktop before running the restart command. No restart
 notice is printed when the catalog and managed provider configuration are
 unchanged or when a newer daemon has already loaded them.
 
+After setup or any required reconnect, start a new Codex task before selecting
+a Webster model. Codex persists the model provider with each task, so a task
+created before setup remains on the built-in `openai` provider even if its
+model is later changed in the picker. Selecting a Webster model in that older
+task sends it to the ChatGPT backend and produces a "model is not supported
+when using Codex with a ChatGPT account" error.
+
 It is not wired into `install.sh`, because it needs both a Webster secret and an
 existing Codex login. Run it separately after the bootstrap.
 

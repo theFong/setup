@@ -1249,6 +1249,7 @@ if ! (
   unmanaged_notice=$(report_codex_client_reload 2>&1)
   printf '%s' "$unmanaged_notice" | grep -q '1. Disconnect'
   printf '%s' "$unmanaged_notice" | grep -q '3. Reconnect'
+  printf '%s' "$unmanaged_notice" | grep -q 'Start a new Codex task'
   mkdir -p "$CODEX_DIR/app-server-daemon"
   touch -t 202001010000 "$CODEX_DIR/app-server-daemon/app-server.pid"
   touch -t 202101010000 "$RELOAD_MARKER"
@@ -1256,8 +1257,13 @@ if ! (
   reload_notice=$(report_codex_client_reload 2>&1)
   printf '%s' "$reload_notice" | grep -q 'codex app-server daemon restart'
   printf '%s' "$reload_notice" | grep -q 'disconnect and reconnect'
+  printf '%s' "$reload_notice" | grep -q 'Existing tasks keep the model provider'
+  export TEST_CODEX_DAEMON_STATE=stopped
+  stopped_notice=$(report_codex_client_reload 2>&1)
+  printf '%s' "$stopped_notice" | grep -q 'new models will load on its next start'
+  printf '%s' "$stopped_notice" | grep -q 'Start a new Codex task'
 ); then
-  echo "FAIL: Codex stale-daemon detection omitted restart/reconnect guidance" >&2
+  echo "FAIL: Codex stale-daemon detection omitted restart/reconnect/new-task guidance" >&2
   exit 1
 fi
 

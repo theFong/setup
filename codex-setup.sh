@@ -124,11 +124,15 @@ report_codex_client_reload() {
 
   if [ "$state" = managed ] && [ -f "$pid_file" ] && [ "$pid_file" -nt "$RELOAD_MARKER" ]; then
     [ "$CHECK_ONLY" = 1 ] || rm -f "$RELOAD_MARKER"
+    printf '\nStart a new Codex task before selecting a Webster model. '
+    printf 'Existing tasks keep the model provider they started with.\n'
     return 0
   fi
   if [ "$state" = stopped ]; then
     [ "$CHECK_ONLY" = 1 ] || rm -f "$RELOAD_MARKER"
     printf '\nCodex app-server is not running; the new models will load on its next start.\n'
+    printf 'Start a new Codex task before selecting a Webster model. '
+    printf 'Existing tasks keep the model provider they started with.\n'
     return 0
   fi
 
@@ -151,6 +155,8 @@ report_codex_client_reload() {
     printf 'Then disconnect and reconnect this machine in Codex Desktop '
     printf '(or fully quit and reopen Desktop).\n'
   fi
+  printf 'Start a new Codex task before selecting a Webster model. '
+  printf 'Existing tasks keep the model provider they started with.\n'
 }
 
 record_failure() {
