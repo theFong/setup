@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 const codexDir = process.env.CODEX_MODEL_PROXY_CODEX_DIR ?? resolve(homedir(), ".codex");
 const authPath = process.env.CODEX_AUTH_FILE ?? resolve(codexDir, "auth.json");
 const catalogPath =
-  process.env.CODEX_MODEL_CATALOG_FILE ?? resolve(codexDir, "openai-webster-models.json");
+  process.env.CODEX_MODEL_CATALOG_FILE ?? resolve(codexDir, "openai-custom-models.json");
 const proxyBaseUrl = (process.env.CODEX_MODEL_PROXY_URL ?? "http://127.0.0.1:4815/v1").replace(
   /\/+$/,
   "",

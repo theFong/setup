@@ -46,6 +46,7 @@ WEBSTER_CONFIG="$PROXY_DIR/webster.json"
 CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
 GATEWAY_CACHE="$CLAUDE_DIR/cache/gateway-models.json"
 CODEX_DIR="${CLAUDE_CODE_SETUP_CODEX_DIR:-${CODEX_HOME:-$HOME/.codex}}"
+CODEX_MODEL_API_CONFIG="$CODEX_DIR/model-proxy/upstream.json"
 CODEX_WEBSTER_CONFIG="$CODEX_DIR/model-proxy/webster.json"
 
 SETUP_REF="${CLAUDE_CODE_SETUP_REF:-main}"
@@ -261,6 +262,20 @@ key_from_config() {
   ' "$config"
 }
 
+key_from_codex_webster_config() {
+  local config="$1"
+  [ -f "$config" ] || return 0
+  WEBSTER_BASE_URL="$WEBSTER_BASE_URL" node -e '
+    const fs = require("fs");
+    try {
+      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (value.name !== "Webster") process.exit(0);
+      if (value.baseUrl?.replace(/\/+$/, "") !== process.env.WEBSTER_BASE_URL) process.exit(0);
+      if (typeof value.apiKey === "string") process.stdout.write(value.apiKey);
+    } catch {}
+  ' "$config"
+}
+
 resolve_api_key() {
   if [ -n "$KEY_FILE" ]; then
     [ -r "$KEY_FILE" ] || { warn "cannot read key file: $KEY_FILE"; return 1; }
@@ -271,7 +286,11 @@ resolve_api_key() {
     [ -n "$API_KEY" ] && ok "reusing the installed Claude Code Webster key"
   fi
   if [ -z "$API_KEY" ]; then
-    API_KEY=$(key_from_config "$CODEX_WEBSTER_CONFIG")
+    if [ -f "$CODEX_MODEL_API_CONFIG" ]; then
+      API_KEY=$(key_from_codex_webster_config "$CODEX_MODEL_API_CONFIG")
+    else
+      API_KEY=$(key_from_config "$CODEX_WEBSTER_CONFIG")
+    fi
     [ -n "$API_KEY" ] && ok "reusing the Codex Webster key"
   fi
   if [ -z "$API_KEY" ]; then

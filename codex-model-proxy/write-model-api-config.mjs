@@ -37,7 +37,14 @@ function humanizeModelId(id) {
     .join(" ");
 }
 
-export function normalizeWebsterModels(body) {
+function withoutProviderSuffix(value, providerName) {
+  const suffix = ` (${providerName})`;
+  return value.toLowerCase().endsWith(suffix.toLowerCase())
+    ? value.slice(0, -suffix.length)
+    : value;
+}
+
+export function normalizeModelApiModels(body, providerName = "Custom") {
   const advertised = Array.isArray(body?.data)
     ? body.data
     : Array.isArray(body?.models)
@@ -52,8 +59,10 @@ export function normalizeWebsterModels(body) {
     if (!id || seen.has(id)) continue;
     seen.add(id);
 
-    const plainName =
-      nonEmptyString(raw?.display_name ?? raw?.displayName ?? raw?.name) ?? humanizeModelId(id);
+    const plainName = withoutProviderSuffix(
+      nonEmptyString(raw?.display_name ?? raw?.displayName ?? raw?.name) ?? humanizeModelId(id),
+      providerName,
+    );
     const contextWindow = positiveInteger(
       raw?.max_input_tokens,
       raw?.context_window,
@@ -63,10 +72,9 @@ export function normalizeWebsterModels(body) {
     const maxOutputTokens = positiveInteger(raw?.max_output_tokens, raw?.maxOutputTokens);
     models.push({
       id,
-      displayName: `${plainName.replace(/\s+\(Webster\)$/i, "")} (Webster)`,
+      displayName: `${plainName} (${providerName})`,
       description:
-        nonEmptyString(raw?.description) ??
-        `${plainName.replace(/\s+\(Webster\)$/i, "")} served by the Brev Webster endpoint.`,
+        nonEmptyString(raw?.description) ?? `${plainName} served by the ${providerName} endpoint.`,
       ...(contextWindow ? { contextWindow } : {}),
       ...(maxOutputTokens ? { maxOutputTokens } : {}),
     });
@@ -74,14 +82,20 @@ export function normalizeWebsterModels(body) {
 
   models.sort((left, right) => left.id.localeCompare(right.id));
   if (models.length === 0) {
-    throw new Error("Webster endpoint did not advertise any accessible models");
+    throw new Error(`${providerName} endpoint did not advertise any accessible models`);
   }
   return models;
 }
 
-export async function discoverWebsterModels({ apiKey, baseUrl, modelsFile, timeoutMs } = {}) {
+export async function discoverModelApiModels({
+  apiKey,
+  baseUrl,
+  modelsFile,
+  providerName = "Custom",
+  timeoutMs,
+} = {}) {
   if (modelsFile) {
-    return normalizeWebsterModels(JSON.parse(readFileSync(modelsFile, "utf8")));
+    return normalizeModelApiModels(JSON.parse(readFileSync(modelsFile, "utf8")), providerName);
   }
 
   const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
@@ -89,24 +103,46 @@ export async function discoverWebsterModels({ apiKey, baseUrl, modelsFile, timeo
     signal: AbortSignal.timeout(timeoutMs ?? DEFAULT_TIMEOUT_MS),
   });
   if (!response.ok) {
-    throw new Error(`Webster model discovery failed with HTTP ${response.status}`);
+    throw new Error(`${providerName} model discovery failed with HTTP ${response.status}`);
   }
-  return normalizeWebsterModels(await response.json());
+  return normalizeModelApiModels(await response.json(), providerName);
 }
 
-export async function expectedConfig({ apiKey, baseUrl, modelsFile, timeoutMs } = {}) {
-  if (!apiKey) throw new Error("WEBSTER_API_KEY must be set");
-  if (!baseUrl) throw new Error("WEBSTER_BASE_URL must be set");
+export async function expectedConfig({
+  apiKey,
+  baseUrl,
+  modelsFile,
+  providerName = "Custom",
+  timeoutMs,
+} = {}) {
+  if (!apiKey) throw new Error("CODEX_MODEL_API_KEY must be set");
+  if (!baseUrl) throw new Error("CODEX_MODEL_API_BASE_URL must be set");
+  if (!nonEmptyString(providerName)) throw new Error("CODEX_MODEL_API_NAME must not be empty");
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, "");
   return {
+    name: providerName.trim(),
     baseUrl: normalizedBaseUrl,
     apiKey,
-    models: await discoverWebsterModels({
+    models: await discoverModelApiModels({
       apiKey,
       baseUrl: normalizedBaseUrl,
       modelsFile,
+      providerName: providerName.trim(),
       timeoutMs,
     }),
+  };
+}
+
+function environment() {
+  const usesGenericInputs =
+    process.env.CODEX_MODEL_API_KEY !== undefined ||
+    process.env.CODEX_MODEL_API_BASE_URL !== undefined ||
+    process.env.CODEX_MODEL_API_NAME !== undefined;
+  return {
+    apiKey: process.env.CODEX_MODEL_API_KEY ?? process.env.WEBSTER_API_KEY,
+    baseUrl: process.env.CODEX_MODEL_API_BASE_URL ?? process.env.WEBSTER_BASE_URL,
+    modelsFile: process.env.CODEX_MODEL_API_MODELS_FILE ?? process.env.WEBSTER_MODELS_FILE,
+    providerName: process.env.CODEX_MODEL_API_NAME ?? (usesGenericInputs ? "Custom" : "Webster"),
   };
 }
 
@@ -114,25 +150,21 @@ export async function main(argv = process.argv.slice(2)) {
   const checkOnly = argv[0] === "--check";
   const outputArgument = checkOnly ? argv[1] : argv[0];
   if (!outputArgument || argv.length !== (checkOnly ? 2 : 1)) {
-    throw new Error("usage: write-webster-config.mjs [--check] OUTPUT_PATH");
+    throw new Error("usage: write-model-api-config.mjs [--check] OUTPUT_PATH");
   }
 
   const outputPath = resolve(outputArgument);
-  const config = await expectedConfig({
-    apiKey: process.env.WEBSTER_API_KEY,
-    baseUrl: process.env.WEBSTER_BASE_URL,
-    modelsFile: process.env.WEBSTER_MODELS_FILE,
-  });
+  const config = await expectedConfig(environment());
 
   if (checkOnly) {
     const installed = JSON.parse(readFileSync(outputPath, "utf8"));
     if (JSON.stringify(installed) !== JSON.stringify(config)) {
       throw new Error(
-        `${outputPath} does not match the models currently advertised for this Webster key`,
+        `${outputPath} does not match the models currently advertised for this API key`,
       );
     }
     process.stdout.write(
-      `Webster endpoint advertises the ${config.models.length} configured model(s)\n`,
+      `${config.name} endpoint advertises the ${config.models.length} configured model(s)\n`,
     );
     return;
   }
@@ -144,9 +176,14 @@ export async function main(argv = process.argv.slice(2)) {
   chmodSync(outputPath, 0o600);
 }
 
+// Backward-compatible exports for callers that imported the original names.
+export const normalizeWebsterModels = (body) => normalizeModelApiModels(body, "Webster");
+export const discoverWebsterModels = (options = {}) =>
+  discoverModelApiModels({ ...options, providerName: "Webster" });
+
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
-    process.stderr.write(`write-webster-config: ${error.message}\n`);
+    process.stderr.write(`write-model-api-config: ${error.message}\n`);
     process.exitCode = 1;
   });
 }

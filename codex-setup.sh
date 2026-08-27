@@ -1,40 +1,43 @@
 #!/usr/bin/env bash
 #
 # codex-setup.sh — install a localhost model router so Codex CLI and Codex
-# Desktop can use OpenAI/ChatGPT and Brev Webster models from one picker.
+# Desktop can use OpenAI/ChatGPT and another Responses-compatible model API
+# from one picker.
 #
 # One-liner (the env prefix belongs on bash, to the right of the pipe):
 #   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
-#     | WEBSTER_API_KEY=sk-... bash
+#     | CODEX_MODEL_API_BASE_URL=https://models.example.com/v1 \
+#       CODEX_MODEL_API_KEY=sk-... CODEX_MODEL_API_NAME=Example bash
 #
 # The installer:
 #   * installs the dependency-free Node.js proxy under ~/.codex/model-proxy
-#   * discovers the models accessible to the supplied Webster key
-#   * stores the key and discovered models in ~/.codex/model-proxy/webster.json (mode 0600)
+#   * discovers the models accessible to the supplied model API key
+#   * stores the key and discovered models in ~/.codex/model-proxy/upstream.json (mode 0600)
 #   * installs a user LaunchAgent (macOS) or systemd user service (Linux)
-#   * builds a combined OpenAI + Webster model catalog from the existing Codex login
+#   * builds a combined OpenAI + custom model catalog from the existing Codex login
 #   * merge-safely configures ~/.codex/config.toml for CLI and Desktop
 #   * detects a running app-server with stale model settings and prints reload steps
 #   * verifies source, secret permissions, endpoint, service, catalog, and config
 #
 # Run `codex login` before this installer. Re-running is safe. When model
 # settings change beneath a running app-server, the installer prints the exact
-# daemon restart and Codex Desktop reconnect steps required to load them.
+# restart and Codex Desktop reconnect steps required to load them.
 #
 # Usage:
 #   ./codex-setup.sh                   install, configure, and verify
 #   ./codex-setup.sh --check           verify only; change nothing
-#   ./codex-setup.sh --key-file PATH   read the Webster key from PATH
+#   ./codex-setup.sh --restart-app-server  refresh and restart a stale app-server
+#   ./codex-setup.sh --key-file PATH   read the model API key from PATH
 #
-# Env: WEBSTER_API_KEY, CODEX_WEBSTER_BASE_URL, CODEX_MODEL_PROXY_PORT,
-#      CODEX_SETUP_REF, CODEX_SETUP_RAW_BASE_URL, CODEX_SETUP_CODEX_DIR,
-#      CODEX_SETUP_SOURCE_DIR, CODEX_SETUP_SKIP_ENDPOINT_CHECK
+# Env: CODEX_MODEL_API_KEY, CODEX_MODEL_API_BASE_URL, CODEX_MODEL_API_NAME,
+#      CODEX_MODEL_PROXY_PORT, CODEX_SETUP_REF, CODEX_SETUP_RAW_BASE_URL,
+#      CODEX_SETUP_CODEX_DIR, CODEX_SETUP_SOURCE_DIR,
+#      CODEX_SETUP_SKIP_ENDPOINT_CHECK
+# Backward-compatible aliases: WEBSTER_API_KEY, CODEX_WEBSTER_BASE_URL
 
 set -euo pipefail
 
 DEFAULT_WEBSTER_BASE_URL="https://webster-models-extnode-3gdrajbr0hiykknxzitck9yaiwo.apps.run.brev.nvidia.com/v1"
-WEBSTER_BASE_URL="${CODEX_WEBSTER_BASE_URL:-$DEFAULT_WEBSTER_BASE_URL}"
-WEBSTER_BASE_URL="${WEBSTER_BASE_URL%/}"
 PROXY_HOST="127.0.0.1"
 PROXY_PORT="${CODEX_MODEL_PROXY_PORT:-4815}"
 PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}/v1"
@@ -42,8 +45,9 @@ HEALTH_URL="http://${PROXY_HOST}:${PROXY_PORT}/healthz"
 
 CODEX_DIR="${CODEX_SETUP_CODEX_DIR:-${CODEX_HOME:-$HOME/.codex}}"
 PROXY_DIR="$CODEX_DIR/model-proxy"
-WEBSTER_CONFIG="$PROXY_DIR/webster.json"
-CATALOG_FILE="$CODEX_DIR/openai-webster-models.json"
+MODEL_API_CONFIG="$PROXY_DIR/upstream.json"
+LEGACY_WEBSTER_CONFIG="$PROXY_DIR/webster.json"
+CATALOG_FILE="$CODEX_DIR/openai-custom-models.json"
 CODEX_CONFIG="$CODEX_DIR/config.toml"
 AUTH_FILE="$CODEX_DIR/auth.json"
 RELOAD_MARKER="$CODEX_DIR/app-server-model-reload-required"
@@ -51,7 +55,7 @@ RELOAD_MARKER="$CODEX_DIR/app-server-model-reload-required"
 SETUP_REF="${CODEX_SETUP_REF:-main}"
 RAW_BASE_URL="${CODEX_SETUP_RAW_BASE_URL:-https://raw.githubusercontent.com/theFong/setup/$SETUP_REF}"
 LOCAL_SOURCE_DIR="${CODEX_SETUP_SOURCE_DIR:-}"
-SOURCE_FILES="proxy.mjs write-webster-config.mjs write-catalog.mjs"
+SOURCE_FILES="proxy.mjs write-model-api-config.mjs write-catalog.mjs"
 
 NODE_MIN_MAJOR=20
 OS=""
@@ -60,9 +64,23 @@ SUDO=""
 APT_UPDATED=0
 FAILED=""
 CHECK_ONLY=0
+RESTART_APP_SERVER=0
 KEY_FILE=""
-API_KEY="${WEBSTER_API_KEY:-}"
+API_KEY=""
+API_BASE_URL=""
+API_NAME=""
+GENERIC_INPUT=0
+LEGACY_WEBSTER_INPUT=0
 INSTALL_CHANGED=0
+
+if [ "${CODEX_MODEL_API_KEY+x}" = x ] ||
+   [ "${CODEX_MODEL_API_BASE_URL+x}" = x ] ||
+   [ "${CODEX_MODEL_API_NAME+x}" = x ]; then
+  GENERIC_INPUT=1
+fi
+if [ "${WEBSTER_API_KEY+x}" = x ] || [ "${CODEX_WEBSTER_BASE_URL+x}" = x ]; then
+  LEGACY_WEBSTER_INPUT=1
+fi
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -91,24 +109,125 @@ resolve_codex_binary() {
   return 1
 }
 
+codex_app_server_processes() {
+  ps -ax -o pid= -o command= 2>/dev/null | awk '
+    /[c]odex/ && /app-server/ && !/app-server proxy/ && !/app-server daemon/ {
+      print $1
+    }
+  '
+}
+
 codex_daemon_state() {
-  local codex_bin daemon_json
+  local codex_bin daemon_json state
   codex_bin=$(resolve_codex_binary) || { printf 'unavailable'; return 0; }
   daemon_json=$("$codex_bin" app-server daemon version 2>/dev/null) || {
-    printf 'stopped'
+    if [ -n "$(codex_app_server_processes)" ]; then
+      printf 'desktop'
+    else
+      printf 'stopped'
+    fi
     return 0
   }
-  printf '%s' "$daemon_json" | node -e '
+  state=$(printf '%s' "$daemon_json" | node -e '
     const fs = require("fs");
     try {
       const value = JSON.parse(fs.readFileSync(0, "utf8"));
       if (value.status !== "running") process.stdout.write("stopped");
-      else if (value.backend === "pid") process.stdout.write("managed");
+      else if (value.backend === "pid" || value.managedCodexVersion) process.stdout.write("managed");
       else process.stdout.write("unmanaged");
     } catch {
       process.stdout.write("unavailable");
     }
-  '
+  ')
+  if [ "$state" = stopped ] && [ -n "$(codex_app_server_processes)" ]; then
+    printf 'desktop'
+  else
+    printf '%s' "$state"
+  fi
+}
+
+process_command() {
+  ps -p "$1" -o command= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+process_parent_pid() {
+  ps -p "$1" -o ppid= 2>/dev/null | tr -d '[:space:]'
+}
+
+process_uid() {
+  ps -p "$1" -o uid= 2>/dev/null | tr -d '[:space:]'
+}
+
+process_is_active() {
+  local state
+  state=$(ps -p "$1" -o stat= 2>/dev/null | tr -d '[:space:]')
+  case "$state" in ''|Z*) return 1 ;; *) return 0 ;; esac
+}
+
+unmanaged_app_server_pids() {
+  local socket_file owner_pids pid parent command current_uid candidates
+  socket_file="$CODEX_DIR/app-server-control/app-server-control.sock"
+  have lsof || { warn "lsof is required to identify the unmanaged app-server safely"; return 1; }
+  [ -S "$socket_file" ] || { warn "Codex app-server control socket was not found"; return 1; }
+  owner_pids=$(lsof -t "$socket_file" 2>/dev/null | sort -n -u) || true
+  [ -n "$owner_pids" ] || { warn "no process owns the Codex app-server control socket"; return 1; }
+
+  current_uid=$(id -u)
+  candidates=""
+  for pid in $owner_pids; do
+    case "$pid" in *[!0-9]*|'') warn "invalid app-server PID: $pid"; return 1 ;; esac
+    [ "$(process_uid "$pid")" = "$current_uid" ] || {
+      warn "refusing to stop app-server PID $pid owned by another user"
+      return 1
+    }
+    command=$(process_command "$pid")
+    case "$command" in
+      *codex*app-server*--listen*unix://*) ;;
+      *) warn "refusing to stop unexpected control-socket owner: $command"; return 1 ;;
+    esac
+    candidates="$candidates $pid"
+
+    parent=$(process_parent_pid "$pid")
+    case "$parent" in ''|*[!0-9]*|0|1) continue ;; esac
+    if [ "$(process_uid "$parent")" = "$current_uid" ]; then
+      command=$(process_command "$parent")
+      case "$command" in
+        *codex*app-server*--listen*unix://*) candidates="$candidates $parent" ;;
+      esac
+    fi
+  done
+  printf '%s\n' "$candidates" | awk '{ for (i = 1; i <= NF; i++) print $i }' | sort -n -u
+}
+
+terminate_unmanaged_app_server() {
+  local pids pid remaining attempt
+  if ! have lsof; then
+    log "installing lsof to inspect the legacy Codex control socket"
+    pm_install lsof || return 1
+    hash -r 2>/dev/null || true
+  fi
+  pids=$(unmanaged_app_server_pids) || return 1
+  [ -n "$pids" ] || { warn "no validated unmanaged app-server process was found"; return 1; }
+
+  for pid in $pids; do
+    if process_is_active "$pid" && ! kill -TERM "$pid" 2>/dev/null; then
+      process_is_active "$pid" || continue
+      warn "could not stop app-server PID $pid"
+      return 1
+    fi
+  done
+  attempt=0
+  while [ "$attempt" -lt 20 ]; do
+    remaining=""
+    for pid in $pids; do
+      process_is_active "$pid" && remaining="$remaining $pid"
+    done
+    [ -z "$remaining" ] && return 0
+    sleep 0.25
+    attempt=$((attempt + 1))
+  done
+  warn "app-server did not stop after SIGTERM (PIDs:${remaining})"
+  return 1
 }
 
 mark_codex_client_reload() {
@@ -116,47 +235,101 @@ mark_codex_client_reload() {
   chmod 600 "$RELOAD_MARKER"
 }
 
+report_new_codex_task() {
+  printf 'Start a new Codex task before selecting a custom model. '
+  printf 'Existing tasks keep the model provider they started with.\n'
+}
+
+restart_codex_app_server() {
+  local state codex_bin
+  [ -f "$RELOAD_MARKER" ] || { ok "Codex app-server does not need a model reload"; return 0; }
+  state=$(codex_daemon_state)
+  case "$state" in
+    managed)
+      codex_bin=$(resolve_codex_binary) || {
+        warn "Codex binary was not found; cannot restart the managed app-server"
+        return 1
+      }
+      "$codex_bin" app-server daemon restart || {
+        warn "Codex app-server daemon restart failed"
+        return 1
+      }
+      rm -f "$RELOAD_MARKER"
+      ok "restarted the managed Codex app-server"
+      printf 'Disconnect and reconnect this machine in Codex Desktop if it is already connected.\n'
+      report_new_codex_task
+      ;;
+    unmanaged)
+      log "Stopping the validated owner of the legacy Codex control socket"
+      terminate_unmanaged_app_server || return 1
+      rm -f "$RELOAD_MARKER"
+      ok "stopped the unmanaged Codex app-server; Desktop can start a fresh one"
+      printf 'Reconnect this machine in Codex Desktop.\n'
+      report_new_codex_task
+      ;;
+    desktop)
+      warn "the Codex app-server is owned by the Desktop app and cannot be restarted safely here"
+      warn "fully quit and reopen Codex Desktop to load the new models"
+      return 1
+      ;;
+    stopped)
+      rm -f "$RELOAD_MARKER"
+      ok "Codex app-server is stopped; it will load the new models on its next start"
+      report_new_codex_task
+      ;;
+    *)
+      warn "Codex app-server state could not be inspected; refusing to stop an unknown process"
+      return 1
+      ;;
+  esac
+}
+
 report_codex_client_reload() {
-  local state pid_file
+  local state pid_file socket_file
   [ -f "$RELOAD_MARKER" ] || return 0
   state=$(codex_daemon_state)
   pid_file="$CODEX_DIR/app-server-daemon/app-server.pid"
+  socket_file="$CODEX_DIR/app-server-control/app-server-control.sock"
 
   if [ "$state" = managed ] && [ -f "$pid_file" ] && [ "$pid_file" -nt "$RELOAD_MARKER" ]; then
     [ "$CHECK_ONLY" = 1 ] || rm -f "$RELOAD_MARKER"
-    printf '\nStart a new Codex task before selecting a Webster model. '
-    printf 'Existing tasks keep the model provider they started with.\n'
+    printf '\n'
+    report_new_codex_task
+    return 0
+  fi
+  if [ "$state" = unmanaged ] && [ -S "$socket_file" ] && [ "$socket_file" -nt "$RELOAD_MARKER" ]; then
+    [ "$CHECK_ONLY" = 1 ] || rm -f "$RELOAD_MARKER"
+    printf '\n'
+    report_new_codex_task
     return 0
   fi
   if [ "$state" = stopped ]; then
     [ "$CHECK_ONLY" = 1 ] || rm -f "$RELOAD_MARKER"
     printf '\nCodex app-server is not running; the new models will load on its next start.\n'
-    printf 'Start a new Codex task before selecting a Webster model. '
-    printf 'Existing tasks keep the model provider they started with.\n'
+    report_new_codex_task
     return 0
   fi
 
   printf '\n'
   if [ "$state" = unmanaged ]; then
     warn "a legacy, unmanaged Codex app-server is still using the previous model catalog"
-    printf '1. Disconnect this machine in Codex Desktop (or fully quit Desktop).\n'
-    printf '2. On this machine, run:\n\n'
+    printf 'On this machine, re-run setup with the explicit restart option:\n\n'
+    printf '  curl -fsSL %s/codex-setup.sh | bash -s -- --restart-app-server\n\n' "$RAW_BASE_URL"
+    printf 'Then reconnect this machine in Codex Desktop.\n'
   elif [ "$state" = managed ]; then
     warn "the running Codex app-server is still using the previous model catalog"
     printf 'Run on this machine:\n\n'
-  else
-    warn "model settings changed, but the Codex app-server state could not be inspected"
-    printf 'If Codex Desktop is open, run on this machine:\n\n'
-  fi
-  printf '  codex app-server daemon restart\n\n'
-  if [ "$state" = unmanaged ]; then
-    printf '3. Reconnect this machine in Codex Desktop (or reopen Desktop).\n'
-  else
+    printf '  codex app-server daemon restart\n\n'
     printf 'Then disconnect and reconnect this machine in Codex Desktop '
     printf '(or fully quit and reopen Desktop).\n'
+  elif [ "$state" = desktop ]; then
+    warn "the Codex Desktop app-server is still using the previous model catalog"
+    printf 'Fully quit and reopen Codex Desktop to load the new models.\n'
+  else
+    warn "model settings changed, but the Codex app-server state could not be inspected"
+    printf 'Restart the active Codex client before using the new models.\n'
   fi
-  printf 'Start a new Codex task before selecting a Webster model. '
-  printf 'Existing tasks keep the model provider they started with.\n'
+  report_new_codex_task
 }
 
 record_failure() {
@@ -169,21 +342,29 @@ record_failure() {
 
 usage() {
   cat <<'USAGE'
-codex-setup.sh — add OpenAI/ChatGPT and Webster models to Codex CLI + Desktop.
+codex-setup.sh — add OpenAI/ChatGPT and custom API models to Codex CLI + Desktop.
 
   ./codex-setup.sh                   install, configure, and verify
   ./codex-setup.sh --check           verify only; change nothing
-  ./codex-setup.sh --key-file PATH   read the Webster key from PATH
+  ./codex-setup.sh --restart-app-server  refresh and restart a stale app-server
+  ./codex-setup.sh --key-file PATH   read the model API key from PATH
 
-One-liner (env prefix goes on bash, not curl):
+Generic OpenAI-compatible Responses API (env prefix goes on bash, not curl):
+  curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
+    | CODEX_MODEL_API_BASE_URL=https://models.example.com/v1 \
+      CODEX_MODEL_API_KEY=sk-... CODEX_MODEL_API_NAME=Example bash
+
+Existing Webster shorthand remains supported:
   curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
     | WEBSTER_API_KEY=sk-... bash
 
 Run `codex login` first. Setup prints restart/reconnect steps only when needed.
 
-Env: WEBSTER_API_KEY, CODEX_WEBSTER_BASE_URL, CODEX_MODEL_PROXY_PORT,
-     CODEX_SETUP_REF, CODEX_SETUP_RAW_BASE_URL, CODEX_SETUP_CODEX_DIR,
-     CODEX_SETUP_SOURCE_DIR, CODEX_SETUP_SKIP_ENDPOINT_CHECK
+Env: CODEX_MODEL_API_KEY, CODEX_MODEL_API_BASE_URL, CODEX_MODEL_API_NAME,
+     CODEX_MODEL_PROXY_PORT, CODEX_SETUP_REF, CODEX_SETUP_RAW_BASE_URL,
+     CODEX_SETUP_CODEX_DIR, CODEX_SETUP_SOURCE_DIR,
+     CODEX_SETUP_SKIP_ENDPOINT_CHECK
+Aliases: WEBSTER_API_KEY, CODEX_WEBSTER_BASE_URL
 USAGE
 }
 
@@ -191,6 +372,7 @@ parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --check|--verify-only) CHECK_ONLY=1 ;;
+      --restart-app-server) RESTART_APP_SERVER=1 ;;
       --key-file)
         shift
         KEY_FILE="${1:-}"
@@ -201,6 +383,10 @@ parse_args() {
     esac
     shift
   done
+  if [ "$CHECK_ONLY" = 1 ] && [ "$RESTART_APP_SERVER" = 1 ]; then
+    warn "--check and --restart-app-server cannot be used together"
+    return 2
+  fi
 }
 
 detect_platform() {
@@ -300,51 +486,111 @@ mode_of() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true
 }
 
-key_from_config() {
-  [ -f "$WEBSTER_CONFIG" ] || return 0
+installed_model_api_config() {
+  if [ -f "$MODEL_API_CONFIG" ]; then
+    printf '%s' "$MODEL_API_CONFIG"
+  elif [ -f "$LEGACY_WEBSTER_CONFIG" ]; then
+    printf '%s' "$LEGACY_WEBSTER_CONFIG"
+  fi
+}
+
+config_value() {
+  local config="$1" field="$2"
+  [ -f "$config" ] || return 0
   node -e '
     const fs = require("fs");
     try {
-      const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).apiKey;
+      const config = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const provider = config?.providers?.modelApi ?? config?.providers?.webster ?? config;
+      const value = provider?.[process.argv[2]];
       if (typeof value === "string") process.stdout.write(value);
     } catch {}
-  ' "$WEBSTER_CONFIG"
+  ' "$config" "$field"
 }
 
-resolve_api_key() {
+resolve_api_config() {
+  local installed="" installed_key="" installed_base_url="" installed_name=""
+  installed=$(installed_model_api_config)
+  if [ -n "$installed" ]; then
+    installed_key=$(config_value "$installed" apiKey)
+    installed_base_url=$(config_value "$installed" baseUrl)
+    installed_name=$(config_value "$installed" name)
+    [ -n "$installed_name" ] || installed_name="Webster"
+  fi
+
+  if [ "$GENERIC_INPUT" = 1 ]; then
+    API_BASE_URL="${CODEX_MODEL_API_BASE_URL:-$installed_base_url}"
+    if [ -n "${CODEX_MODEL_API_NAME:-}" ]; then
+      API_NAME="$CODEX_MODEL_API_NAME"
+    elif [ -n "$installed_name" ] &&
+         [ "${installed_base_url%/}" = "${API_BASE_URL%/}" ]; then
+      API_NAME="$installed_name"
+    else
+      API_NAME="Custom"
+    fi
+    API_KEY="${CODEX_MODEL_API_KEY:-}"
+    if [ -z "$API_KEY" ] && [ -n "$installed_key" ] &&
+       [ "${installed_base_url%/}" = "${API_BASE_URL%/}" ]; then
+      API_KEY="$installed_key"
+    fi
+    [ -n "$API_BASE_URL" ] || {
+      warn "CODEX_MODEL_API_BASE_URL is required for a custom model API"
+      return 1
+    }
+  elif [ "$LEGACY_WEBSTER_INPUT" = 1 ]; then
+    API_BASE_URL="${CODEX_WEBSTER_BASE_URL:-$DEFAULT_WEBSTER_BASE_URL}"
+    API_NAME="Webster"
+    API_KEY="${WEBSTER_API_KEY:-}"
+  elif [ -n "$installed" ]; then
+    API_BASE_URL="$installed_base_url"
+    API_NAME="$installed_name"
+    API_KEY="$installed_key"
+  else
+    API_BASE_URL="$DEFAULT_WEBSTER_BASE_URL"
+    API_NAME="Webster"
+  fi
+
+  [ -n "$API_NAME" ] || { warn "model API name must not be empty"; return 1; }
+  case "$API_NAME" in
+    *$'\n'*|*$'\r'*) warn "model API name must fit on one line"; return 1 ;;
+  esac
+  API_BASE_URL="${API_BASE_URL%/}"
+  case "$API_BASE_URL" in
+    http://*|https://*) ;;
+    *) warn "model API base URL must start with http:// or https://"; return 1 ;;
+  esac
   if [ -n "$KEY_FILE" ]; then
     [ -r "$KEY_FILE" ] || { warn "cannot read key file: $KEY_FILE"; return 1; }
     IFS= read -r API_KEY < "$KEY_FILE" || true
   fi
+  [ -n "$API_KEY" ] && [ -n "$installed_key" ] && [ "$API_KEY" = "$installed_key" ] &&
+    ok "reusing the installed $API_NAME key"
   if [ -z "$API_KEY" ]; then
-    API_KEY=$(key_from_config)
-    [ -n "$API_KEY" ] && ok "reusing the installed Webster key"
-  fi
-  if [ -z "$API_KEY" ]; then
-    [ "$CHECK_ONLY" = 1 ] && { warn "no installed Webster key"; return 1; }
+    [ "$CHECK_ONLY" = 1 ] && { warn "no installed $API_NAME key"; return 1; }
     if [ -r /dev/tty ]; then
-      printf 'Webster API key (sk-...): ' >/dev/tty
+      printf '%s API key: ' "$API_NAME" >/dev/tty
       IFS= read -rs API_KEY </dev/tty || true
       printf '\n' >/dev/tty
     fi
   fi
   [ -n "$API_KEY" ] || {
-    warn "no Webster key; set WEBSTER_API_KEY or use --key-file"
+    warn "no model API key; set CODEX_MODEL_API_KEY or use --key-file"
     return 1
   }
 }
 
-assert_webster_endpoint() {
+assert_model_api_endpoint() {
   if [ "${CODEX_SETUP_SKIP_ENDPOINT_CHECK:-0}" = 1 ]; then
-    ok "skipping Webster endpoint check (CODEX_SETUP_SKIP_ENDPOINT_CHECK=1)"
+    ok "skipping $API_NAME endpoint check (CODEX_SETUP_SKIP_ENDPOINT_CHECK=1)"
     return 0
   fi
-  WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" \
-    node "$PROXY_DIR/write-webster-config.mjs" --check "$WEBSTER_CONFIG" || {
-      warn "Webster access changed or the endpoint rejected the key; re-run setup to refresh"
+  CODEX_MODEL_API_KEY="$API_KEY" CODEX_MODEL_API_BASE_URL="$API_BASE_URL" \
+  CODEX_MODEL_API_NAME="$API_NAME" \
+    node "$PROXY_DIR/write-model-api-config.mjs" --check "$MODEL_API_CONFIG" || {
+      warn "$API_NAME access changed or the endpoint rejected the key; re-run setup to refresh"
       return 1
     }
-  ok "Webster endpoint access matches the installed model list"
+  ok "$API_NAME endpoint access matches the installed model list"
 }
 
 install_one_source() {
@@ -399,40 +645,45 @@ assert_proxy_sources() {
   ok "proxy source files pass Node.js syntax validation"
 }
 
-write_webster_config() {
-  local next="$WEBSTER_CONFIG.next-$$" models_file=""
+write_model_api_config() {
+  local next="$MODEL_API_CONFIG.next-$$" models_file=""
   if [ "${CODEX_SETUP_SKIP_ENDPOINT_CHECK:-0}" = 1 ]; then
-    [ -f "$WEBSTER_CONFIG" ] || {
+    models_file=$(installed_model_api_config)
+    [ -n "$models_file" ] || {
       warn "cannot skip model discovery on a fresh install"
       return 1
     }
-    models_file="$WEBSTER_CONFIG"
   fi
-  WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" \
-  WEBSTER_MODELS_FILE="$models_file" \
-    node "$PROXY_DIR/write-webster-config.mjs" "$next"
-  if [ -f "$WEBSTER_CONFIG" ] && cmp -s "$next" "$WEBSTER_CONFIG"; then
+  if ! CODEX_MODEL_API_KEY="$API_KEY" CODEX_MODEL_API_BASE_URL="$API_BASE_URL" \
+    CODEX_MODEL_API_NAME="$API_NAME" CODEX_MODEL_API_MODELS_FILE="$models_file" \
+    node "$PROXY_DIR/write-model-api-config.mjs" "$next"; then
     rm -f "$next"
-    ok "Webster credential config unchanged"
+    return 1
+  fi
+  if [ -f "$MODEL_API_CONFIG" ] && cmp -s "$next" "$MODEL_API_CONFIG"; then
+    rm -f "$next"
+    ok "$API_NAME credential config unchanged"
     return 0
   fi
-  mv "$next" "$WEBSTER_CONFIG"
-  chmod 600 "$WEBSTER_CONFIG"
+  mv "$next" "$MODEL_API_CONFIG"
+  chmod 600 "$MODEL_API_CONFIG"
   INSTALL_CHANGED=1
-  ok "wrote $WEBSTER_CONFIG (mode 600)"
+  ok "wrote $MODEL_API_CONFIG (mode 600)"
 }
 
-assert_webster_config() {
-  [ -f "$WEBSTER_CONFIG" ] || { warn "missing $WEBSTER_CONFIG"; return 1; }
-  [ "$(mode_of "$WEBSTER_CONFIG")" = 600 ] || {
-    warn "$WEBSTER_CONFIG must have mode 600"
+assert_model_api_config() {
+  [ -f "$MODEL_API_CONFIG" ] || { warn "missing $MODEL_API_CONFIG"; return 1; }
+  [ "$(mode_of "$MODEL_API_CONFIG")" = 600 ] || {
+    warn "$MODEL_API_CONFIG must have mode 600"
     return 1
   }
-  WEBSTER_API_KEY="$API_KEY" WEBSTER_BASE_URL="$WEBSTER_BASE_URL" node -e '
+  CODEX_MODEL_API_KEY="$API_KEY" CODEX_MODEL_API_BASE_URL="$API_BASE_URL" \
+  CODEX_MODEL_API_NAME="$API_NAME" node -e '
     const fs = require("fs");
     const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    if (value.apiKey !== process.env.WEBSTER_API_KEY) process.exit(1);
-    if (value.baseUrl.replace(/\/+$/, "") !== process.env.WEBSTER_BASE_URL.replace(/\/+$/, "")) process.exit(1);
+    if (value.name !== process.env.CODEX_MODEL_API_NAME) process.exit(1);
+    if (value.apiKey !== process.env.CODEX_MODEL_API_KEY) process.exit(1);
+    if (value.baseUrl.replace(/\/+$/, "") !== process.env.CODEX_MODEL_API_BASE_URL.replace(/\/+$/, "")) process.exit(1);
     if (!Array.isArray(value.models) || value.models.length === 0) process.exit(1);
     const ids = new Set();
     for (const model of value.models) {
@@ -441,8 +692,8 @@ assert_webster_config() {
       if (model.contextWindow !== undefined && (!Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0)) process.exit(1);
       ids.add(model.id);
     }
-  ' "$WEBSTER_CONFIG" || { warn "Webster credential config does not match"; return 1; }
-  ok "Webster credential and discovered model config is valid and private"
+  ' "$MODEL_API_CONFIG" || { warn "$API_NAME credential config does not match"; return 1; }
+  ok "$API_NAME credential and discovered model config is valid and private"
 }
 
 xml_escape() {
@@ -474,7 +725,7 @@ install_launch_agent() {
 
   node_xml=$(printf '%s' "$node_path" | xml_escape)
   proxy_xml=$(printf '%s' "$PROXY_DIR/proxy.mjs" | xml_escape)
-  config_xml=$(printf '%s' "$WEBSTER_CONFIG" | xml_escape)
+  config_xml=$(printf '%s' "$MODEL_API_CONFIG" | xml_escape)
   stdout_xml=$(printf '%s' "$CODEX_DIR/log/model-proxy.log" | xml_escape)
   stderr_xml=$(printf '%s' "$CODEX_DIR/log/model-proxy.error.log" | xml_escape)
   temporary=$(mktemp)
@@ -488,7 +739,7 @@ install_launch_agent() {
   <array><string>$node_xml</string><string>$proxy_xml</string></array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>WEBSTER_MODELS_CONFIG</key><string>$config_xml</string>
+    <key>CODEX_MODEL_API_CONFIG</key><string>$config_xml</string>
     <key>CODEX_MODEL_PROXY_HOST</key><string>$PROXY_HOST</string>
     <key>CODEX_MODEL_PROXY_PORT</key><string>$PROXY_PORT</string>
   </dict>
@@ -534,18 +785,18 @@ install_systemd_service() {
   node_path=$(command -v node)
   node_unit=$(printf '%s' "$node_path" | systemd_escape)
   proxy_unit=$(printf '%s' "$PROXY_DIR/proxy.mjs" | systemd_escape)
-  config_unit=$(printf '%s' "$WEBSTER_CONFIG" | systemd_escape)
+  config_unit=$(printf '%s' "$MODEL_API_CONFIG" | systemd_escape)
   mkdir -p "$units"
   temporary=$(mktemp)
   cat > "$temporary" <<EOF
 [Unit]
-Description=Codex OpenAI and Webster model proxy
+Description=Codex OpenAI and custom model API proxy
 After=network-online.target
 
 [Service]
 Type=simple
 ExecStart="$node_unit" "$proxy_unit"
-Environment="WEBSTER_MODELS_CONFIG=$config_unit"
+Environment="CODEX_MODEL_API_CONFIG=$config_unit"
 Environment="CODEX_MODEL_PROXY_HOST=$PROXY_HOST"
 Environment="CODEX_MODEL_PROXY_PORT=$PROXY_PORT"
 Restart=on-failure
@@ -616,7 +867,7 @@ generate_catalog() {
     warn "Codex login not found at $AUTH_FILE; run 'codex login' and re-run setup"
     return 1
   }
-  candidate=$(mktemp "$CODEX_DIR/.openai-webster-models.XXXXXX")
+  candidate=$(mktemp "$CODEX_DIR/.openai-custom-models.XXXXXX")
   CODEX_MODEL_PROXY_CODEX_DIR="$CODEX_DIR" \
   CODEX_AUTH_FILE="$AUTH_FILE" \
   CODEX_MODEL_CATALOG_FILE="$candidate" \
@@ -660,13 +911,13 @@ assert_catalog() {
       if (model.visibility !== "list" || typeof model.supports_reasoning_summaries !== "boolean") process.exit(1);
       required.delete(model.slug);
     }
-    const websterIds = new Set(config.models.map((model) => model.id));
-    if (required.size || !models.some((model) => !websterIds.has(model.slug))) process.exit(1);
-  ' "$CATALOG_FILE" "$WEBSTER_CONFIG" || {
-    warn "combined catalog is invalid or missing OpenAI/Webster models"
+    const modelApiIds = new Set(config.models.map((model) => model.id));
+    if (required.size || !models.some((model) => !modelApiIds.has(model.slug))) process.exit(1);
+  ' "$CATALOG_FILE" "$MODEL_API_CONFIG" || {
+    warn "combined catalog is invalid or missing OpenAI/custom API models"
     return 1
   }
-  ok "combined catalog has OpenAI and every discovered Webster model"
+  ok "combined catalog has OpenAI and every discovered $API_NAME model"
 }
 
 toml_escape() {
@@ -684,7 +935,8 @@ merge_codex_config() {
     awk '
       BEGIN { top = 1; skip_provider = 0 }
       /^\[\[?[^]]+/ {
-        if ($0 == "[model_providers.openai_webster]") {
+        if ($0 == "[model_providers.openai_custom]" ||
+            $0 == "[model_providers.openai_webster]") {
           skip_provider = 1
           top = 0
           next
@@ -715,12 +967,12 @@ merge_codex_config() {
   ' "$stripped" > "$cleaned"
 
   {
-    printf 'model_provider = "openai_webster"\n'
+    printf 'model_provider = "openai_custom"\n'
     printf 'model_catalog_json = "%s"\n\n' "$catalog_toml"
     cat "$cleaned"
     printf '\n# Managed by https://github.com/theFong/setup/blob/main/codex-setup.sh\n'
-    printf '[model_providers.openai_webster]\n'
-    printf 'name = "OpenAI + Webster"\n'
+    printf '[model_providers.openai_custom]\n'
+    printf 'name = "OpenAI + %s"\n' "$(printf '%s' "$API_NAME" | toml_escape)"
     printf 'base_url = "%s"\n' "$PROXY_URL"
     printf 'wire_api = "responses"\n'
     printf 'requires_openai_auth = true\n'
@@ -749,14 +1001,14 @@ assert_codex_config() {
     /^[[:space:]]*model_catalog_json[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); catalog=$0 }
     END { print provider "|" catalog }
   ' "$CODEX_CONFIG")
-  [ "$top_values" = "model_provider=\"openai_webster\"|\"$CATALOG_FILE\"" ] || {
+  [ "$top_values" = "model_provider=\"openai_custom\"|\"$CATALOG_FILE\"" ] || {
     warn "Codex top-level provider/catalog settings are missing or incorrect"
     return 1
   }
-  section_count=$(grep -c '^\[model_providers\.openai_webster\]$' "$CODEX_CONFIG" || true)
+  section_count=$(grep -c '^\[model_providers\.openai_custom\]$' "$CODEX_CONFIG" || true)
   [ "$section_count" = 1 ] || { warn "Codex provider section count is $section_count, expected 1"; return 1; }
   awk -v url="$PROXY_URL" '
-    $0 == "[model_providers.openai_webster]" { in_provider = 1; next }
+    $0 == "[model_providers.openai_custom]" { in_provider = 1; next }
     in_provider && /^\[/ { exit }
     in_provider && $0 == "base_url = \"" url "\"" { base = 1 }
     in_provider && $0 == "wire_api = \"responses\"" { api = 1 }
@@ -768,8 +1020,8 @@ assert_codex_config() {
 
 verify_all() {
   assert_proxy_sources  || record_failure proxy-source
-  assert_webster_config || record_failure webster-config
-  assert_webster_endpoint || record_failure webster-endpoint
+  assert_model_api_config || record_failure model-api-config
+  assert_model_api_endpoint || record_failure model-api-endpoint
   assert_service        || record_failure proxy-service
   assert_catalog        || record_failure model-catalog
   assert_codex_config   || record_failure codex-config
@@ -782,7 +1034,7 @@ summary() {
     warn "fix the reported issue and re-run codex-setup.sh"
     return 1
   fi
-  log "Codex OpenAI + Webster setup is healthy"
+  log "Codex OpenAI + $API_NAME setup is healthy"
   report_codex_client_reload
   printf 'Re-run this installer to refresh the model catalog; use --check for a read-only health check.\n'
 }
@@ -796,7 +1048,7 @@ main() {
   detect_platform || { record_failure platform; summary || true; return 1; }
   ensure_package_manager
   ensure_node || { record_failure node; summary || true; return 1; }
-  resolve_api_key || { record_failure webster-key; summary || true; return 1; }
+  resolve_api_config || { record_failure model-api-key; summary || true; return 1; }
 
   if [ "$CHECK_ONLY" = 1 ]; then
     verify_all
@@ -806,15 +1058,18 @@ main() {
 
   install_proxy_sources || { record_failure proxy-source; summary || true; return 1; }
   assert_proxy_sources || { record_failure proxy-source; summary || true; return 1; }
-  write_webster_config || { record_failure webster-config; summary || true; return 1; }
-  assert_webster_config || { record_failure webster-config; summary || true; return 1; }
-  assert_webster_endpoint || { record_failure webster-endpoint; summary || true; return 1; }
+  write_model_api_config || { record_failure model-api-config; summary || true; return 1; }
+  assert_model_api_config || { record_failure model-api-config; summary || true; return 1; }
+  assert_model_api_endpoint || { record_failure model-api-endpoint; summary || true; return 1; }
   install_service || { record_failure proxy-service; summary || true; return 1; }
   assert_service || { record_failure proxy-service; summary || true; return 1; }
   generate_catalog || { record_failure model-catalog; summary || true; return 1; }
   assert_catalog || { record_failure model-catalog; summary || true; return 1; }
   merge_codex_config "$CODEX_CONFIG" || { record_failure codex-config; summary || true; return 1; }
   assert_codex_config || record_failure codex-config
+  if [ "$RESTART_APP_SERVER" = 1 ]; then
+    restart_codex_app_server || record_failure app-server-restart
+  fi
   summary
 }
 

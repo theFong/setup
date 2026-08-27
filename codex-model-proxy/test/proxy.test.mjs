@@ -5,20 +5,23 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 
-import { createCodexModelProxy, loadWebsterProvider } from "../proxy.mjs";
-import { discoverWebsterModels, normalizeWebsterModels } from "../write-webster-config.mjs";
+import { createCodexModelProxy, loadModelApiProvider } from "../proxy.mjs";
+import {
+  discoverModelApiModels,
+  normalizeModelApiModels,
+} from "../write-model-api-config.mjs";
 
-const TEST_WEBSTER_MODELS = Object.freeze([
+const TEST_MODEL_API_MODELS = Object.freeze([
   {
     id: "future-model-7b",
-    displayName: "Future Model 7B (Webster)",
-    description: "Future Model 7B served by Webster.",
+    displayName: "Future Model 7B (Example)",
+    description: "Future Model 7B served by Example.",
     contextWindow: 98_304,
     maxOutputTokens: 16_384,
   },
   {
     id: "key-scoped-model",
-    displayName: "Key Scoped Model (Webster)",
+    displayName: "Key Scoped Model (Example)",
     description: "A model available to this test key.",
     contextWindow: 131_072,
   },
@@ -75,8 +78,8 @@ function catalogModel() {
   };
 }
 
-async function fixture(t, { websterModels = TEST_WEBSTER_MODELS } = {}) {
-  const seen = { chatGpt: [], openAi: [], webster: [] };
+async function fixture(t, { modelApiModels = TEST_MODEL_API_MODELS } = {}) {
+  const seen = { chatGpt: [], modelApi: [], openAi: [] };
 
   const upstream = (bucket, models = false) =>
     createServer(async (request, response) => {
@@ -94,51 +97,69 @@ async function fixture(t, { websterModels = TEST_WEBSTER_MODELS } = {}) {
 
   const chatGptServer = upstream("chatGpt", true);
   const openAiServer = upstream("openAi");
-  const websterServer = upstream("webster");
-  const [chatGptBaseUrl, openAiBaseUrl, websterBaseUrl] = await Promise.all([
+  const modelApiServer = upstream("modelApi");
+  const [chatGptBaseUrl, openAiBaseUrl, modelApiBaseUrl] = await Promise.all([
     listen(chatGptServer),
     listen(openAiServer),
-    listen(websterServer),
+    listen(modelApiServer),
   ]);
   const proxy = createCodexModelProxy({
     chatGptBaseUrl,
     openAiBaseUrl,
     port: 0,
-    websterApiKey: "webster-secret",
-    websterBaseUrl,
-    websterModels,
+    modelApiKey: "model-api-secret",
+    modelApiBaseUrl,
+    modelApiModels,
   });
   const address = await proxy.start();
   const proxyBaseUrl = `http://127.0.0.1:${address.port}/v1`;
 
   t.after(async () => {
     await proxy.stop();
-    await Promise.all([close(chatGptServer), close(openAiServer), close(websterServer)]);
+    await Promise.all([close(chatGptServer), close(openAiServer), close(modelApiServer)]);
   });
   return { proxyBaseUrl, seen };
 }
 
-test("loads the installer-owned Webster config format", (t) => {
+test("loads the installer-owned custom model API config format", (t) => {
+  const directory = mkdtempSync(resolve(tmpdir(), "codex-model-proxy-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const configPath = resolve(directory, "upstream.json");
+  writeFileSync(
+    configPath,
+    JSON.stringify({
+      name: "Example",
+      baseUrl: "https://models.example/v1/",
+      apiKey: "secret",
+      models: TEST_MODEL_API_MODELS,
+    }),
+  );
+
+  assert.deepEqual(loadModelApiProvider(configPath), {
+    name: "Example",
+    baseUrl: "https://models.example/v1",
+    apiKey: "secret",
+    models: TEST_MODEL_API_MODELS,
+  });
+});
+
+test("loads a legacy Webster config with its compatibility name", (t) => {
   const directory = mkdtempSync(resolve(tmpdir(), "codex-model-proxy-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const configPath = resolve(directory, "webster.json");
   writeFileSync(
     configPath,
     JSON.stringify({
-      baseUrl: "https://webster.example/v1/",
+      baseUrl: "https://webster.example/v1",
       apiKey: "secret",
-      models: TEST_WEBSTER_MODELS,
+      models: TEST_MODEL_API_MODELS,
     }),
   );
 
-  assert.deepEqual(loadWebsterProvider(configPath), {
-    baseUrl: "https://webster.example/v1",
-    apiKey: "secret",
-    models: TEST_WEBSTER_MODELS,
-  });
+  assert.equal(loadModelApiProvider(configPath).name, "Webster");
 });
 
-test("rejects legacy Webster config without discovered models", (t) => {
+test("rejects a model API config without discovered models", (t) => {
   const directory = mkdtempSync(resolve(tmpdir(), "codex-model-proxy-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const configPath = resolve(directory, "webster.json");
@@ -147,7 +168,7 @@ test("rejects legacy Webster config without discovered models", (t) => {
     JSON.stringify({ baseUrl: "https://webster.example/v1", apiKey: "secret" }),
   );
 
-  assert.throws(() => loadWebsterProvider(configPath), /no discovered models/);
+  assert.throws(() => loadModelApiProvider(configPath), /no discovered models/);
 });
 
 test("discovers and normalizes only the models advertised for the supplied key", async (t) => {
@@ -171,12 +192,16 @@ test("discovers and normalizes only the models advertised for the supplied key",
   t.after(() => close(discoveryServer));
 
   assert.deepEqual(
-    await discoverWebsterModels({ apiKey: "scoped-secret", baseUrl }),
+    await discoverModelApiModels({
+      apiKey: "scoped-secret",
+      baseUrl,
+      providerName: "Example",
+    }),
     [
       {
         id: "new-model-h300",
-        displayName: "New Model H300 (Webster)",
-        description: "New Model H300 served by the Brev Webster endpoint.",
+        displayName: "New Model H300 (Example)",
+        description: "New Model H300 served by the Example endpoint.",
         contextWindow: 222_000,
         maxOutputTokens: 12_000,
       },
@@ -185,10 +210,13 @@ test("discovers and normalizes only the models advertised for the supplied key",
 });
 
 test("rejects a successful discovery response with no accessible models", () => {
-  assert.throws(() => normalizeWebsterModels({ data: [] }), /did not advertise any/);
+  assert.throws(
+    () => normalizeModelApiModels({ data: [] }, "Example"),
+    /did not advertise any/,
+  );
 });
 
-test("routes Webster models and replaces the incoming credential", async (t) => {
+test("routes custom API models and replaces the incoming credential", async (t) => {
   const { proxyBaseUrl, seen } = await fixture(t);
   const response = await fetch(`${proxyBaseUrl}/responses`, {
     method: "POST",
@@ -201,10 +229,10 @@ test("routes Webster models and replaces the incoming credential", async (t) => 
   });
 
   assert.equal(response.status, 200);
-  assert.match(await response.text(), /webster/);
-  assert.equal(seen.webster.length, 1);
-  assert.equal(seen.webster[0].headers.authorization, "Bearer webster-secret");
-  assert.equal(seen.webster[0].headers["chatgpt-account-id"], undefined);
+  assert.match(await response.text(), /modelApi/);
+  assert.equal(seen.modelApi.length, 1);
+  assert.equal(seen.modelApi[0].headers.authorization, "Bearer model-api-secret");
+  assert.equal(seen.modelApi[0].headers["chatgpt-account-id"], undefined);
   assert.equal(seen.chatGpt.length, 0);
 });
 
@@ -224,7 +252,7 @@ test("routes OpenAI models to the ChatGPT backend with the incoming login", asyn
   assert.match(await response.text(), /chatGpt/);
   assert.equal(seen.chatGpt[0].headers.authorization, "Bearer chatgpt-secret");
   assert.equal(seen.chatGpt[0].headers["chatgpt-account-id"], "account-123");
-  assert.equal(seen.webster.length, 0);
+  assert.equal(seen.modelApi.length, 0);
 });
 
 test("routes API-key requests without an account header to api.openai.com", async (t) => {
@@ -244,7 +272,7 @@ test("routes API-key requests without an account header to api.openai.com", asyn
   assert.equal(seen.chatGpt.length, 0);
 });
 
-test("merges Webster models into the Codex model catalog", async (t) => {
+test("merges custom API models into the Codex model catalog", async (t) => {
   const { proxyBaseUrl, seen } = await fixture(t);
   const response = await fetch(`${proxyBaseUrl}/models?client_version=0.148.0`, {
     headers: {

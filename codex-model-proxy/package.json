@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local Responses API router for Codex, OpenAI, and Webster models",
+  "description": "Local Responses API router for Codex, OpenAI, and a custom model API",
   "scripts": {
     "catalog": "node write-catalog.mjs",
     "start": "node proxy.mjs",

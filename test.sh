@@ -1155,6 +1155,10 @@ model_provider = "table-scoped-value"
 name = "stale"
 base_url = "https://stale.example/v1"
 
+[model_providers.openai_custom]
+name = "also stale"
+base_url = "https://also-stale.example/v1"
+
 [model_providers.other]
 name = "keep this provider"
 base_url = "https://other.example/v1"
@@ -1186,7 +1190,11 @@ if grep -q 'stale.example/v1' "$codex_home/.codex/config.toml"; then
   echo "FAIL: codex merge_codex_config retained a stale managed provider" >&2
   exit 1
 fi
-if [ "$(grep -c '^\[model_providers\.openai_webster\]$' "$codex_home/.codex/config.toml")" != 1 ]; then
+if grep -q '^\[model_providers\.openai_webster\]$' "$codex_home/.codex/config.toml"; then
+  echo "FAIL: codex merge_codex_config retained the legacy Webster provider" >&2
+  exit 1
+fi
+if [ "$(grep -c '^\[model_providers\.openai_custom\]$' "$codex_home/.codex/config.toml")" != 1 ]; then
   echo "FAIL: codex merge_codex_config produced duplicate provider sections" >&2
   exit 1
 fi
@@ -1226,14 +1234,19 @@ if ! (
   exit 1
 fi
 
-# Detect managed versus legacy unmanaged app-servers from Codex's lifecycle
-# response, and make a stale managed daemon produce both required user steps.
+# Detect managed, legacy unmanaged, and Desktop-owned app-servers. Each stale
+# state must produce only the restart guidance that can work for that install.
 codex_daemon_stub="$scratch/codex-daemon-stub"
 cat > "$codex_daemon_stub" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-} ${2:-} ${3:-}" = "app-server daemon restart" ]; then
+  printf 'restart\n' >> "${TEST_CODEX_RESTART_LOG:?}"
+  exit 0
+fi
 case "${TEST_CODEX_DAEMON_STATE:-stopped}" in
   managed) printf '{"status":"running","backend":"pid"}\n' ;;
-  unmanaged) printf '{"status":"running"}\n' ;;
+  managed_legacy) printf '{"status":"running","managedCodexVersion":"0.144.1"}\n' ;;
+  unmanaged) printf '{"status":"running","managedCodexVersion":null}\n' ;;
   *) exit 1 ;;
 esac
 EOF
@@ -1242,68 +1255,239 @@ if ! (
   export HOME="$codex_reload_home" CODEX_SETUP_CODEX_DIR="$codex_reload_home/.codex"
   export CODEX_SETUP_CODEX_BIN="$codex_daemon_stub" SETUP_SKIP_MAIN=1 CHECK_ONLY=1
   source ./codex-setup.sh
+  codex_app_server_processes() { :; }
   export TEST_CODEX_DAEMON_STATE=managed
+  [ "$(codex_daemon_state)" = managed ]
+  export TEST_CODEX_DAEMON_STATE=managed_legacy
   [ "$(codex_daemon_state)" = managed ]
   export TEST_CODEX_DAEMON_STATE=unmanaged
   [ "$(codex_daemon_state)" = unmanaged ]
   unmanaged_notice=$(report_codex_client_reload 2>&1)
-  printf '%s' "$unmanaged_notice" | grep -q '1. Disconnect'
-  printf '%s' "$unmanaged_notice" | grep -q '3. Reconnect'
+  printf '%s' "$unmanaged_notice" | grep -q -- '--restart-app-server'
+  ! printf '%s' "$unmanaged_notice" | grep -q 'codex app-server daemon restart'
   printf '%s' "$unmanaged_notice" | grep -q 'Start a new Codex task'
+
+  export TEST_CODEX_DAEMON_STATE=stopped
+  codex_app_server_processes() { printf '123\n'; }
+  [ "$(codex_daemon_state)" = desktop ]
+  codex_app_server_processes() { :; }
+  [ "$(codex_daemon_state)" = stopped ]
+
+  codex_daemon_state() { printf '%s' "$REPORT_STATE"; }
+  REPORT_STATE=desktop
+  desktop_notice=$(report_codex_client_reload 2>&1)
+  printf '%s' "$desktop_notice" | grep -q 'Fully quit and reopen Codex Desktop'
+  ! printf '%s' "$desktop_notice" | grep -q 'codex app-server daemon restart'
+  printf '%s' "$desktop_notice" | grep -q 'Existing tasks keep the model provider'
+
+  REPORT_STATE=managed
   mkdir -p "$CODEX_DIR/app-server-daemon"
   touch -t 202001010000 "$CODEX_DIR/app-server-daemon/app-server.pid"
   touch -t 202101010000 "$RELOAD_MARKER"
-  export TEST_CODEX_DAEMON_STATE=managed
   reload_notice=$(report_codex_client_reload 2>&1)
   printf '%s' "$reload_notice" | grep -q 'codex app-server daemon restart'
   printf '%s' "$reload_notice" | grep -q 'disconnect and reconnect'
   printf '%s' "$reload_notice" | grep -q 'Existing tasks keep the model provider'
-  export TEST_CODEX_DAEMON_STATE=stopped
+  REPORT_STATE=stopped
   stopped_notice=$(report_codex_client_reload 2>&1)
   printf '%s' "$stopped_notice" | grep -q 'new models will load on its next start'
   printf '%s' "$stopped_notice" | grep -q 'Start a new Codex task'
 ); then
-  echo "FAIL: Codex stale-daemon detection omitted restart/reconnect/new-task guidance" >&2
+  echo "FAIL: Codex stale app-server detection emitted incorrect restart/new-task guidance" >&2
+  exit 1
+fi
+
+# The explicit restart path may restart a managed daemon or stop a validated
+# legacy socket owner. It must refuse app-owned processes and incompatible args.
+if ! (
+  export HOME="$codex_reload_home" CODEX_SETUP_CODEX_DIR="$codex_reload_home/.codex"
+  export CODEX_SETUP_CODEX_BIN="$codex_daemon_stub" SETUP_SKIP_MAIN=1 CHECK_ONLY=0
+  export TEST_CODEX_DAEMON_STATE=managed TEST_CODEX_RESTART_LOG="$scratch/restart.log"
+  source ./codex-setup.sh
+  codex_app_server_processes() { :; }
+  touch "$RELOAD_MARKER"
+  managed_restart=$(restart_codex_app_server 2>&1)
+  grep -q '^restart$' "$TEST_CODEX_RESTART_LOG"
+  [ ! -e "$RELOAD_MARKER" ]
+  printf '%s' "$managed_restart" | grep -q 'Start a new Codex task'
+
+  codex_daemon_state() { printf unmanaged; }
+  terminate_unmanaged_app_server() { touch "$scratch/unmanaged-stopped"; }
+  touch "$RELOAD_MARKER"
+  unmanaged_restart=$(restart_codex_app_server 2>&1)
+  [ -f "$scratch/unmanaged-stopped" ]
+  [ ! -e "$RELOAD_MARKER" ]
+  printf '%s' "$unmanaged_restart" | grep -q 'Reconnect this machine'
+  printf '%s' "$unmanaged_restart" | grep -q 'Existing tasks keep the model provider'
+
+  codex_daemon_state() { printf desktop; }
+  touch "$RELOAD_MARKER"
+  ! restart_codex_app_server >/dev/null 2>&1
+  [ -f "$RELOAD_MARKER" ]
+
+  CHECK_ONLY=0 RESTART_APP_SERVER=0
+  ! parse_args --check --restart-app-server >/dev/null 2>&1
+); then
+  echo "FAIL: Codex explicit app-server restart safety checks failed" >&2
+  exit 1
+fi
+
+# A control socket alone is not authority to kill its owner. Reject a PID whose
+# command is not the expected Codex unix-listener process.
+if ! (
+  short_codex_dir=$(mktemp -d /tmp/codex-app-server-test.XXXXXX)
+  export HOME="$codex_reload_home" CODEX_SETUP_CODEX_DIR="$short_codex_dir"
+  export SETUP_SKIP_MAIN=1
+  source ./codex-setup.sh
+  mkdir -p "$CODEX_DIR/app-server-control"
+  socket_file="$CODEX_DIR/app-server-control/app-server-control.sock"
+  node -e '
+    const net = require("net");
+    const server = net.createServer();
+    server.listen(process.argv[1]);
+    setInterval(() => {}, 1000);
+  ' "$socket_file" &
+  socket_pid=$!
+  trap '
+    kill "$socket_pid" 2>/dev/null || true
+    wait "$socket_pid" 2>/dev/null || true
+    rm -f "$socket_file"
+    rmdir "$CODEX_DIR/app-server-control" "$CODEX_DIR" 2>/dev/null || true
+  ' EXIT
+  attempt=0
+  while [ ! -S "$socket_file" ] && [ "$attempt" -lt 20 ]; do
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  [ -S "$socket_file" ]
+  have() { [ "$1" = lsof ]; }
+  lsof() { printf '%s\n' "$socket_pid"; }
+  ! unmanaged_app_server_pids >/dev/null 2>&1
+  process_uid() { id -u; }
+  process_command() { printf 'node /usr/bin/codex app-server --listen unix://%s\n' "$socket_file"; }
+  process_parent_pid() { printf '1\n'; }
+  [ "$(unmanaged_app_server_pids)" = "$socket_pid" ]
+); then
+  echo "FAIL: Codex unmanaged restart accepted an unexpected socket owner" >&2
   exit 1
 fi
 
 # The credential writer must JSON-escape arbitrary key text and leave the
 # result owner-only. It must also persist only the models returned by discovery.
 # A hand-written printf-based JSON writer tends to fail one or both checks.
-codex_secret="$scratch/webster.json"
+if ! (
+  export HOME="$scratch/codex-generic-input" \
+    CODEX_SETUP_CODEX_DIR="$scratch/codex-generic-input/.codex" SETUP_SKIP_MAIN=1
+  export CODEX_MODEL_API_KEY=generic-key
+  export CODEX_MODEL_API_BASE_URL=https://models.example/v1/
+  export CODEX_MODEL_API_NAME='Example Cloud'
+  unset WEBSTER_API_KEY CODEX_WEBSTER_BASE_URL
+  source ./codex-setup.sh
+  resolve_api_config >/dev/null
+  [ "$API_KEY" = generic-key ]
+  [ "$API_BASE_URL" = https://models.example/v1 ]
+  [ "$API_NAME" = 'Example Cloud' ]
+); then
+  echo "FAIL: codex setup did not accept the generic model API inputs" >&2
+  exit 1
+fi
+if ! (
+  export HOME="$scratch/codex-webster-alias" \
+    CODEX_SETUP_CODEX_DIR="$scratch/codex-webster-alias/.codex" SETUP_SKIP_MAIN=1
+  unset CODEX_MODEL_API_KEY CODEX_MODEL_API_BASE_URL CODEX_MODEL_API_NAME
+  unset CODEX_WEBSTER_BASE_URL
+  export WEBSTER_API_KEY=legacy-alias-key
+  source ./codex-setup.sh
+  resolve_api_config >/dev/null
+  [ "$API_KEY" = legacy-alias-key ]
+  [ "$API_BASE_URL" = "$DEFAULT_WEBSTER_BASE_URL" ]
+  [ "$API_NAME" = Webster ]
+); then
+  echo "FAIL: codex setup broke the WEBSTER_API_KEY shorthand" >&2
+  exit 1
+fi
+
+codex_secret="$scratch/upstream.json"
 codex_models="$scratch/codex-models.json"
 printf '%s\n' \
   '{"data":[{"id":"available-to-this-key","max_input_tokens":123456,"max_output_tokens":8192}]}' \
   > "$codex_models"
-WEBSTER_API_KEY='sk-test-"quoted"' WEBSTER_BASE_URL='https://webster.example/v1/' \
-  WEBSTER_MODELS_FILE="$codex_models" \
-  node codex-model-proxy/write-webster-config.mjs "$codex_secret"
-if ! WEBSTER_API_KEY='sk-test-"quoted"' node -e '
+CODEX_MODEL_API_KEY='sk-test-"quoted"' \
+  CODEX_MODEL_API_BASE_URL='https://models.example/v1/' \
+  CODEX_MODEL_API_NAME='Example Cloud' CODEX_MODEL_API_MODELS_FILE="$codex_models" \
+  node codex-model-proxy/write-model-api-config.mjs "$codex_secret"
+if ! CODEX_MODEL_API_KEY='sk-test-"quoted"' node -e '
     const fs = require("fs");
     const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    if (value.apiKey !== process.env.WEBSTER_API_KEY) process.exit(1);
-    if (value.baseUrl !== "https://webster.example/v1") process.exit(1);
+    if (value.name !== "Example Cloud") process.exit(1);
+    if (value.apiKey !== process.env.CODEX_MODEL_API_KEY) process.exit(1);
+    if (value.baseUrl !== "https://models.example/v1") process.exit(1);
     if (value.models.length !== 1 || value.models[0].id !== "available-to-this-key") process.exit(1);
+    if (value.models[0].displayName !== "Available To This Key (Example Cloud)") process.exit(1);
     if (value.models[0].contextWindow !== 123456 || value.models[0].maxOutputTokens !== 8192) process.exit(1);
   ' "$codex_secret"; then
-  echo "FAIL: Codex Webster credential writer corrupted its values or discovery" >&2
+  echo "FAIL: Codex model API credential writer corrupted its values or discovery" >&2
   exit 1
 fi
 codex_secret_mode=$(stat -c '%a' "$codex_secret" 2>/dev/null \
   || stat -f '%Lp' "$codex_secret" 2>/dev/null || true)
 if [ "$codex_secret_mode" != 600 ]; then
-  echo "FAIL: Codex Webster credential is not mode 600 (got '$codex_secret_mode')" >&2
+  echo "FAIL: Codex model API credential is not mode 600 (got '$codex_secret_mode')" >&2
   exit 1
 fi
 
 # A valid endpoint response that advertises no models for this key must fail;
 # otherwise setup would install a healthy-looking but unusable empty picker.
 printf '{"data":[]}\n' > "$scratch/codex-no-models.json"
-if WEBSTER_API_KEY='sk-test' WEBSTER_BASE_URL='https://webster.example/v1' \
-  WEBSTER_MODELS_FILE="$scratch/codex-no-models.json" \
-  node codex-model-proxy/write-webster-config.mjs "$scratch/empty-webster.json" \
+if CODEX_MODEL_API_KEY='sk-test' CODEX_MODEL_API_BASE_URL='https://models.example/v1' \
+  CODEX_MODEL_API_NAME='Example' CODEX_MODEL_API_MODELS_FILE="$scratch/codex-no-models.json" \
+  node codex-model-proxy/write-model-api-config.mjs "$scratch/empty-upstream.json" \
   >/dev/null 2>&1; then
-  echo "FAIL: Codex Webster discovery accepted a key with no accessible models" >&2
+  echo "FAIL: Codex model API discovery accepted a key with no accessible models" >&2
+  exit 1
+fi
+
+# A failed discovery must stop before mv/chmod and must never print a false
+# success. This covers failures while the function is called from an `||`
+# handler, where Bash does not propagate `set -e` into the function body.
+codex_writer_failure=$( (
+  export HOME="$scratch/codex-writer-failure" \
+    CODEX_SETUP_CODEX_DIR="$scratch/codex-writer-failure/.codex" SETUP_SKIP_MAIN=1
+  unset CODEX_MODEL_API_KEY CODEX_MODEL_API_BASE_URL CODEX_MODEL_API_NAME
+  unset WEBSTER_API_KEY CODEX_WEBSTER_BASE_URL
+  source ./codex-setup.sh
+  mkdir -p "$PROXY_DIR"
+  API_KEY=bad-key
+  API_BASE_URL=https://models.invalid/v1
+  API_NAME=Broken
+  node() { return 23; }
+  write_model_api_config
+) 2>&1) && codex_writer_status=0 || codex_writer_status=$?
+if [ "$codex_writer_status" = 0 ] ||
+   printf '%s' "$codex_writer_failure" | grep -q 'ok.*wrote' ||
+   [ -e "$scratch/codex-writer-failure/.codex/model-proxy/upstream.json" ]; then
+  echo "FAIL: codex config discovery failure continued into a false successful write" >&2
+  exit 1
+fi
+
+# The old Webster variables and config remain a migration path. A no-env
+# rerun must recover the endpoint and key, then write the generic config.
+codex_legacy_home="$scratch/codex-legacy-home"
+mkdir -p "$codex_legacy_home/.codex/model-proxy"
+printf '{"baseUrl":"https://webster.example/v1","apiKey":"legacy-key","models":[{"id":"legacy-model","displayName":"Legacy (Webster)","description":"Legacy"}]}\n' \
+  > "$codex_legacy_home/.codex/model-proxy/webster.json"
+if ! (
+  export HOME="$codex_legacy_home" CODEX_SETUP_CODEX_DIR="$codex_legacy_home/.codex"
+  export SETUP_SKIP_MAIN=1
+  unset CODEX_MODEL_API_KEY CODEX_MODEL_API_BASE_URL CODEX_MODEL_API_NAME
+  unset WEBSTER_API_KEY CODEX_WEBSTER_BASE_URL
+  source ./codex-setup.sh
+  resolve_api_config >/dev/null
+  [ "$API_NAME" = Webster ]
+  [ "$API_BASE_URL" = https://webster.example/v1 ]
+  [ "$API_KEY" = legacy-key ]
+); then
+  echo "FAIL: codex setup could not read the legacy Webster config during migration" >&2
   exit 1
 fi
 
@@ -1312,12 +1496,13 @@ fi
 if (
   export HOME="$scratch/codex-no-key" CODEX_SETUP_CODEX_DIR="$scratch/codex-no-key/.codex"
   export SETUP_SKIP_MAIN=1
-  unset WEBSTER_API_KEY
+  unset CODEX_MODEL_API_KEY CODEX_MODEL_API_BASE_URL CODEX_MODEL_API_NAME
+  unset WEBSTER_API_KEY CODEX_WEBSTER_BASE_URL
   source ./codex-setup.sh
   CHECK_ONLY=1
-  resolve_api_key
+  resolve_api_config
 ) >/dev/null 2>&1; then
-  echo "FAIL: codex --check accepted a missing Webster key" >&2
+  echo "FAIL: codex --check accepted a missing model API key" >&2
   exit 1
 fi
 if (
@@ -1331,8 +1516,12 @@ fi
 
 # Help must work in the actual curl-pipe execution mode.
 codex_help=$( (unset SETUP_SKIP_MAIN; bash -s -- --help < ./codex-setup.sh) 2>&1 || true)
-if ! printf '%s' "$codex_help" | grep -q 'WEBSTER_API_KEY'; then
+if ! printf '%s' "$codex_help" | grep -q 'CODEX_MODEL_API_BASE_URL'; then
   echo "FAIL: codex-setup.sh --help printed nothing usable when piped to bash" >&2
+  exit 1
+fi
+if ! printf '%s' "$codex_help" | grep -q -- '--restart-app-server'; then
+  echo "FAIL: codex-setup.sh --help omitted the explicit restart option" >&2
   exit 1
 fi
 
@@ -1365,18 +1554,38 @@ fi
 # avoiding a second prompt without ever printing the credential.
 claude_home="$scratch/claude-home"
 mkdir -p "$claude_home/.codex/model-proxy"
-printf '{"baseUrl":"https://webster.example/v1","apiKey":"shared-test-key"}\n' \
-  > "$claude_home/.codex/model-proxy/webster.json"
+printf '{"name":"Webster","baseUrl":"https://webster.example/v1","apiKey":"shared-test-key"}\n' \
+  > "$claude_home/.codex/model-proxy/upstream.json"
 claude_reused_key=$(
   export HOME="$claude_home" CLAUDE_CODE_SETUP_CLAUDE_DIR="$claude_home/.claude"
   export CLAUDE_CODE_SETUP_CODEX_DIR="$claude_home/.codex" SETUP_SKIP_MAIN=1
+  export CLAUDE_CODE_WEBSTER_BASE_URL=https://webster.example/v1
   unset WEBSTER_API_KEY
   source ./claude-code-setup.sh
   resolve_api_key >/dev/null
   printf '%s' "$API_KEY"
 )
 if [ "$claude_reused_key" != "shared-test-key" ]; then
-  echo "FAIL: Claude Code setup did not reuse the installed Codex Webster key" >&2
+  echo "FAIL: Claude Code setup did not reuse the migrated Codex Webster key" >&2
+  exit 1
+fi
+
+# A generic Codex upstream may hold an unrelated credential. Claude's
+# Webster-specific gateway must not reuse it merely because the file exists.
+claude_custom_home="$scratch/claude-custom-codex-key"
+mkdir -p "$claude_custom_home/.codex/model-proxy"
+printf '{"name":"Example Cloud","baseUrl":"https://models.example/v1","apiKey":"unrelated-key"}\n' \
+  > "$claude_custom_home/.codex/model-proxy/upstream.json"
+if (
+  export HOME="$claude_custom_home"
+  export CLAUDE_CODE_SETUP_CLAUDE_DIR="$claude_custom_home/.claude"
+  export CLAUDE_CODE_SETUP_CODEX_DIR="$claude_custom_home/.codex"
+  export SETUP_SKIP_MAIN=1 CHECK_ONLY=1
+  unset WEBSTER_API_KEY
+  source ./claude-code-setup.sh
+  resolve_api_key
+) >/dev/null 2>&1; then
+  echo "FAIL: Claude Code setup reused an unrelated generic Codex API key" >&2
   exit 1
 fi
 

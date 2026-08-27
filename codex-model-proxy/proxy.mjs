@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -11,7 +11,8 @@ import { pathToFileURL } from "node:url";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4815;
 const DEFAULT_CODEX_DIR = resolve(homedir(), ".codex");
-const DEFAULT_WEBSTER_CONFIG = resolve(DEFAULT_CODEX_DIR, "model-proxy/webster.json");
+const DEFAULT_MODEL_API_CONFIG = resolve(DEFAULT_CODEX_DIR, "model-proxy/upstream.json");
+const LEGACY_WEBSTER_CONFIG = resolve(DEFAULT_CODEX_DIR, "model-proxy/webster.json");
 const DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024 * 1024;
@@ -48,41 +49,45 @@ function requireNonEmptyString(value, label) {
   return value;
 }
 
-export function loadWebsterProvider(configPath = DEFAULT_WEBSTER_CONFIG) {
+export function loadModelApiProvider(configPath = DEFAULT_MODEL_API_CONFIG) {
   let config;
   try {
     config = JSON.parse(readFileSync(configPath, "utf8"));
   } catch (error) {
-    throw new Error(`Unable to read Webster config at ${configPath}: ${error.message}`, {
+    throw new Error(`Unable to read model API config at ${configPath}: ${error.message}`, {
       cause: error,
     });
   }
 
-  const provider = config?.providers?.webster ?? config;
+  const provider = config?.providers?.modelApi ?? config?.providers?.webster ?? config;
   if (!Array.isArray(provider?.models) || provider.models.length === 0) {
     throw new Error(
-      `Webster config at ${configPath} has no discovered models; re-run codex-setup.sh`,
+      `Model API config at ${configPath} has no discovered models; re-run codex-setup.sh`,
     );
   }
   return {
+    name: requireNonEmptyString(provider?.name ?? "Webster", "Model API config name"),
     baseUrl: normalizeBaseUrl(
-      requireNonEmptyString(provider?.baseUrl, "Webster config baseUrl"),
+      requireNonEmptyString(provider?.baseUrl, "Model API config baseUrl"),
     ),
-    apiKey: requireNonEmptyString(provider?.apiKey, "Webster config apiKey"),
+    apiKey: requireNonEmptyString(provider?.apiKey, "Model API config apiKey"),
     models: provider.models.map((model, index) => ({
       ...model,
-      id: requireNonEmptyString(model?.id, `Webster config models[${index}].id`),
+      id: requireNonEmptyString(model?.id, `Model API config models[${index}].id`),
       displayName: requireNonEmptyString(
         model?.displayName,
-        `Webster config models[${index}].displayName`,
+        `Model API config models[${index}].displayName`,
       ),
       description: requireNonEmptyString(
         model?.description,
-        `Webster config models[${index}].description`,
+        `Model API config models[${index}].description`,
       ),
     })),
   };
 }
+
+// Keep the original export working for downstream imports while installations migrate.
+export const loadWebsterProvider = loadModelApiProvider;
 
 function readBody(request, limitBytes) {
   return new Promise((resolveBody, reject) => {
@@ -117,7 +122,7 @@ function hasChatGptAccount(request) {
   return typeof request.headers["chatgpt-account-id"] === "string";
 }
 
-function copyRequestHeaders(request, { websterApiKey, route }) {
+function copyRequestHeaders(request, { modelApiKey, route }) {
   const headers = {};
   for (const [name, value] of Object.entries(request.headers)) {
     const lowerName = name.toLowerCase();
@@ -130,7 +135,7 @@ function copyRequestHeaders(request, { websterApiKey, route }) {
       continue;
     }
     if (
-      route === "webster" &&
+      route === "modelApi" &&
       (lowerName === "authorization" || lowerName === "chatgpt-account-id")
     ) {
       continue;
@@ -139,8 +144,8 @@ function copyRequestHeaders(request, { websterApiKey, route }) {
   }
 
   headers["accept-encoding"] = "identity";
-  if (route === "webster") {
-    headers.authorization = `Bearer ${websterApiKey}`;
+  if (route === "modelApi") {
+    headers.authorization = `Bearer ${modelApiKey}`;
   }
   return headers;
 }
@@ -209,7 +214,7 @@ function modelTemplate(catalog) {
   );
 }
 
-function websterCatalogEntry(definition, template, priority) {
+function modelApiCatalogEntry(definition, template, priority) {
   const entry = structuredClone(template);
   const contextWindow = definition.contextWindow ?? template.context_window;
   Object.assign(entry, {
@@ -265,27 +270,29 @@ function websterCatalogEntry(definition, template, priority) {
   return entry;
 }
 
-export function mergeWebsterModels(catalog, definitions) {
+export function mergeModelApiModels(catalog, definitions) {
   if (!catalog || !Array.isArray(catalog.models) || catalog.models.length === 0) {
     throw new Error("OpenAI model catalog did not contain a non-empty models array");
   }
   if (!Array.isArray(definitions) || definitions.length === 0) {
-    throw new Error("Webster config did not contain any discovered models");
+    throw new Error("Model API config did not contain any discovered models");
   }
 
   const template = modelTemplate(catalog);
-  const websterIds = new Set(definitions.map((model) => model.id));
-  const models = catalog.models.filter((model) => !websterIds.has(model.slug));
+  const modelApiIds = new Set(definitions.map((model) => model.id));
+  const models = catalog.models.filter((model) => !modelApiIds.has(model.slug));
   const highestPriority = models.reduce(
     (current, model) => Math.max(current, Number(model.priority) || 0),
     0,
   );
 
   definitions.forEach((definition, index) => {
-    models.push(websterCatalogEntry(definition, template, highestPriority + index + 1));
+    models.push(modelApiCatalogEntry(definition, template, highestPriority + index + 1));
   });
   return { ...catalog, models };
 }
+
+export const mergeWebsterModels = mergeModelApiModels;
 
 function upstreamBaseForOpenAi(request, options) {
   return hasChatGptAccount(request) ? options.chatGptBaseUrl : options.openAiBaseUrl;
@@ -301,7 +308,7 @@ async function handleModels(request, response, options) {
   const upstreamResponse = await requestUpstream({
     headers: copyRequestHeaders(request, {
       route: "openai",
-      websterApiKey: options.websterApiKey,
+      modelApiKey: options.modelApiKey,
     }),
     method: "GET",
     timeoutMs: options.timeoutMs,
@@ -320,7 +327,7 @@ async function handleModels(request, response, options) {
 
   let catalog;
   try {
-    catalog = mergeWebsterModels(JSON.parse(body.toString("utf8")), options.websterModels);
+    catalog = mergeModelApiModels(JSON.parse(body.toString("utf8")), options.modelApiModels);
   } catch (error) {
     jsonResponse(response, 502, {
       error: { message: `Unable to merge the OpenAI model catalog: ${error.message}` },
@@ -353,15 +360,15 @@ async function handleResponses(request, response, options) {
     return;
   }
 
-  const isWebster = options.websterModelIds.has(model);
-  const route = isWebster ? "webster" : "openai";
-  const baseUrl = isWebster ? options.websterBaseUrl : upstreamBaseForOpenAi(request, options);
+  const isModelApi = options.modelApiIds.has(model);
+  const route = isModelApi ? "modelApi" : "openai";
+  const baseUrl = isModelApi ? options.modelApiBaseUrl : upstreamBaseForOpenAi(request, options);
   const url = upstreamUrl(baseUrl, request.url);
   const upstreamResponse = await requestUpstream({
     body,
     headers: copyRequestHeaders(request, {
       route,
-      websterApiKey: options.websterApiKey,
+      modelApiKey: options.modelApiKey,
     }),
     method: "POST",
     timeoutMs: options.timeoutMs,
@@ -379,24 +386,31 @@ export function createCodexModelProxy({
   openAiBaseUrl = DEFAULT_OPENAI_BASE_URL,
   port = DEFAULT_PORT,
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  modelApiKey,
+  modelApiBaseUrl,
+  modelApiModels,
+  // Deprecated aliases retained for callers of the original Webster-specific API.
   websterApiKey,
   websterBaseUrl,
   websterModels,
 }) {
-  requireNonEmptyString(websterApiKey, "websterApiKey");
-  requireNonEmptyString(websterBaseUrl, "websterBaseUrl");
-  if (!Array.isArray(websterModels) || websterModels.length === 0) {
-    throw new Error("websterModels must contain at least one discovered model");
+  const resolvedModelApiKey = modelApiKey ?? websterApiKey;
+  const resolvedModelApiBaseUrl = modelApiBaseUrl ?? websterBaseUrl;
+  const resolvedModelApiModels = modelApiModels ?? websterModels;
+  requireNonEmptyString(resolvedModelApiKey, "modelApiKey");
+  requireNonEmptyString(resolvedModelApiBaseUrl, "modelApiBaseUrl");
+  if (!Array.isArray(resolvedModelApiModels) || resolvedModelApiModels.length === 0) {
+    throw new Error("modelApiModels must contain at least one discovered model");
   }
   const options = {
     bodyLimitBytes,
     chatGptBaseUrl: normalizeBaseUrl(chatGptBaseUrl),
     openAiBaseUrl: normalizeBaseUrl(openAiBaseUrl),
     timeoutMs,
-    websterApiKey,
-    websterBaseUrl: normalizeBaseUrl(websterBaseUrl),
-    websterModelIds: new Set(websterModels.map((model) => model.id)),
-    websterModels,
+    modelApiKey: resolvedModelApiKey,
+    modelApiBaseUrl: normalizeBaseUrl(resolvedModelApiBaseUrl),
+    modelApiIds: new Set(resolvedModelApiModels.map((model) => model.id)),
+    modelApiModels: resolvedModelApiModels,
   };
 
   const server = createServer(async (request, response) => {
@@ -470,8 +484,14 @@ function integerFromEnv(name, fallback) {
 }
 
 export async function main() {
-  const configPath = process.env.WEBSTER_MODELS_CONFIG ?? DEFAULT_WEBSTER_CONFIG;
-  const configProvider = loadWebsterProvider(configPath);
+  const defaultConfigPath = existsSync(DEFAULT_MODEL_API_CONFIG)
+    ? DEFAULT_MODEL_API_CONFIG
+    : LEGACY_WEBSTER_CONFIG;
+  const configPath =
+    process.env.CODEX_MODEL_API_CONFIG ??
+    process.env.WEBSTER_MODELS_CONFIG ??
+    defaultConfigPath;
+  const configProvider = loadModelApiProvider(configPath);
   const proxy = createCodexModelProxy({
     bodyLimitBytes: integerFromEnv("CODEX_MODEL_PROXY_BODY_LIMIT_BYTES", DEFAULT_BODY_LIMIT_BYTES),
     chatGptBaseUrl: process.env.CHATGPT_UPSTREAM_BASE_URL ?? DEFAULT_CHATGPT_BASE_URL,
@@ -479,9 +499,13 @@ export async function main() {
     openAiBaseUrl: process.env.OPENAI_UPSTREAM_BASE_URL ?? DEFAULT_OPENAI_BASE_URL,
     port: integerFromEnv("CODEX_MODEL_PROXY_PORT", DEFAULT_PORT),
     timeoutMs: integerFromEnv("CODEX_MODEL_PROXY_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS),
-    websterApiKey: process.env.WEBSTER_API_KEY ?? configProvider.apiKey,
-    websterBaseUrl: process.env.WEBSTER_BASE_URL ?? configProvider.baseUrl,
-    websterModels: configProvider.models,
+    modelApiKey:
+      process.env.CODEX_MODEL_API_KEY ?? process.env.WEBSTER_API_KEY ?? configProvider.apiKey,
+    modelApiBaseUrl:
+      process.env.CODEX_MODEL_API_BASE_URL ??
+      process.env.WEBSTER_BASE_URL ??
+      configProvider.baseUrl,
+    modelApiModels: configProvider.models,
   });
   const address = await proxy.start();
   process.stdout.write(

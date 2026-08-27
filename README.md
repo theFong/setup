@@ -7,7 +7,7 @@ Portable dotfiles and Claude Code configuration. Clone to `~/.setup` on any mach
 - **install.sh** — New-machine bootstrap: installs tooling and links Claude config (see below)
 - **omp-setup.sh** — Installs and configures [omp](https://omp.sh) (oh-my-pi) against the Brev-hosted model endpoint (see below)
 - **pi-setup.sh** — Same, for the [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding agent; one-liner installable (see below)
-- **codex-setup.sh** — Adds Webster models alongside OpenAI models in Codex CLI and Codex Desktop through a localhost-only proxy (see below)
+- **codex-setup.sh** — Adds any Responses-compatible model API alongside OpenAI models in Codex CLI and Codex Desktop through a localhost-only proxy (see below)
 - **test.sh** — Isolated negative tests for the installers, run by CI and safe to run locally
 - **STYLE_GUIDE.md** — Required validation, portability, and agent-compatibility rules
 - **AGENTS.md** — Codex repository instructions that reference the shared style guide
@@ -272,16 +272,34 @@ Nerd mode needs a [Nerd Font](https://nerdfonts.com) selected in your terminal;
 without one the status line renders as tofu boxes. Fall back with
 `omp config set symbolPreset unicode && omp config set statusLine.preset full`.
 
-## Codex OpenAI + Webster proxy
+## Codex OpenAI + custom model API proxy
 
-`codex-setup.sh` installs a localhost-only Responses API router that keeps the
-OpenAI/ChatGPT login already managed by Codex for OpenAI models and substitutes
-the Webster API key only when a Webster model is selected. Both model families
-then appear in the Codex CLI and Codex Desktop model picker. Setup queries
-Webster's `/v1/models` endpoint with the supplied key, so each user sees only
-the models that key can access; no Webster model IDs are hardcoded.
+`codex-setup.sh` installs a localhost-only router that keeps the OpenAI/ChatGPT
+login already managed by Codex for OpenAI models and substitutes a separate API
+key only when one of the custom endpoint's models is selected. Both model
+families then appear in the Codex CLI and Codex Desktop model picker.
+
+The custom endpoint must use the OpenAI Responses protocol and expose an
+authenticated model list. In practice, a base URL such as
+`https://models.example.com/v1` must accept `GET /models` and
+`POST /responses`; this proxy does not translate Chat Completions into
+Responses.
 
 First sign in once with `codex login`, then run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
+  | CODEX_MODEL_API_BASE_URL=https://models.example.com/v1 \
+    CODEX_MODEL_API_KEY=sk-... CODEX_MODEL_API_NAME='Example Cloud' bash
+```
+
+`CODEX_MODEL_API_NAME` is optional and defaults to `Custom`. It controls the
+label appended to discovered models. Setup queries the endpoint with the
+supplied key, so every user sees only the models their key can access; no custom
+model IDs are hardcoded.
+
+Webster remains a supported shorthand with its hosted base URL and display name
+preselected:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
@@ -289,58 +307,80 @@ curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
 ```
 
 The environment prefix belongs on `bash`, to the right of the pipe. The script
-can also prompt for the key through `/dev/tty`, or read it with `--key-file`:
+can also prompt through `/dev/tty` or read the key with `--key-file`. On a fresh
+custom install, set `CODEX_MODEL_API_BASE_URL` alongside that flag:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh \
-  | bash -s -- --key-file /path/to/webster-key
+  | CODEX_MODEL_API_BASE_URL=https://models.example.com/v1 \
+    CODEX_MODEL_API_NAME='Example Cloud' bash -s -- --key-file /path/to/api-key
 ```
 
 | Flag | Effect |
 |---|---|
 | _(none)_ | Install + configure + verify |
 | `--check` | Verify source, secret permissions, endpoint, service, catalog, and Codex config without changing anything |
-| `--key-file PATH` | Read the Webster key from a file's first line |
+| `--restart-app-server` | Install + verify, then explicitly refresh a stale Codex app-server when the installer can do so safely |
+| `--key-file PATH` | Read the custom model API key from a file's first line |
 
 What it writes:
 
 | Where | What |
 |---|---|
-| `~/.codex/model-proxy/` | Dependency-free proxy runtime and Webster key plus its discovered model list; the config is mode `0600` |
-| `~/.codex/openai-webster-models.json` | Combined model catalog loaded by Codex at startup (mode `0600`) |
-| `~/.codex/config.toml` | Merge-safe `openai_webster` provider and `model_catalog_json` selection |
+| `~/.codex/model-proxy/` | Dependency-free proxy runtime and `upstream.json`, containing the custom key plus its discovered model list (mode `0600`) |
+| `~/.codex/openai-custom-models.json` | Combined model catalog loaded by Codex at startup (mode `0600`) |
+| `~/.codex/config.toml` | Merge-safe `openai_custom` provider and `model_catalog_json` selection |
 | `~/Library/LaunchAgents/com.thefong.codex-model-proxy.plist` | Always-on user service on macOS |
 | `~/.config/systemd/user/codex-model-proxy.service` | Always-on user service on Linux |
 
 The proxy listens only on `127.0.0.1:4815`. It strips the incoming OpenAI
-credential and ChatGPT account header before Webster requests, never logs
+credential and ChatGPT account header before custom API requests, never logs
 request bodies or headers, and never writes OpenAI credentials anywhere new.
-The Webster key lives only in the owner-readable proxy config.
+The custom key lives only in the owner-readable proxy config.
 
 The installer preserves the current selected model and unrelated Codex config.
-Re-run it to update the proxy and rediscover both the key's Webster access and
-the OpenAI portion of the catalog. Setup fails instead of installing an empty
-catalog when the key cannot access any models. Generated Webster entries clone
-the complete stock Codex catalog shape so strict Codex Desktop versions can
-deserialize every entry.
+Re-run it to update the proxy and rediscover both the key's custom endpoint
+access and the OpenAI portion of the catalog. Existing Webster installs and the
+`WEBSTER_API_KEY` / `CODEX_WEBSTER_BASE_URL` variables are migrated
+automatically. Setup fails instead of installing an empty catalog when the key
+cannot access any models. Generated custom entries clone the complete stock
+Codex catalog shape so strict Codex Desktop versions can deserialize every
+entry.
+
 The installer changes the catalog only when its contents actually differ. If a
-running Codex app-server has therefore become stale, setup detects whether it
-is daemon-managed and prints the required order: restart it with
-`codex app-server daemon restart`, then disconnect and reconnect that machine
-in Codex Desktop (or fully quit and reopen Desktop). For a legacy unmanaged
-server, disconnect Desktop before running the restart command. No restart
-notice is printed when the catalog and managed provider configuration are
-unchanged or when a newer daemon has already loaded them.
+running Codex app-server has therefore become stale, setup identifies its
+lifecycle and prints instructions that match it:
+
+- A standalone, daemon-managed install uses
+  `codex app-server daemon restart`, followed by reconnecting the machine in
+  Codex Desktop.
+- A legacy npm/SSH app-server cannot use that daemon command. Re-run the
+  one-liner with `bash -s -- --restart-app-server`; the installer validates the
+  user-owned control-socket process before sending it `SIGTERM`, and Desktop
+  starts a fresh server when the machine reconnects.
+- An app-owned local server is not terminated from the shell. Fully quit and
+  reopen Codex Desktop instead.
+
+For example, to refresh a legacy remote session after setup:
+
+```bash
+ssh my-host 'curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/codex-setup.sh | bash -s -- --restart-app-server'
+```
+
+No restart notice is printed when the catalog and managed provider
+configuration are unchanged or when a newer app-server has already loaded
+them. `--check` and `--restart-app-server` are intentionally mutually
+exclusive.
 
 After setup or any required reconnect, start a new Codex task before selecting
-a Webster model. Codex persists the model provider with each task, so a task
+a custom model. Codex persists the model provider with each task, so a task
 created before setup remains on the built-in `openai` provider even if its
-model is later changed in the picker. Selecting a Webster model in that older
+model is later changed in the picker. Selecting a custom model in that older
 task sends it to the ChatGPT backend and produces a "model is not supported
 when using Codex with a ChatGPT account" error.
 
-It is not wired into `install.sh`, because it needs both a Webster secret and an
-existing Codex login. Run it separately after the bootstrap.
+It is not wired into `install.sh`, because it needs both a custom API secret and
+an existing Codex login. Run it separately after the bootstrap.
 
 ## Claude Code + Webster proxy
 
