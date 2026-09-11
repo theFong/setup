@@ -13,9 +13,17 @@ if [[ ! -x "$stage_artifacts" ]]; then
   echo "FAIL: missing executable $stage_artifacts" >&2
   exit 1
 fi
+install_guard="webster/deepseek-v41/scripts/install-glm52-guard.sh"
+restore_config="webster/deepseek-v41/scripts/restore-litellm-config.sh"
+for required_script in "$install_guard" "$restore_config"; do
+  if [[ ! -x "$required_script" ]]; then
+    echo "FAIL: missing executable $required_script" >&2
+    exit 1
+  fi
+done
 
 scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT
+trap 'chmod -R u+w "$scratch" 2>/dev/null || true; rm -rf "$scratch"' EXIT
 fake_bin="$scratch/bin"
 mkdir -p "$fake_bin"
 export TEST_LOG="$scratch/invocations.log"
@@ -26,6 +34,17 @@ for command in ssh docker curl systemctl sha256sum nvidia-smi; do
   printf '%s\n' '#!/usr/bin/env bash' 'printf "%s %s\\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' 'exit 0' >"$command_path"
   chmod +x "$command_path"
 done
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s %s\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' \
+  '[[ "${TEST_SCP_FAIL:-0}" != "1" ]] || exit 9' \
+  'exit 0' >"$fake_bin/scp"
+chmod +x "$fake_bin/scp"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s %s\\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' \
+  'exec /usr/bin/sha256sum "$@"' >"$fake_bin/sha256sum"
+chmod +x "$fake_bin/sha256sum"
 
 export PATH="$fake_bin:$PATH"
 export WEBSTER_PREFLIGHT_TEST_MODE=1
@@ -103,5 +122,127 @@ cp "$TEST_LOG" "$scratch/first-stage.log"
 : >"$TEST_LOG"
 "$stage_artifacts" --node shamu --run-root "$valid_root"
 cmp "$scratch/first-stage.log" "$TEST_LOG"
+
+test_runs_root="$scratch/runs"
+test_run_root="$test_runs_root/20990101T000001Z"
+(
+  export WEBSTER_PREFLIGHT_TEST_MODE=1
+  export TEST_RUNS_ROOT="$test_runs_root"
+  source webster/deepseek-v41/scripts/common.sh
+  init_run_root "$test_run_root"
+)
+
+tokenizer_source="$scratch/tokenizer"
+mkdir -p "$tokenizer_source"
+for name in tokenizer.json tokenizer_config.json chat_template.jinja; do
+  printf 'fixture-%s\n' "$name" >"$tokenizer_source/$name"
+done
+candidate_config="$scratch/candidate.yaml"
+printf 'model_list: []\n' >"$candidate_config"
+chmod 0600 "$candidate_config"
+test_litellm_root="$scratch/litellm"
+
+: >"$TEST_LOG"
+expect_failure install_transfer_cleanup \
+  env TEST_SCP_FAIL=1 TEST_RUNS_ROOT="$test_runs_root" \
+    TEST_TOKENIZER_SOURCE="$tokenizer_source" \
+    "$install_guard" --candidate --run-root "$test_run_root" \
+      --candidate-config "$candidate_config"
+if ! grep -F 'for path in '\''/home/nvidia/litellm/energy-pricing/.glm52-guard-stage-' \
+    "$TEST_LOG" |
+    grep -F "' '/home/nvidia/litellm/energy-pricing/.glm52-guard-offline-" >/dev/null ||
+  ! grep -F 'rm -rf -- "$resolved"' "$TEST_LOG" >/dev/null; then
+  echo "FAIL: transfer failure did not clean both remote candidate trees" >&2
+  sed -n '1,20p' "$TEST_LOG" >&2
+  exit 1
+fi
+
+install_test_env=(
+  env
+  WEBSTER_LITELLM_TEST_MODE=1
+  TEST_RUNS_ROOT="$test_runs_root"
+  TEST_LITELLM_ROOT="$test_litellm_root"
+  TEST_TOKENIZER_SOURCE="$tokenizer_source"
+)
+"${install_test_env[@]}" "$install_guard" --candidate \
+  --run-root "$test_run_root" --candidate-config "$candidate_config"
+first_module_hash="$(sha256sum "$test_litellm_root/glm52_contract_guard.py")"
+"${install_test_env[@]}" "$install_guard" --candidate \
+  --run-root "$test_run_root" --candidate-config "$candidate_config"
+[[ "$(sha256sum "$test_litellm_root/glm52_contract_guard.py")" == "$first_module_hash" ]]
+if find "$test_litellm_root" -maxdepth 1 -name 'glm52_contract_guard.py.bak-*' | grep -q .; then
+  echo "FAIL: identical guard reinstall created a backup" >&2
+  exit 1
+fi
+
+chmod 0666 "$test_litellm_root/glm52_contract_guard.py"
+chmod 0755 "$test_litellm_root/glm52-tokenizer"
+chmod 0644 "$test_litellm_root/glm52-tokenizer/"*
+"${install_test_env[@]}" "$install_guard" --candidate \
+  --run-root "$test_run_root" --candidate-config "$candidate_config"
+[[ "$(stat -c %a "$test_litellm_root/glm52_contract_guard.py")" == "644" ]]
+[[ "$(stat -c %a "$test_litellm_root/glm52-tokenizer")" == "555" ]]
+for tokenizer_file in "$test_litellm_root/glm52-tokenizer/"*; do
+  [[ "$(stat -c %a "$tokenizer_file")" == "444" ]]
+done
+
+printf 'divergent\n' >"$test_litellm_root/glm52_contract_guard.py"
+"${install_test_env[@]}" "$install_guard" --candidate \
+  --run-root "$test_run_root" --candidate-config "$candidate_config"
+find "$test_litellm_root" -maxdepth 1 -name 'glm52_contract_guard.py.bak-*' | grep -q .
+[[ "$(sha256sum "$test_litellm_root/glm52_contract_guard.py")" == "$first_module_hash" ]]
+
+mv "$tokenizer_source/chat_template.jinja" "$scratch/missing-chat-template"
+expect_failure install_missing_tokenizer \
+  "${install_test_env[@]}" "$install_guard" --candidate \
+    --run-root "$test_run_root" --candidate-config "$candidate_config"
+mv "$scratch/missing-chat-template" "$tokenizer_source/chat_template.jinja"
+
+rollback_backup="$test_litellm_root/config.yaml.bak-alias"
+printf 'restored: true\n' >"$rollback_backup"
+chmod 0600 "$rollback_backup"
+printf 'restored: false\n' >"$test_litellm_root/config.yaml"
+chmod 0600 "$test_litellm_root/config.yaml"
+rollback_hash="$(sha256sum "$rollback_backup" | awk '{print $1}')"
+{
+  printf 'ALIAS_CONFIG_BACKUP=/home/nvidia/litellm/config.yaml.bak-alias\n'
+  printf 'ALIAS_CONFIG_SHA256=%s\n' "$rollback_hash"
+} >"$test_run_root/rollback.env"
+chmod 0600 "$test_run_root/rollback.env"
+: >"$TEST_LOG"
+restore_test_env=(
+  env
+  WEBSTER_LITELLM_TEST_MODE=1
+  TEST_RUNS_ROOT="$test_runs_root"
+  TEST_LITELLM_ROOT="$test_litellm_root"
+)
+"${restore_test_env[@]}" "$restore_config" --phase alias --run-root "$test_run_root"
+grep -qx 'restored: true' "$test_litellm_root/config.yaml"
+first_restart_count="$(grep -c '^docker restart litellm$' "$TEST_LOG" || true)"
+"${restore_test_env[@]}" "$restore_config" --phase alias --run-root "$test_run_root"
+second_restart_count="$(grep -c '^docker restart litellm$' "$TEST_LOG" || true)"
+[[ "$first_restart_count" == "1" && "$second_restart_count" == "1" ]]
+
+chmod 0644 "$test_litellm_root/config.yaml"
+"${restore_test_env[@]}" "$restore_config" --phase alias --run-root "$test_run_root"
+[[ "$(stat -c %a "$test_litellm_root/config.yaml")" == "600" ]]
+third_restart_count="$(grep -c '^docker restart litellm$' "$TEST_LOG" || true)"
+[[ "$third_restart_count" == "1" ]]
+
+expect_failure restore_not_ready \
+  env WEBSTER_LITELLM_TEST_MODE=1 TEST_RUNS_ROOT="$test_runs_root" \
+    TEST_LITELLM_ROOT="$test_litellm_root" TEST_RESTORE_READINESS=failed \
+    "$restore_config" --phase alias --run-root "$test_run_root"
+
+sed -i 's#^ALIAS_CONFIG_BACKUP=.*#ALIAS_CONFIG_BACKUP=/tmp/outside.yaml#' \
+  "$test_run_root/rollback.env"
+expect_failure restore_outside_path \
+  "${restore_test_env[@]}" "$restore_config" --phase alias --run-root "$test_run_root"
+sed -i 's#^ALIAS_CONFIG_BACKUP=.*#ALIAS_CONFIG_BACKUP=/home/nvidia/litellm/config.yaml.bak-alias#' \
+  "$test_run_root/rollback.env"
+sed -i 's/^ALIAS_CONFIG_SHA256=.*/ALIAS_CONFIG_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/' \
+  "$test_run_root/rollback.env"
+expect_failure restore_hash_mismatch \
+  "${restore_test_env[@]}" "$restore_config" --phase alias --run-root "$test_run_root"
 
 echo "cutover failure-path tests passed"

@@ -129,6 +129,18 @@ class FoundationContractTests(unittest.TestCase):
             with self.subTest(path=relative_path):
                 self.assertTrue((PACKAGE_ROOT / relative_path).is_file())
 
+    def test_litellm_cutover_files_exist(self) -> None:
+        for relative_path in (
+            "scripts/render-litellm-cutover.py",
+            "scripts/verify-litellm-config.py",
+            "scripts/verify-litellm-container.py",
+            "scripts/install-glm52-guard.sh",
+            "scripts/restore-litellm-config.sh",
+            "scripts/contract-probe.py",
+        ):
+            with self.subTest(path=relative_path):
+                self.assertTrue((PACKAGE_ROOT / relative_path).is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
