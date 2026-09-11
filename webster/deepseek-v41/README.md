@@ -4,7 +4,8 @@ This package records and executes the limited-downtime migration from the
 station-hosted GLM-5.2 engine to a separately published DeepSeek V4.1 Flash
 service. The public `glm-5.2` name remains a compatibility contract served by
 GLM-5.3: a shared 320,000-token prompt-plus-completion window, reasoning and
-function calling, no advertised vision, and the legacy reject/clamp behavior.
+function calling, no advertised vision, rejection of explicit over-budget output,
+and the legacy remaining-budget default when no output limit is supplied.
 
 ## Control sequence
 

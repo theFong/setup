@@ -52,7 +52,7 @@ Read-only characterization on the live LiteLLM 1.95.0 container established:
 ```text
 Router(enable_pre_call_checks=True)
   prompt > max_input_tokens                 -> REJECTED
-  short prompt + max_tokens=1_000_000       -> ACCEPTED
+  short prompt + max_tokens=1_000_000       -> ACCEPTED BY ROUTER PRE-CHECK
 ```
 
 The installed `_pre_call_checks()` counts only input tokens. It never combines
@@ -60,26 +60,37 @@ The installed `_pre_call_checks()` counts only input tokens. It never combines
 CPU cost and behavioral changes to every model without enforcing the legacy shared
 window.
 
-The station vLLM 0.25.1 source uses `get_max_tokens()` to compute:
+That result characterizes only LiteLLM's optional router pre-check, not the original
+backend contract. Live direct requests to the still-hot station vLLM 0.25.1 backend on
+2026-09-11 established the actual boundary behavior:
 
-```python
-effective_max_tokens = min(max_model_len - prompt_tokens, requested_or_default_max_tokens)
+```text
+319999 prompt + max_tokens 1       -> HTTP 200
+319999 prompt + max_tokens 2       -> HTTP 400
+320000 prompt + max_tokens 1       -> HTTP 400
+320000 prompt + omitted max_tokens -> HTTP 400 (effective max_tokens 0)
+320001 prompt + max_tokens 1       -> HTTP 400
+short prompt + max_tokens 1000000  -> HTTP 400
 ```
 
-It rejects only when the rendered prompt itself exceeds the model window; an explicit
-larger output request is clamped to the remaining window. Therefore the compatibility
-guard must:
+The source explains the split: `TokenizeParams` reserves an explicitly requested output
+budget before tokenization and rejects a prompt that would make the combined total exceed
+320,000. `get_max_tokens()` applies only after rendering and supplies the remaining budget
+when the output field was omitted. Explicit over-budget output is rejected, not clamped.
+Therefore the compatibility guard must:
 
 1. run only when the incoming public model is exactly `glm-5.2`;
 2. render with the original GLM-5.2 `chat_template.jinja` and `tokenizer.json`;
-3. return HTTP 400 when the rendered prompt exceeds 320,000 tokens;
-4. set the active output-limit field to `min(requested, 320000 - prompt_tokens)`;
-5. set `max_tokens` to the remaining budget when neither output-limit field is present;
+3. return HTTP 400 when the rendered prompt plus an explicit active output limit exceeds
+   320,000 tokens;
+4. preserve an explicit active output limit when the combined total fits;
+5. set `max_tokens` to the positive remaining budget when no output-limit field is
+   present, and return HTTP 400 when no output token remains;
 6. fail closed for an alias request it cannot count; and
 7. leave native `glm-5.3-flash` and all other models byte-for-byte untouched.
 
 The guard is a `CustomLogger.async_pre_call_hook`, placed first in
-`litellm_settings.callbacks`, so rejection or clamping happens before routing and before
+`litellm_settings.callbacks`, so rejection or defaulting happens before routing and before
 the GLM-5.3 backend sees the request. Its renderer is accepted only after its token IDs
 match the still-hot GLM-5.2 `/tokenize` behavior on plain, reasoning-disabled, tool,
 tool-result, structured-output, and long-boundary fixtures.
@@ -94,7 +105,7 @@ webster/deepseek-v41/
   .gitignore                             rejects live manifests, secrets, logs, images, checkpoints
   manifest.env.example                   immutable and execution-time pin field names
   litellm/
-    glm52_contract_guard.py              exact legacy prompt count and output clamp
+    glm52_contract_guard.py              exact legacy prompt count and shared-budget guard
     test_glm52_contract_guard.py         unit and golden-token contract tests
   runtime/
     Dockerfile                           pinned-source vLLM OpenAI image build wrapper
@@ -477,11 +488,12 @@ def test_prompt_over_limit_is_rejected_before_routing():
         asyncio.run(guard.async_pre_call_hook(None, None, {"model": "glm-5.2", "messages": []}, "completion"))
     self.assertEqual(error.exception.status_code, 400)
 
-def test_requested_output_is_clamped_like_old_vllm():
+def test_explicit_output_over_remaining_budget_is_rejected_like_old_vllm():
     guard = GLM52ContractGuard(counter=lambda _: 319_900)
     data = {"model": "glm-5.2", "messages": [], "max_tokens": 500}
-    result = asyncio.run(guard.async_pre_call_hook(None, None, data, "completion"))
-    self.assertEqual(result["max_tokens"], 100)
+    with self.assertRaises(HTTPException) as error:
+        asyncio.run(guard.async_pre_call_hook(None, None, data, "completion"))
+    self.assertEqual(error.exception.status_code, 400)
 
 def test_native_glm53_is_untouched():
     data = {"model": "glm-5.3-flash", "messages": [], "max_tokens": 500_000}
@@ -518,7 +530,9 @@ mount and Transformers tokenizer; do not start an engine or allocate the GPU.
 
 Require exact token-ID equality for all short fixtures. Generate boundary fixtures by
 binary-searching repeated non-special text until local counts are 319,999, 320,000, and
-320,001, and validate the old route's accept/accept/reject behavior.
+320,001. With `max_tokens: 1`, validate the old Chat Completions route's
+accept/reject/reject behavior, plus rejection of an explicit output request larger than
+the remaining shared budget.
 
 - [ ] **Step 4: Run tests in the exact LiteLLM image**
 
@@ -1222,7 +1236,8 @@ webster/deepseek-v41/scripts/restore-litellm-config.sh --phase publish --run-roo
 ## Final Verification Checklist
 
 - [ ] `glm-5.2` routes to GLM-5.3 but retains its public name, 320K shared window,
-  reasoning/function metadata, no vision, and old clamp/reject behavior.
+  reasoning/function metadata, no vision, explicit over-budget rejection, and the
+  remaining-budget default when no output limit is supplied.
 - [ ] Native `glm-5.3-flash` retains 1M and vision; Baker remains unchanged.
 - [ ] Old GLM ranks are stopped together and all rollback artifacts remain.
 - [ ] DeepSeek V4.1 runs from identical pinned checkpoint/runtime artifacts on both

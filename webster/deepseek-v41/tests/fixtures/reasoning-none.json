@@ -1,0 +1,9 @@
+{
+  "model": "glm-5.2",
+  "messages": [
+    {"role": "user", "content": "Return only the word cobalt."}
+  ],
+  "max_completion_tokens": 32,
+  "reasoning_effort": "none",
+  "temperature": 0
+}
