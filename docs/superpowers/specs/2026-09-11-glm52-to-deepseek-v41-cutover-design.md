@@ -127,8 +127,9 @@ repository: deepseek-ai/DeepSeek-V4.1-Flash
 revision:   dba1be0a40aa45a94ad051997016db3960a90277
 ```
 
-The revision contains 48 weight shards totaling 510,286,023,000 bytes
-(475.24 GiB). Engram tables account for approximately 189.13 GiB and the
+The revision's safetensors index declares 510,286,023,000 logical tensor bytes
+(475.24 GiB). Its 48 shard files total 510,296,708,312 on-disk bytes after
+safetensors headers. Engram tables account for approximately 189.13 GiB and the
 remaining weights for approximately 286.11 GiB. With TP=2, the ideal
 non-Engram GPU share is approximately 143.06 GiB per rank, leaving about
 107.63 GiB of each GPU for runtime state, graphs, activations, and KV cache.
@@ -140,6 +141,13 @@ checkpoint, the runtime image, caches, and a temporary download margin. The
 implementation plan will set the exact minimum from the downloader's real
 layout; it may not assume that the nominal 475.24 GiB checkpoint is the only
 disk consumer.
+
+The pinned release intentionally has no Jinja chat template, generation config,
+or processor config. Its protocol reference is `encoding/encoding.py` plus the
+published encoding fixtures, and the candidate vLLM source registers
+`deepseek_v41` with its native `DeepseekV4Renderer`. Checkpoint verification must
+require those published assets rather than inventing conventional Transformers
+files that do not exist at this revision.
 
 ### Runtime support state
 

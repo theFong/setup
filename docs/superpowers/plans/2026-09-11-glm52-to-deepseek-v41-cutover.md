@@ -28,7 +28,7 @@
 - Shamu is rank 0 and the only HTTP listener. Bind port 8000 only to Shamu's NetBird address `100.73.140.127`, never `0.0.0.0`, loopback, or the Webster LAN address.
 - Run station NCCL only over Shamu `10.10.1.1` and Tilikum `10.10.1.2`, interface `enP1p3s0f1np1`, HCA `mlx5_1`; do not use NetBird for collectives.
 - Preserve `--network host`, `--ipc host`, `--ulimit memlock=-1:-1`, `--ulimit stack=67108864:67108864`, `--cap-add CAP_IPC_LOCK`, and the rank-1 headless invariant.
-- Use DeepSeek V4.1 checkpoint `deepseek-ai/DeepSeek-V4.1-Flash` at revision `dba1be0a40aa45a94ad051997016db3960a90277`, exactly 48 weight shards and 510,286,023,000 weight bytes.
+- Use DeepSeek V4.1 checkpoint `deepseek-ai/DeepSeek-V4.1-Flash` at revision `dba1be0a40aa45a94ad051997016db3960a90277`, exactly 48 weight shards, 510,286,023,000 logical tensor bytes from the safetensors index, and 510,296,708,312 on-disk shard-file bytes including headers.
 - Keep a complete checkpoint on local NVMe on both stations and each rank's Engram embedding shard in that station's local pinned Grace memory; remote Engram access is a failed gate.
 - Require at least 805,306,368,000 free bytes (750 GiB) before staging on each station and at least 214,748,364,800 free bytes (200 GiB) after the checkpoint, immutable runtime, build cache, and evidence are present.
 - Do not compile GPU kernels or launch a second GPU workload while station GLM-5.2 is serving.
@@ -300,7 +300,8 @@ MIN_FREE_AFTER_STAGE_BYTES="214748364800"
 CHECKPOINT_REPO="deepseek-ai/DeepSeek-V4.1-Flash"
 CHECKPOINT_REVISION="dba1be0a40aa45a94ad051997016db3960a90277"
 CHECKPOINT_SHARDS="48"
-CHECKPOINT_WEIGHT_BYTES="510286023000"
+CHECKPOINT_TENSOR_BYTES="510286023000"
+CHECKPOINT_SHARD_FILE_BYTES="510296708312"
 ```
 
 Implement `event milestone decision reason`, `capture name command...`,
@@ -388,9 +389,14 @@ Expected: both suites pass; no SSH fake log contains a secret value.
 
 `verify-checkpoint.py PATH` loads `model.safetensors.index.json`, resolves every
 referenced weight shard, and exits nonzero unless the unique shard count is 48 and the
-sum of their `st_size` values is 510,286,023,000. It also requires config, generation
-config, tokenizer, processor, and chat-template files; rejects symlinks escaping PATH;
-and emits sorted `sha256  bytes  relative/path` lines to stdout.
+index metadata declares 510,286,023,000 logical tensor bytes while the sum of shard
+`st_size` values is 510,296,708,312. It requires `config.json`, `tokenizer.json`,
+`tokenizer_config.json`, the published `encoding/encoding.py` reference and fixtures,
+and `inference/config.json`; rejects symlinks escaping PATH; and emits sorted
+`sha256  bytes  relative/path` lines to stdout. The release intentionally contains no
+`generation_config.json`, processor config, or Jinja chat template; the candidate vLLM
+source must register the native `deepseek_v41` renderer instead of staging invented
+files.
 
 Before download, query the pinned Hugging Face revision's LFS metadata and compute
 `missing_file_bytes + largest_missing_file_bytes + 214748364800`. Require free space to
@@ -684,7 +690,8 @@ webster/deepseek-v41/scripts/stage-artifacts.sh --node tilikum --run-root "$RUN_
 ```
 
 Do not run these concurrently. Expected: identical manifests, 48 shards,
-510,286,023,000 bytes, and GLM success/latency inside the abort thresholds.
+510,286,023,000 logical tensor bytes, 510,296,708,312 on-disk shard-file bytes, and GLM
+success/latency inside the abort thresholds.
 
 - [ ] **Step 4: Stage and prove the guard without restarting LiteLLM**
 
