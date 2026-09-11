@@ -35,6 +35,10 @@ test_mode_checks() {
   local mode="${TEST_CREDENTIAL_MODE:-0600}"
   mode="${mode#0}"
   require_eq "credential mode" "600" "$mode"
+  local inspect_path="${TEST_LITELLM_INSPECT:?TEST_LITELLM_INSPECT is required}"
+  "$script_dir/verify-litellm-container.py" "$inspect_path" >/dev/null
+  require_eq "current model probe status" "ok" \
+    "${TEST_CURRENT_MODEL_PROBE_STATUS:-ok}"
   ssh shamu preflight-test >/dev/null
   ssh tilikum preflight-test >/dev/null
 }
@@ -47,6 +51,15 @@ fi
 init_run_root "$validated_root"
 write_summary_header "$phase"
 event "$phase" START "read-only preflight"
+
+inspect_path="$RUN_ROOT/baseline/litellm.inspect.redacted.json"
+inspect_temporary="$inspect_path.tmp.$$"
+ssh spark-1 'docker inspect litellm' |
+  python3 -c 'import json,sys; data=json.load(sys.stdin); data[0].get("Config", {})["Env"]=["REDACTED"]; json.dump(data,sys.stdout); print()' \
+    >"$inspect_temporary"
+chmod 0600 "$inspect_temporary"
+mv -- "$inspect_temporary" "$inspect_path"
+capture litellm-container-verify "$script_dir/verify-litellm-container.py" "$inspect_path"
 
 capture git-state bash -c \
   'git rev-parse HEAD; git status --short --branch; sha256sum docs/superpowers/specs/2026-09-11-glm52-to-deepseek-v41-cutover-design.md'
@@ -122,6 +135,99 @@ root_status="$(ssh spark-1 "curl -sS -o /dev/null -w '%{http_code}' http://127.0
 models_status="$(ssh spark-1 "curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:4444/v1/models")"
 require_eq "Caddy root status" "403" "$root_status"
 require_eq "unauthenticated model-list status" "401" "$models_status"
+
+capture current-model-probes ssh spark-1 python3 - "$(basename "$RUN_ROOT")" <<'PY'
+import json
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+import yaml
+
+change_id = sys.argv[1]
+environment = subprocess.check_output(
+    [
+        "docker",
+        "inspect",
+        "litellm",
+        "--format",
+        "{{range .Config.Env}}{{println .}}{{end}}",
+    ],
+    text=True,
+).splitlines()
+master = next(
+    line.split("=", 1)[1]
+    for line in environment
+    if line.startswith("LITELLM_MASTER_KEY=")
+)
+config = yaml.safe_load(Path("/home/nvidia/litellm/config.yaml").read_text())
+models = list(dict.fromkeys(item["model_name"] for item in config["model_list"]))
+
+
+def post(url, body, key, timeout):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body, separators=(",", ":")).encode(),
+        headers={
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.status, json.load(response)
+
+
+virtual = None
+results = []
+try:
+    _, created = post(
+        "http://127.0.0.1:4446/key/generate",
+        {
+            "key_alias": f"baseline-{change_id}",
+            "models": models,
+            "max_budget": 0.5,
+            "budget_duration": "1d",
+        },
+        master,
+        30,
+    )
+    virtual = created["key"]
+    for model in models:
+        started = time.monotonic()
+        status, payload = post(
+            "http://127.0.0.1:4444/v1/chat/completions",
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "Reply OK."}],
+                "max_tokens": 8,
+            },
+            virtual,
+            180,
+        )
+        choices = payload.get("choices")
+        if status != 200 or not isinstance(choices, list) or not choices:
+            raise RuntimeError(f"completion probe failed for {model}")
+        results.append(
+            {
+                "model": model,
+                "status": status,
+                "response_model": payload.get("model"),
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+            }
+        )
+finally:
+    if virtual is not None:
+        post(
+            "http://127.0.0.1:4446/key/delete",
+            {"keys": [virtual]},
+            master,
+            30,
+        )
+print(json.dumps({"models": results, "key_revoked": True}, sort_keys=True))
+PY
 
 capture prometheus-targets curl -fsS --max-time 10 \
   "http://$SHAMU_NETBIRD:9095/api/v1/targets?state=active"

@@ -60,6 +60,15 @@ expect_failure() {
 }
 
 valid_root="/home/ubuntu/deepseek-v41-runs/20990101T000000Z"
+valid_inspect="$scratch/litellm-inspect-valid.json"
+bad_inspect="$scratch/litellm-inspect-bad.json"
+printf '%s\n' \
+  '[{"Image":"sha256:0000000000000000000000000000000000000000000000000000000000000000","Config":{"Entrypoint":["docker/prod_entrypoint.sh"],"Cmd":["--config","/app/config.yaml","--host","127.0.0.1","--port","4446"]}}]' \
+  >"$valid_inspect"
+printf '%s\n' \
+  '[{"Image":"sha256:0000000000000000000000000000000000000000000000000000000000000000","Config":{"Entrypoint":["docker/prod_entrypoint.sh"],"Cmd":["--config","/app/config.yaml","--host","0.0.0.0","--port","4446"]}}]' \
+  >"$bad_inspect"
+export TEST_LITELLM_INSPECT="$valid_inspect"
 
 (
   export TEST_RUNS_ROOT="$scratch/runs"
@@ -84,6 +93,14 @@ expect_failure invalid_root \
 
 TEST_CREDENTIAL_MODE=0644 expect_failure bad_credential_mode \
   "$preflight" --phase baseline --run-root "$valid_root"
+
+expect_failure bad_litellm_shape \
+  env TEST_LITELLM_INSPECT="$bad_inspect" \
+    "$preflight" --phase baseline --run-root "$valid_root"
+
+expect_failure model_probe_failure \
+  env TEST_CURRENT_MODEL_PROBE_STATUS=failed \
+    "$preflight" --phase baseline --run-root "$valid_root"
 
 : >"$TEST_LOG"
 "$preflight" --phase baseline --run-root "$valid_root"
