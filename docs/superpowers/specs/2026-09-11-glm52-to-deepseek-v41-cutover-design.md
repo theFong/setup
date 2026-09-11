@@ -1,7 +1,7 @@
 # GLM-5.2 Deprecation and DeepSeek V4.1 Flash Station Cutover Design
 
 **Date:** 2026-09-11
-**Status:** Written review requested; design approved in chat
+**Status:** Approved
 
 ## Summary
 
@@ -34,7 +34,8 @@ require LiteLLM restarts.
 ## Goals
 
 - Preserve the `glm-5.2` client-visible name and existing virtual-key scopes
-  while serving those requests from the current `glm-5.3-flash` backend.
+  and its original 320K client contract while serving those requests from the
+  current `glm-5.3-flash` backend.
 - Reclaim `shamu` and `tilikum` without a GLM-5.2 client outage beyond the
   single planned LiteLLM restart.
 - Establish a reproducible, pinned vLLM runtime for DeepSeek V4.1 Flash.
@@ -86,6 +87,18 @@ prompt-length p90 of approximately 198,850 tokens, and 22,748
 support a compatibility floor of 320K for the replacement station service and
 make long-context, multi-turn behavior a primary benchmark regime rather than
 an edge case.
+
+The legacy alias retains its original compatibility contract: model name
+`glm-5.2`; a 320,000-token shared prompt-and-completion ceiling; existing
+reasoning, streaming, structured-output, and function-calling metadata; and no
+advertised vision or 1M capability. Requests above the shared 320K ceiling must
+continue to fail before reaching the GLM-5.3 backend. This preserves the option
+to restore the former backend without first unwinding client dependencies on
+GLM-5.3-only capabilities. Exact generations cannot remain identical because
+the underlying weights change; “original contract” refers to the API surface,
+advertised capabilities, limits, and failure behavior. Energy-cost metadata
+will describe the backend that actually serves the request so accounting stays
+truthful.
 
 ### Station topology
 
@@ -231,9 +244,13 @@ cutover.
 Back up `spark-1:~/litellm/config.yaml`. Change only the legacy `glm-5.2`
 deployment so it targets the existing authenticated GLM-5.3 backend. Keep the
 native `glm-5.3-flash` entry. Preserve the legacy name, virtual-key scopes,
-callbacks, Caddy policy, and all unrelated model entries. Update the alias's
-capability, context, and energy-cost metadata to describe the backend that now
-does the work; mark the description as a deprecated compatibility alias.
+callbacks, Caddy policy, all unrelated model entries, and the legacy alias's
+320K text/reasoning/function-calling contract. Do not advertise GLM-5.3's 1M or
+vision capabilities under `glm-5.2`. Update only the alias's backend and
+energy-cost attribution, and mark its description as a deprecated compatibility
+alias. Enforce the 320K shared prompt-and-completion ceiling at LiteLLM so an
+over-limit request cannot begin depending on behavior the rollback backend does
+not support.
 
 Validate YAML structure, callback imports, the expected model/deployment
 counts, backend authentication, and the rendered target before restarting.
@@ -248,7 +265,10 @@ station GLM-5.2 process. Revoke the temporary key after validation.
 the old backend receives no new alias probe, unrelated models still complete,
 a Langfuse trace records the correct alias and backend, the root/401 security
 checks are unchanged, the bind remains loopback-only, and restart count is
-zero after the deliberate restart.
+zero after the deliberate restart. `/model/info` and `/v1/models` still expose
+the original `glm-5.2` limits and capabilities, a request above the shared 320K
+limit fails without reaching GLM-5.3, and the native `glm-5.3-flash` name retains
+its independent 1M and vision contract.
 
 **Rollback:** restore the timestamped config and perform one validated LiteLLM
 restart. Because the station GLM remains hot, this rollback does not require a
@@ -259,7 +279,7 @@ model reload.
 Keep both GLM-5.2 station ranks running for 30–60 minutes after the successful
 alias change. During the soak, observe request success, p50/p90 latency,
 streaming, reasoning controls, tool calling, structured outputs, long prompts,
-vision where clients use it, cost attribution, and Langfuse traces. Compare
+over-limit rejection, cost attribution, and Langfuse traces. Compare
 `glm-5.2` compatibility-alias traffic with native `glm-5.3-flash` traffic and
 confirm that no request reaches the old station backend.
 
@@ -541,7 +561,8 @@ safe re-run behavior consistent with the setup repository's style guide.
 
 The project is complete only when:
 
-- `glm-5.2` is a verified deprecated alias to the current GLM-5.3 backend;
+- `glm-5.2` is a verified deprecated alias to the current GLM-5.3 backend while
+  retaining its original 320K client contract;
 - the old station GLM ranks are stopped but recoverable;
 - DeepSeek V4.1 Flash runs on both stations from pinned artifacts under a
   documented, reproducible configuration;
