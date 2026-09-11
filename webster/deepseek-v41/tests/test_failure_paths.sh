@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/../../.."
+
+preflight="webster/deepseek-v41/scripts/preflight.sh"
+if [[ ! -x "$preflight" ]]; then
+  echo "FAIL: missing executable $preflight" >&2
+  exit 1
+fi
+
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+fake_bin="$scratch/bin"
+mkdir -p "$fake_bin"
+export TEST_LOG="$scratch/invocations.log"
+: >"$TEST_LOG"
+
+for command in ssh docker curl systemctl sha256sum nvidia-smi; do
+  command_path="$fake_bin/$command"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s %s\\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' 'exit 0' >"$command_path"
+  chmod +x "$command_path"
+done
+
+export PATH="$fake_bin:$PATH"
+export WEBSTER_PREFLIGHT_TEST_MODE=1
+
+expect_failure() {
+  local name="$1"
+  shift
+  if "$@" >"$scratch/$name.stdout" 2>"$scratch/$name.stderr"; then
+    echo "FAIL: $name unexpectedly succeeded" >&2
+    exit 1
+  fi
+}
+
+valid_root="/home/ubuntu/deepseek-v41-runs/20990101T000000Z"
+
+TEST_FREE_BYTES=805306367999 expect_failure low_free \
+  "$preflight" --phase stage --run-root "$valid_root"
+
+TEST_MISSING_TOPOLOGY=shamu-hca expect_failure missing_hca \
+  "$preflight" --phase baseline --run-root "$valid_root"
+
+expect_failure invalid_root \
+  "$preflight" --phase baseline --run-root "$scratch/outside"
+
+TEST_CREDENTIAL_MODE=0644 expect_failure bad_credential_mode \
+  "$preflight" --phase baseline --run-root "$valid_root"
+
+: >"$TEST_LOG"
+"$preflight" --phase baseline --run-root "$valid_root"
+cp "$TEST_LOG" "$scratch/first-success.log"
+: >"$TEST_LOG"
+"$preflight" --phase baseline --run-root "$valid_root"
+cmp "$scratch/first-success.log" "$TEST_LOG"
+
+echo "cutover failure-path tests passed"

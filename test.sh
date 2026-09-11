@@ -1425,3 +1425,9 @@ if ! printf '%s' "$claude_help" | grep -q 'WEBSTER_API_KEY'; then
 fi
 
 log "all negative tests passed"
+
+python3 -m unittest discover -s webster/deepseek-v41/tests -p 'test_*.py'
+bash webster/deepseek-v41/tests/test_failure_paths.sh
+if [ -f webster/deepseek-v41/litellm/test_glm52_contract_guard.py ]; then
+  python3 webster/deepseek-v41/litellm/test_glm52_contract_guard.py
+fi
