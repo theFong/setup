@@ -244,16 +244,21 @@ else:
 PY
 }
 
+capture_credential_metadata() {
+  local host="$1" path="$2"
+  ssh "$host" stat -c 'mode=%a,owner=%U,size=%s,path=%n' -- "$path"
+  ssh "$host" sha256sum -- "$path"
+}
+
 require_file_mode_600() {
   local host="$1" path="$2" metadata mode
   if [[ "${WEBSTER_PREFLIGHT_TEST_MODE:-0}" == "1" ]]; then
     mode="${TEST_CREDENTIAL_MODE:-0600}"
   else
-    metadata="$(ssh "$host" stat -c '%a %U %s' -- "$path")" ||
+    metadata="$(ssh "$host" stat -c '%a:%U:%s' -- "$path")" ||
       die "cannot inspect credential metadata on $host"
-    mode="${metadata%% *}"
-    capture "credential-${host}" ssh "$host" sh -c \
-      "'stat -c \"mode=%a owner=%U size=%s path=$path\" -- \"$path\"; sha256sum -- \"$path\"'"
+    mode="${metadata%%:*}"
+    capture "credential-${host}" capture_credential_metadata "$host" "$path"
   fi
   mode="${mode#0}"
   require_eq "$host credential mode" "600" "$mode"

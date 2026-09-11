@@ -37,6 +37,9 @@ for command in ssh docker curl systemctl sha256sum nvidia-smi; do
     'if [[ "$(basename "$0")" == "ssh" && "$*" == *"df -PB1 /home/alecfong"* && -n "${TEST_SSH_DF_FREE:-}" ]]; then' \
     '  printf "Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/test 1000 1 %s 1%% /home/alecfong\\n" "$TEST_SSH_DF_FREE"' \
     'fi' \
+    'if [[ "$(basename "$0")" == "ssh" && "$*" == *"stat -c %a:%U:%s"* && -n "${TEST_SSH_CREDENTIAL_METADATA:-}" ]]; then' \
+    '  printf "%s\\n" "$TEST_SSH_CREDENTIAL_METADATA"' \
+    'fi' \
     'exit 0' >"$command_path"
   chmod +x "$command_path"
 done
@@ -87,6 +90,16 @@ export TEST_LITELLM_INSPECT="$valid_inspect"
   [[ "$(stat -c %a "$local_root")" == "700" ]]
   [[ "$(stat -c %a "$local_root/manifest.env")" == "600" ]]
 )
+
+credential_root="$scratch/credential-evidence"
+mkdir -p "$credential_root/logs"
+chmod 0700 "$credential_root" "$credential_root/logs"
+env WEBSTER_PREFLIGHT_TEST_MODE=0 WEBSTER_STAGE_TEST_MODE=0 \
+  TEST_SSH_CREDENTIAL_METADATA=600:nvidia:32 \
+  RUN_ROOT="$credential_root" bash -c '
+    source webster/deepseek-v41/scripts/common.sh
+    require_file_mode_600 shamu /home/alecfong/.config/glm52/vllm-api-key
+  '
 
 TEST_FREE_BYTES=805306367999 expect_failure low_free \
   "$preflight" --phase stage --run-root "$valid_root"
