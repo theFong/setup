@@ -51,3 +51,18 @@ separate cleanup approval.
 
 Append only redacted GO/NO-GO decisions here. Full evidence remains outside Git
 under `/home/ubuntu/deepseek-v41-runs/$CHANGE_ID/`.
+
+- **Milestone 1 — GO (2026-09-11):** evidence root
+  `/home/ubuntu/deepseek-v41-runs/20260911T075859Z`. The read-only baseline
+  passed for all eight existing public models with its scoped key revoked.
+  Exact byte-verified rollback state was frozen with timestamp
+  `20260911T081659Z` at
+  `spark-1:/home/nvidia/litellm/deepseek-v41-rollback-20260911T081659Z` and
+  `shamu|tilikum:/home/alecfong/deepseek-v41-rollback-20260911T081659Z`.
+  Rank 1 remained headless and keyless; no service, route, container, or model
+  process changed.
+- **Runtime pin gate — NO-GO (2026-09-11):** vLLM PR `#56214` was open,
+  non-draft, merge-blocked, unapproved, and still had 157 of 246 current commit
+  statuses pending at head `7d81d62702b41885e2ff3ebc7ad9dfb638cc429c`.
+  `VLLM_COMMIT` remains empty. No image build, checkpoint download, GPU kernel
+  compilation, or station workload was started.
