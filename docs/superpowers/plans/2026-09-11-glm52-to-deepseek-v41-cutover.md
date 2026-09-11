@@ -21,6 +21,7 @@
 - Leave native `glm-5.3-flash` on `http://100.73.165.55:8000/v1` with its independent 1,048,576-token and vision contract.
 - Do not remove, rename, repoint, pool, retune, or restart Baker's `deepseek-v4-flash` deployment at `http://100.73.127.129:8888/v1`.
 - The alias cutover and the final DeepSeek registration each receive one planned LiteLLM restart, targeting less than 30 seconds with a 60-second rollback decision threshold.
+- Before either restart, capture and validate the live LiteLLM container command shape: the immutable image supplies `docker/prod_entrypoint.sh` through `Config.Entrypoint`, so `Config.Cmd` must contain only `--config /app/config.yaml --host 127.0.0.1 --port 4446` and must never repeat the entrypoint. Any recovery recreation must pass the same check on its candidate inspect record before the old container is stopped or renamed.
 - Never use `LITELLM_MASTER_KEY` for a completion, probe, replay, or benchmark. Mint a named, model-scoped virtual key and revoke it at the end of the work block.
 - Keep the station GLM-5.2 ranks hot for 30–60 minutes after the alias restart; do not shorten this soak to start DeepSeek sooner.
 - Stop and start both ranks together. Tilikum is rank 1, always uses `--headless`, receives no serving API key, and exposes no HTTP listener.
@@ -108,6 +109,7 @@ webster/deepseek-v41/
     build-runtime.sh                     reproducible arm64 image build/save/copy/load
     render-litellm-cutover.py            semantic alias/callback rewrite with no other changes
     verify-litellm-config.py             allowed semantic diff and invariant validation
+    verify-litellm-container.py          fail-closed entrypoint/Cmd and recreation-shape validation
     install-glm52-guard.sh                idempotent callback/tokenizer install on spark-1
     restore-litellm-config.sh             phase-specific validated proxy rollback
     stop-glm52-tp2.sh                    coordinated old-engine stop with evidence capture
@@ -333,6 +335,7 @@ secret values:
 - credential path, owner, mode, size, and SHA-256 only through files written beneath
   the mode-0700 run root; terminal output shows no fingerprint;
 - LiteLLM container ID/image/start/restart/network/bind, callbacks, router plugin,
+  `Config.Entrypoint` and `Config.Cmd` as separate fields, the effective command shape,
   redacted model entries, config mode/hash, Caddy root 403, unauthenticated models 401,
   and all current model completion probes through a temporary scoped key;
 - Prometheus target health and a Langfuse trace window.
@@ -531,6 +534,7 @@ git commit -m "feat: preserve the GLM-5.2 shared token contract"
 
 - Create: `webster/deepseek-v41/scripts/render-litellm-cutover.py`
 - Create: `webster/deepseek-v41/scripts/verify-litellm-config.py`
+- Create: `webster/deepseek-v41/scripts/verify-litellm-container.py`
 - Create: `webster/deepseek-v41/scripts/install-glm52-guard.sh`
 - Create: `webster/deepseek-v41/scripts/restore-litellm-config.sh`
 - Create: `webster/deepseek-v41/scripts/contract-probe.py`
@@ -585,7 +589,27 @@ It removes `supports_vision` from only that model info and inserts
 index zero. The output is mode `0600`, is never written over the source, and is accepted
 only after `verify-litellm-config.py` returns zero.
 
-- [ ] **Step 3: Implement idempotent guard installation and offline import checks**
+- [ ] **Step 3: Implement fail-closed container-shape and recreation checks**
+
+`verify-litellm-container.py INSPECT_JSON` reads a Docker inspect object without
+printing environment values. It requires the immutable live image ID, a nonempty
+`Config.Entrypoint` containing `docker/prod_entrypoint.sh` exactly once, and
+`Config.Cmd` equal to:
+
+```text
+--config /app/config.yaml --host 127.0.0.1 --port 4446
+```
+
+It rejects any entrypoint path in `Config.Cmd`, any duplicate effective entrypoint,
+and any change to the expected host or port. Failure-path tests must reproduce the
+2026-09-11 duplicate-entrypoint crash shape and prove it is rejected. Before a planned
+restart, save the redacted live inspect and successful check beneath the run root. If a
+recreation is ever required, render its candidate inspect-equivalent JSON first and
+require the same check plus equality of image ID, mounts, network mode, restart policy,
+published ports, user, capabilities, and ulimits against the captured baseline; only
+the explicitly approved command/config delta may differ.
+
+- [ ] **Step 4: Implement idempotent guard installation and offline import checks**
 
 `install-glm52-guard.sh --candidate` copies the module and tokenizer to timestamped
 temporary paths beneath `/home/nvidia/litellm/energy-pricing`, verifies hashes and
@@ -594,7 +618,7 @@ divergent live file is backed up, never erased. Use the running LiteLLM image ID
 `--network none` to parse YAML, import every dotted callback, assert each custom object
 subclasses `CustomLogger`, and invoke the guard fixture tests.
 
-- [ ] **Step 4: Implement boundary and routing probes**
+- [ ] **Step 5: Implement boundary and routing probes**
 
 `contract-probe.py` reads a key from a mode-0600 file, never argv. It supports
 `--base-url`, `--models`, `--backend-metrics-before`, and `--output-json`. It checks
@@ -610,7 +634,7 @@ phase-specific absolute backup path from mode-0600 `rollback.env`, rejects paths
 LiteLLM once, and runs bind/readiness/root/401/cross-model checks. No rollback command
 depends on shell history or a manually substituted path.
 
-- [ ] **Step 5: Run tests and commit**
+- [ ] **Step 6: Run tests and commit**
 
 ```bash
 python3 -m unittest discover -s webster/deepseek-v41/tests -p 'test_*.py'
@@ -715,7 +739,10 @@ allowed-diff validation against that exact live file, and rename the candidate o
 
 - [ ] **Step 3: Restart LiteLLM once and enforce the 60-second decision**
 
-Record `date +%s%N`, run `docker restart litellm`, and poll readiness every second.
+Capture the live Docker inspect, run `verify-litellm-container.py`, and store the
+redacted command-shape evidence under the run root. Abort before the restart if the
+entrypoint/Cmd check fails. Then record `date +%s%N`, run `docker restart litellm`, and
+poll readiness every second.
 When ready, record duration, ID, start time, bind, restart count, callback imports, and
 logs. If not ready by 60 seconds, inspect logs once, restore the named backup, restart
 once, and stop the milestone.
@@ -1106,7 +1133,8 @@ input/output energy costs from the accepted Weka profile.
 - [ ] **Step 2: Validate offline and perform the second planned restart**
 
 Back up the exact live config, render to a candidate, run semantic diff, parse/import in
-the pinned LiteLLM image with `--network none`, atomically promote, and restart once.
+the pinned LiteLLM image with `--network none`, atomically promote, capture the live
+inspect, and require `verify-litellm-container.py` to pass before restarting once.
 If readiness is absent at 60 seconds or any cross-model probe fails, restore the backup,
 restart once, and leave DeepSeek private.
 
