@@ -25,6 +25,13 @@ done
 validate_phase "$phase"
 validated_root="$(validate_run_root "$run_root")"
 
+station_free_bytes() {
+  local node="$1" value
+  value="$(ssh "$node" df -PB1 /home/alecfong | awk 'NR == 2 {print $4}')"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$node free-space query returned a non-integer"
+  printf '%s\n' "$value"
+}
+
 test_mode_checks() {
   if [[ "$phase" == "stage" ]]; then
     require_ge "free bytes before staging" "$MIN_FREE_BEFORE_STAGE_BYTES" \
@@ -39,6 +46,10 @@ test_mode_checks() {
   "$script_dir/verify-litellm-container.py" "$inspect_path" >/dev/null
   require_eq "current model probe status" "ok" \
     "${TEST_CURRENT_MODEL_PROBE_STATUS:-ok}"
+  if [[ "${TEST_VALIDATE_STATION_FREE:-0}" == "1" ]]; then
+    station_free_bytes shamu >/dev/null
+    station_free_bytes tilikum >/dev/null
+  fi
   ssh shamu preflight-test >/dev/null
   ssh tilikum preflight-test >/dev/null
 }
@@ -71,8 +82,8 @@ capture shamu-host ssh shamu \
 capture tilikum-host ssh tilikum \
   'set -eu; hostname; date -u +%Y-%m-%dT%H:%M:%SZ; uptime; uname -a; nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader; free -b; df -PB1 /home/alecfong; ip -o addr show; cat /sys/class/infiniband/mlx5_1/ports/1/state; sudo -n docker inspect glm52-full-mtp --format "id={{.Id}} image={{.Image}} started={{.State.StartedAt}} restarts={{.RestartCount}} running={{.State.Running}} args={{json .Args}}"; ss -lntp'
 
-shamu_free="$(ssh shamu "df -PB1 /home/alecfong | awk 'NR==2 {print \\$4}'")"
-tilikum_free="$(ssh tilikum "df -PB1 /home/alecfong | awk 'NR==2 {print \\$4}'")"
+shamu_free="$(station_free_bytes shamu)"
+tilikum_free="$(station_free_bytes tilikum)"
 if [[ "$phase" == "stage" ]]; then
   require_ge "Shamu free bytes before staging" "$MIN_FREE_BEFORE_STAGE_BYTES" "$shamu_free"
   require_ge "Tilikum free bytes before staging" "$MIN_FREE_BEFORE_STAGE_BYTES" "$tilikum_free"

@@ -31,7 +31,13 @@ export TEST_LOG="$scratch/invocations.log"
 
 for command in ssh docker curl systemctl sha256sum nvidia-smi; do
   command_path="$fake_bin/$command"
-  printf '%s\n' '#!/usr/bin/env bash' 'printf "%s %s\\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' 'exit 0' >"$command_path"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s %s\\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' \
+    'if [[ "$(basename "$0")" == "ssh" && "$*" == *"df -PB1 /home/alecfong"* && -n "${TEST_SSH_DF_FREE:-}" ]]; then' \
+    '  printf "Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/test 1000 1 %s 1%% /home/alecfong\\n" "$TEST_SSH_DF_FREE"' \
+    'fi' \
+    'exit 0' >"$command_path"
   chmod +x "$command_path"
 done
 printf '%s\n' \
@@ -100,6 +106,10 @@ expect_failure bad_litellm_shape \
 
 expect_failure model_probe_failure \
   env TEST_CURRENT_MODEL_PROBE_STATUS=failed \
+    "$preflight" --phase baseline --run-root "$valid_root"
+
+expect_failure malformed_station_free \
+  env TEST_VALIDATE_STATION_FREE=1 TEST_SSH_DF_FREE=not-an-integer \
     "$preflight" --phase baseline --run-root "$valid_root"
 
 : >"$TEST_LOG"
