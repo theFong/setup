@@ -53,7 +53,8 @@ class FoundationContractTests(unittest.TestCase):
             'CHECKPOINT_REPO="deepseek-ai/DeepSeek-V4.1-Flash"',
             'CHECKPOINT_REVISION="dba1be0a40aa45a94ad051997016db3960a90277"',
             'CHECKPOINT_SHARDS="48"',
-            'CHECKPOINT_WEIGHT_BYTES="510286023000"',
+            'CHECKPOINT_TENSOR_BYTES="510286023000"',
+            'CHECKPOINT_SHARD_FILE_BYTES="510296708312"',
         ):
             self.assertIn(literal, common)
 
@@ -119,6 +120,14 @@ class FoundationContractTests(unittest.TestCase):
                 runner,
             )
         )
+
+    def test_staging_files_exist(self) -> None:
+        for relative_path in (
+            "scripts/stage-artifacts.sh",
+            "scripts/verify-checkpoint.py",
+        ):
+            with self.subTest(path=relative_path):
+                self.assertTrue((PACKAGE_ROOT / relative_path).is_file())
 
 
 if __name__ == "__main__":
