@@ -78,3 +78,20 @@ under `/home/ubuntu/deepseek-v41-runs/$CHANGE_ID/`.
   earlier uv-cache, missing-tag, wheel-limit, help-device, and registry-glob
   NO-GO failures. No route, listener, checkpoint, or GPU owner changed; GLM
   remained live throughout.
+- **Milestone 2 — GO (2026-09-12):** the pinned 48-shard checkpoint at revision
+  `dba1be0a40aa45a94ad051997016db3960a90277` passed two complete hash passes
+  per station and cross-node byte comparison. Both 9,257-byte manifests have
+  SHA-256 `aad652a2b601f711599298493229f32fcc7216ca17d6bb0ccd451fd2fdd01fef`;
+  Shamu retained 1,187,905,433,600 free bytes and Tilikum retained
+  2,241,969,221,632. The low-priority rail seed and verifier windows recorded
+  no production regression. The compatibility guard and original tokenizer
+  then passed 18 tests inside the exact live LiteLLM image without a restart.
+- **Milestone 3 — GO (2026-09-12):** the `glm-5.2` public deployment now uses
+  the existing GLM-5.3 backend while retaining the original shared 320,000-token
+  contract and public response name. The first planned LiteLLM restart became
+  ready in 10.273 seconds with restart count zero and the required loopback-only
+  command shape. Its exact rollback file is
+  `spark-1:/home/nvidia/litellm/config.yaml.bak-deepseek-v41-alias-20260912T075404Z`.
+  Private and public probes covered text, streaming, reasoning, tools, tool
+  results, structured output, and a pre-backend 320,001-token rejection; the
+  old station chat counter remained 16,400 while the GLM-5.3 counter advanced.
