@@ -63,6 +63,9 @@ class FoundationContractTests(unittest.TestCase):
         for field in (
             "VLLM_COMMIT",
             "VLLM_BASE_IMAGE_DIGEST",
+            "VLLM_BUILD_BASE_IMAGE_DIGEST",
+            "VLLM_FINAL_BASE_IMAGE_DIGEST",
+            "VLLM_SOURCE_ARCHIVE_SHA256",
             "VLLM_IMAGE_ID",
             "VLLM_IMAGE_TAR_SHA256",
             "AIPERF_COMMIT",
@@ -129,6 +132,10 @@ class FoundationContractTests(unittest.TestCase):
             with self.subTest(path=relative_path):
                 self.assertTrue((PACKAGE_ROOT / relative_path).is_file())
 
+    def test_checkpoint_downloader_keeps_xet_enabled(self) -> None:
+        staging = read("scripts/stage-artifacts.sh")
+        self.assertNotIn("HF_HUB_DISABLE_XET=1", staging)
+
     def test_litellm_cutover_files_exist(self) -> None:
         for relative_path in (
             "scripts/render-litellm-cutover.py",
@@ -140,6 +147,29 @@ class FoundationContractTests(unittest.TestCase):
         ):
             with self.subTest(path=relative_path):
                 self.assertTrue((PACKAGE_ROOT / relative_path).is_file())
+
+    def test_runtime_package_files_exist(self) -> None:
+        for relative_path in (
+            "runtime/Dockerfile",
+            "runtime/constraints.txt",
+            "runtime/README.md",
+            "scripts/build-runtime.sh",
+        ):
+            with self.subTest(path=relative_path):
+                self.assertTrue((PACKAGE_ROOT / relative_path).is_file())
+
+    def test_runtime_wrapper_cannot_mutate_upstream_image(self) -> None:
+        dockerfile = read("runtime/Dockerfile")
+        instructions = [
+            line.split(maxsplit=1)[0].upper()
+            for line in dockerfile.splitlines()
+            if line and not line.startswith("#")
+        ]
+        self.assertEqual(instructions.count("FROM"), 1)
+        self.assertIn("ARG", instructions)
+        self.assertIn("LABEL", instructions)
+        for forbidden in ("ADD", "COPY", "RUN"):
+            self.assertNotIn(forbidden, instructions)
 
 
 if __name__ == "__main__":

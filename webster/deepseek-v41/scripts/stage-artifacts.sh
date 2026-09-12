@@ -28,7 +28,21 @@ case "$node" in
 esac
 validated_root="$(validate_run_root "$run_root")"
 
+STAGE_SSH_TIMEOUT_SECONDS="${STAGE_SSH_TIMEOUT_SECONDS:-20}"
+[[ "$STAGE_SSH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+  die "STAGE_SSH_TIMEOUT_SECONDS must be a positive integer"
+(( STAGE_SSH_TIMEOUT_SECONDS <= 120 )) ||
+  die "STAGE_SSH_TIMEOUT_SECONDS must not exceed 120"
+
+stage_quick_ssh() {
+  timeout --foreground --signal=TERM --kill-after=5 \
+    "$STAGE_SSH_TIMEOUT_SECONDS" \
+    ssh -o BatchMode=yes -o ConnectTimeout=5 \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "$@"
+}
+
 if [[ "${WEBSTER_STAGE_TEST_MODE:-0}" == "1" ]]; then
+  check_glm_health
   require_ge "free bytes before staging" "$MIN_FREE_BEFORE_STAGE_BYTES" \
     "${TEST_FREE_BYTES:-$MIN_FREE_BEFORE_STAGE_BYTES}"
   [[ "${TEST_STAGE_FINAL_STATE:-absent}" != "divergent" ]] ||
@@ -49,7 +63,8 @@ if [[ "${WEBSTER_STAGE_TEST_MODE:-0}" == "1" ]]; then
         die "GLM success/latency breached for two consecutive staging windows"
     done <<<"$TEST_STAGE_HEALTH_WINDOWS"
   fi
-  ssh "$node" stage-artifacts-test >/dev/null
+  stage_quick_ssh "$node" stage-artifacts-test >/dev/null ||
+    die "bounded staging SSH probe failed"
   exit 0
 fi
 
@@ -64,7 +79,7 @@ verifier="$script_dir/verify-checkpoint.py"
 [[ -f "$verifier" ]] || die "missing checkpoint verifier"
 
 event "stage-$node" START "immutable checkpoint staging"
-ssh "$node" "curl -fsS --max-time 5 'http://$SHAMU_NETBIRD:$CANARY_PORT/health' >/dev/null" ||
+check_glm_health ||
   die "GLM health failed before staging on $node"
 
 baseline_p90=""
@@ -163,7 +178,7 @@ PY
 required_bytes=$((missing_bytes + largest_missing + MIN_FREE_AFTER_STAGE_BYTES))
 (( required_bytes < MIN_FREE_BEFORE_STAGE_BYTES )) &&
   required_bytes="$MIN_FREE_BEFORE_STAGE_BYTES"
-free_bytes="$(ssh "$node" "df -PB1 '$model_parent' 2>/dev/null | awk 'NR==2 {print \\$4}' || df -PB1 /home/alecfong | awk 'NR==2 {print \\$4}'")"
+free_bytes="$(remote_available_bytes "$node" "$model_parent")"
 require_ge "$node free bytes for staging" "$required_bytes" "$free_bytes"
 
 verify_remote() {
@@ -196,10 +211,11 @@ download_image="$shamu_downloader_image"
 event "stage-$node" GO "downloader image=$download_image runtime=runc gpu=none"
 download_active=0
 stage_complete=0
+preserve_download_on_exit=0
 
 remote_download_pid() {
   local pid
-  pid="$(ssh "$node" "test -s '$download_pid' && cat '$download_pid'" 2>/dev/null || true)"
+  pid="$(stage_quick_ssh "$node" "test -s '$download_pid' && cat '$download_pid'" 2>/dev/null || true)"
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   printf '%s\n' "$pid"
 }
@@ -207,7 +223,12 @@ remote_download_pid() {
 remote_download_is_running() {
   local pid
   pid="$(remote_download_pid)" || return 1
-  ssh "$node" "/bin/kill -0 -- '-$pid' 2>/dev/null"
+  stage_quick_ssh "$node" "/bin/kill -0 -- '-$pid' 2>/dev/null"
+}
+
+remote_download_state() {
+  stage_quick_ssh "$node" \
+    "if test -s '$download_status'; then printf complete; elif test -s '$download_pid'; then pid=\$(cat '$download_pid'); if test -n \"\$pid\" && /bin/kill -0 -- \"-\$pid\" 2>/dev/null; then printf running; else printf stopped; fi; else printf missing; fi"
 }
 
 capture_download_evidence() {
@@ -279,7 +300,6 @@ esac
   --user "$(id -u):$(id -g)" \
   --env HOME=/tmp \
   --env HF_HUB_DISABLE_TELEMETRY=1 \
-  --env HF_HUB_DISABLE_XET=1 \
   --env NVIDIA_VISIBLE_DEVICES=void \
   --volume "$incomplete:$incomplete" \
   --entrypoint ionice \
@@ -311,10 +331,12 @@ cancel_remote_download() {
 cleanup_on_exit() {
   local status=$?
   trap - EXIT
-  if (( status != 0 && download_active == 1 && stage_complete == 0 )); then
+  if (( status != 0 && download_active == 1 && stage_complete == 0 && preserve_download_on_exit == 0 )); then
     cancel_remote_download || true
     capture_download_evidence "abort-$(date -u +%Y%m%dT%H%M%SZ)" || true
     event "stage-$node" NO-GO "download cancelled after staging gate failure" || true
+  elif (( status != 0 && preserve_download_on_exit == 1 )); then
+    event "stage-$node" DEFER "monitor transport unavailable; durable downloader left running" || true
   fi
   exit "$status"
 }
@@ -337,22 +359,37 @@ else
       ssh "$node" "rm -f -- '$download_log' '$download_status' '$download_pid' '$download_runner'"
     fi
   fi
-  if ! ssh "$node" test -s "$download_status" && ! remote_download_is_running; then
-    start_remote_download
-  fi
-  if ! ssh "$node" test -s "$download_status"; then
-    remote_download_is_running || die "checkpoint downloader failed to start on $node"
-    download_active=1
-  fi
+  download_state="$(remote_download_state)" || {
+    preserve_download_on_exit=1
+    die "cannot observe checkpoint downloader over bounded SSH on $node"
+  }
+  case "$download_state" in
+    complete) ;;
+    running) download_active=1 ;;
+    missing|stopped)
+      start_remote_download
+      download_state="$(remote_download_state)" || {
+        preserve_download_on_exit=1
+        die "cannot observe newly started checkpoint downloader on $node"
+      }
+      require_eq "$node checkpoint downloader state" running "$download_state"
+      download_active=1
+      ;;
+    *) die "invalid checkpoint downloader state: $download_state" ;;
+  esac
 
   window=0
   consecutive_failures=0
-  while ! ssh "$node" test -s "$download_status"; do
+  while [[ "$download_state" != complete ]]; do
     sleep 60
     window=$((window + 1))
-    if ! remote_download_is_running && ! ssh "$node" test -s "$download_status"; then
+    download_state="$(remote_download_state)" || {
+      preserve_download_on_exit=1
+      die "cannot observe checkpoint downloader over bounded SSH on $node"
+    }
+    [[ "$download_state" != stopped && "$download_state" != missing ]] ||
       die "checkpoint downloader exited without a completion record on $node"
-    fi
+    [[ "$download_state" != complete ]] || break
     window_snapshot="$RUN_ROOT/metrics/stage-$node-window-$(printf '%05d' "$window").json"
     write_glm_window_snapshot "$window_snapshot" 1m ||
       die "cannot capture GLM staging window from Prometheus"
@@ -371,7 +408,7 @@ PY
       die "invalid GLM staging-window metrics"
     window_bad=0
     [[ "$decision" != BREACH\ * ]] || window_bad=1
-    if ! ssh "$node" "curl -fsS --max-time 5 'http://$SHAMU_NETBIRD:$CANARY_PORT/health' >/dev/null"; then
+    if ! check_glm_health; then
       decision="BREACH direct-health-check-failed;$decision"
       window_bad=1
     fi
@@ -389,7 +426,10 @@ PY
       die "GLM success/latency failed for two consecutive staging windows"
   done
   download_active=0
-  status_line="$(ssh "$node" "cat '$download_status'")"
+  status_line="$(stage_quick_ssh "$node" "cat '$download_status'")" || {
+    preserve_download_on_exit=1
+    die "cannot read checkpoint completion record over bounded SSH on $node"
+  }
   capture_download_evidence "complete-$(date -u +%Y%m%dT%H%M%SZ)"
   require_eq "$node checkpoint download" "EXIT=0" "$status_line"
   ssh "$node" "rm -f -- '$download_log' '$download_status' '$download_pid' '$download_runner'; if test -d '$incomplete_path/.cache'; then rm -rf -- '$incomplete_path/.cache'; fi"
@@ -404,7 +444,7 @@ PY
   event "stage-$node" GO "checkpoint downloaded, verified, and made immutable"
 fi
 
-free_bytes="$(ssh "$node" "df -PB1 '$final_path' | awk 'NR==2 {print \\$4}'")"
+free_bytes="$(remote_available_bytes "$node" "$final_path")"
 require_ge "$node post-stage free bytes" "$MIN_FREE_AFTER_STAGE_BYTES" "$free_bytes"
 
 other_node="shamu"

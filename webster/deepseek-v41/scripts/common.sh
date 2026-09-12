@@ -16,16 +16,36 @@ CHECKPOINT_REVISION="dba1be0a40aa45a94ad051997016db3960a90277"
 CHECKPOINT_SHARDS="48"
 CHECKPOINT_TENSOR_BYTES="510286023000"
 CHECKPOINT_SHARD_FILE_BYTES="510296708312"
+VLLM_BUILD_BASE_IMAGE_TAG="pytorch/manylinuxaarch64-builder:cuda13.0-b8b5f17a7d9ccfc25bbc5cf17b3fcea12964a042"
+VLLM_BUILD_BASE_IMAGE_DIGEST="sha256:994bed2b225a9ff0f6fbe85c85fe84fbeac9031bb909442e18178484798529df"
+VLLM_FINAL_BASE_IMAGE_TAG="nvidia/cuda:13.0.3-base-ubuntu24.04"
+VLLM_FINAL_BASE_IMAGE_DIGEST="sha256:56d9d8183e2181a20be6b0d3801d1f056a0e75c17706df939ba207b126e1cb9c"
+VLLM_CUDA_VERSION="13.0.3"
+VLLM_NCCL_VERSION="2.30.7"
+VLLM_ARM64_ARCH_LIST="9.0 10.0 11.0 12.0"
+VLLM_MAX_WHEEL_SIZE_MB="700"
 PROMETHEUS_URL="http://100.73.140.127:9095"
 GLM_METRICS_INSTANCE="100.73.140.127:8000"
 STAGE_MIN_SUCCESS_RATE="0.99"
 STAGE_LATENCY_MULTIPLIER="2.0"
 STAGE_BASELINE_MIN_REQUESTS="20"
-if [[ "${WEBSTER_PREFLIGHT_TEST_MODE:-0}" == "1" || "${WEBSTER_STAGE_TEST_MODE:-0}" == "1" ]]; then
+if [[ "${WEBSTER_PREFLIGHT_TEST_MODE:-0}" == "1" ||
+  "${WEBSTER_STAGE_TEST_MODE:-0}" == "1" ||
+  "${WEBSTER_RUNTIME_TEST_MODE:-0}" == "1" ||
+  "${WEBSTER_LIFECYCLE_TEST_MODE:-0}" == "1" ]]; then
   RUNS_ROOT="${TEST_RUNS_ROOT:-/home/ubuntu/deepseek-v41-runs}"
 else
   RUNS_ROOT="/home/ubuntu/deepseek-v41-runs"
 fi
+
+GLM_CONTAINER="glm52-full-mtp"
+DEEPSEEK_CONTAINER="deepseek-v41-flash-tp2"
+DEEPSEEK_CHECKPOINT_DIR="DeepSeek-V4.1-Flash-${CHECKPOINT_REVISION:0:10}"
+DEEPSEEK_REMOTE_ROOT="/home/alecfong/deepseek-v41"
+DEEPSEEK_CHECKPOINT_PATH="$DEEPSEEK_REMOTE_ROOT/models/$DEEPSEEK_CHECKPOINT_DIR"
+DEEPSEEK_CACHE_PATH="$DEEPSEEK_REMOTE_ROOT/cache"
+DEEPSEEK_API_ENV_FILE="$DEEPSEEK_REMOTE_ROOT/credentials/vllm-api.env"
+DEEPSEEK_SERVED_MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -75,7 +95,10 @@ init_run_root() {
       printf 'CHECKPOINT_SHARDS=%s\n' "$CHECKPOINT_SHARDS"
       printf 'CHECKPOINT_TENSOR_BYTES=%s\n' "$CHECKPOINT_TENSOR_BYTES"
       printf 'CHECKPOINT_SHARD_FILE_BYTES=%s\n' "$CHECKPOINT_SHARD_FILE_BYTES"
-      printf 'VLLM_COMMIT=\nVLLM_BASE_IMAGE_DIGEST=\nVLLM_IMAGE_ID=\n'
+      printf 'VLLM_COMMIT=\nVLLM_BASE_IMAGE_DIGEST=\n'
+      printf 'VLLM_BUILD_BASE_IMAGE_DIGEST=\nVLLM_FINAL_BASE_IMAGE_DIGEST=\n'
+      printf 'VLLM_SOURCE_ARCHIVE_SHA256=\nVLLM_IMAGE_ID=\n'
+      printf 'VLLM_MAX_WHEEL_SIZE_MB=%s\n' "$VLLM_MAX_WHEEL_SIZE_MB"
       printf 'VLLM_IMAGE_TAR_SHA256=\nAIPERF_COMMIT=\nWEKA_REPOSITORY=\nWEKA_REVISION=\n'
     } >"$RUN_ROOT/manifest.env"
     chmod 0600 "$RUN_ROOT/manifest.env"
@@ -94,7 +117,7 @@ event() {
 redact_stream() {
   sed -E \
     -e 's/(Authorization:[[:space:]]*Bearer)[[:space:]]+[^[:space:]]+/\1 [REDACTED]/Ig' \
-    -e "s/((api[_-]?key|master[_-]?key|password|secret|token)[\"']?[[:space:]]*[:=][[:space:]]*)[^,[:space:]\"']+/\\1[REDACTED]/Ig" \
+    -e "s/((api[_-]?keys?|master[_-]?key|password|secret|token)[\"']?[[:space:]]*[:=][[:space:]]*)[^,[:space:]\"']+/\\1[REDACTED]/Ig" \
     -e 's/sk-[A-Za-z0-9._-]{8,}/[REDACTED-KEY]/g'
 }
 
@@ -115,6 +138,24 @@ capture() {
   return "$status"
 }
 
+check_glm_health() {
+  curl -fsS --connect-timeout 3 --max-time 5 \
+    "http://$SHAMU_NETBIRD:$CANARY_PORT/health" >/dev/null
+}
+
+remote_available_bytes() {
+  local node="$1" requested_path="$2" output available
+  if ! output="$(
+    ssh "$node" df -B1 --output=avail "$requested_path" 2>/dev/null
+  )"; then
+    output="$(ssh "$node" df -B1 --output=avail /home/alecfong)"
+  fi
+  available="$(awk 'NR == 2 {print $1}' <<<"$output")"
+  [[ "$available" =~ ^[0-9]+$ ]] ||
+    die "remote free-space query returned a non-integer for $node"
+  printf '%s\n' "$available"
+}
+
 require_eq() {
   local label="$1" expected="$2" actual="$3"
   [[ "$actual" == "$expected" ]] ||
@@ -125,6 +166,29 @@ require_ge() {
   local label="$1" minimum="$2" actual="$3"
   [[ "$actual" =~ ^[0-9]+$ ]] || die "$label is not an integer"
   (( actual >= minimum )) || die "$label is below required floor"
+}
+
+create_tagged_git_bundle() {
+  local source_dir="$1" output="$2" expected_commit="$3"
+  local temporary bundle_head tag_count
+  require_eq "source bundle HEAD" "$expected_commit" \
+    "$(git -C "$source_dir" rev-parse HEAD)"
+  git -C "$source_dir" describe --tags "$expected_commit" >/dev/null
+  if [[ -f "$output" ]]; then
+    git -C "$source_dir" bundle verify "$output" >/dev/null 2>&1
+    bundle_head="$(git bundle list-heads "$output" | awk '$2 == "HEAD" {print $1}')"
+    require_eq "existing source bundle HEAD" "$expected_commit" "$bundle_head"
+    tag_count="$(git bundle list-heads "$output" | awk '$2 ~ /^refs\/tags\// {count++} END {print count+0}')"
+    (( tag_count > 0 )) || die "existing source bundle contains no tags"
+    return 0
+  fi
+  temporary="$output.tmp.$$"
+  git -C "$source_dir" bundle create "$temporary" HEAD --tags
+  bundle_head="$(git bundle list-heads "$temporary" | awk '$2 == "HEAD" {print $1}')"
+  require_eq "new source bundle HEAD" "$expected_commit" "$bundle_head"
+  tag_count="$(git bundle list-heads "$temporary" | awk '$2 ~ /^refs\/tags\// {count++} END {print count+0}')"
+  (( tag_count > 0 )) || die "new source bundle contains no tags"
+  mv "$temporary" "$output"
 }
 
 write_glm_window_snapshot() {

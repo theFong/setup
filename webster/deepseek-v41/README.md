@@ -66,3 +66,15 @@ under `/home/ubuntu/deepseek-v41-runs/$CHANGE_ID/`.
   statuses pending at head `7d81d62702b41885e2ff3ebc7ad9dfb638cc429c`.
   `VLLM_COMMIT` remains empty. No image build, checkpoint download, GPU kernel
   compilation, or station workload was started.
+- **Runtime package gate — GO (2026-09-12):** PR `#56214` merged and the
+  selected source is its merge commit
+  `e77daef89e18e08321ae7b8b24827eedd5fe8673`. The arm64 image
+  `sha256:3863bf0f59bd4df4012b7b7aed8a7d2be6ef9b42ee3a5299d014f83a1f1ba6ea`
+  and saved-image checksum match on Shamu and Tilikum. The upstream four-family
+  architecture build produced a 613.97 MiB wheel, so the private build retains
+  the upstream size check with a recorded 700 MiB ceiling below its 800 MiB
+  quota. GPU-blind checks verified `DeepseekV41ForCausalLM`,
+  `--engram-config`, and nonempty Engram layers. The evidence preserves the
+  earlier uv-cache, missing-tag, wheel-limit, help-device, and registry-glob
+  NO-GO failures. No route, listener, checkpoint, or GPU owner changed; GLM
+  remained live throughout.
