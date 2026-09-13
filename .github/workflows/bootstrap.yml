@@ -91,6 +91,7 @@ jobs:
         run: |
           {
             echo "$HOME/.local/bin"
+            echo "$HOME/.local/share/setup/go/current/bin"
             echo "$HOME/.opencode/bin"
             echo "/usr/local/go/bin"
           } >> "$GITHUB_PATH"

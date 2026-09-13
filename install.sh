@@ -122,34 +122,6 @@ pm_install() {
   esac
 }
 
-# Homebrew's --build-from-source flag applies to the named formula but not to
-# dependencies. On Tier 3 Intel macOS, a dependency without a bottle therefore
-# aborts the source build before it starts. Install declared dependencies in
-# topological order, retrying only unavailable/outdated ones from source, then
-# build the requested formula.
-brew_install_from_source() {
-  local tool="$1" deps dep action
-  if ! deps=$(brew deps --topological --include-build "$tool"); then
-    warn "could not resolve Homebrew dependencies for $tool"
-    return 1
-  fi
-  while IFS= read -r dep; do
-    [ -n "$dep" ] || continue
-    action="install"
-    if brew list --versions "$dep" >/dev/null 2>&1; then
-      action="upgrade"
-    fi
-    if ! brew "$action" "$dep"; then
-      warn "Homebrew binary $action failed for $tool dependency $dep; retrying from source"
-      if ! brew "$action" --build-from-source "$dep"; then
-        warn "Homebrew source $action failed for $tool dependency $dep"
-        return 1
-      fi
-    fi
-  done <<< "$deps"
-  brew install --build-from-source "$tool"
-}
-
 # add_path DIR — prepend to current PATH and persist to the user's shell rc.
 add_path() {
   local dir="$1" profile
@@ -162,6 +134,131 @@ add_path() {
   touch "$profile"
   grep -qF "$dir" "$profile" 2>/dev/null || \
     printf '\nexport PATH="%s:$PATH"\n' "$dir" >> "$profile"
+}
+
+verify_sha256() {
+  local file="$1" expected="$2" actual
+  actual=$(shasum -a 256 "$file" | awk '{print $1}') || return 1
+  [ -n "$expected" ] && [ "$actual" = "$expected" ]
+}
+
+# Intel macOS 15 is a Homebrew Tier 3 platform. Use upstream release artifacts
+# for Go and fzf instead of compiling through Homebrew's unsupported dependency
+# path. Both downloads are checked against checksums published by their owners.
+install_go_darwin_archive() {
+  local metadata version asset expected tmpd install_base install_root
+  metadata=$(curl -fsSL 'https://go.dev/dl/?mode=json') || return 1
+  version=$(printf '%s' "$metadata" | jq -er 'map(select(.stable))[0].version') || return 1
+  asset="${version}.darwin-amd64.tar.gz"
+  expected=$(printf '%s' "$metadata" | jq -er --arg asset "$asset" \
+    'map(select(.stable))[0].files[] | select(.filename == $asset) | .sha256') || return 1
+  tmpd=$(mktemp -d)
+  if ! curl -fsSL "https://go.dev/dl/${asset}" -o "$tmpd/$asset" ||
+     ! verify_sha256 "$tmpd/$asset" "$expected" ||
+     ! tar -C "$tmpd" -xzf "$tmpd/$asset"; then
+    warn "failed to download or verify Go release $version"
+    rm -rf "$tmpd"
+    return 1
+  fi
+  install_base="$HOME/.local/share/setup/go"
+  install_root="$install_base/$version"
+  mkdir -p "$install_base"
+  if [ -e "$install_root" ] && [ ! -x "$install_root/bin/go" ]; then
+    rm -rf "$install_root"
+  fi
+  if [ ! -e "$install_root" ]; then
+    mv "$tmpd/go" "$install_root"
+  fi
+  ln -sfn "$version" "$install_base/current"
+  rm -rf "$tmpd"
+  add_path "$install_base/current/bin"
+}
+
+install_fzf_darwin_archive() {
+  local metadata version asset url checksums_url expected tmpd
+  metadata=$(curl -fsSL 'https://formulae.brew.sh/api/formula/fzf.json') || return 1
+  version=$(printf '%s' "$metadata" | jq -er '.versions.stable') || return 1
+  asset="fzf-${version}-darwin_amd64.tar.gz"
+  url="https://github.com/junegunn/fzf/releases/download/v${version}/${asset}"
+  checksums_url="https://github.com/junegunn/fzf/releases/download/v${version}/fzf_${version}_checksums.txt"
+  tmpd=$(mktemp -d)
+  expected=$(curl -fsSL "$checksums_url" | awk -v asset="$asset" '$2 == asset {print $1; exit}') || true
+  if [ -z "$expected" ] ||
+     ! curl -fsSL "$url" -o "$tmpd/$asset" ||
+     ! verify_sha256 "$tmpd/$asset" "$expected" ||
+     ! tar -C "$tmpd" -xzf "$tmpd/$asset" fzf; then
+    warn "failed to download or verify fzf release $version"
+    rm -rf "$tmpd"
+    return 1
+  fi
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 "$tmpd/fzf" "$HOME/.local/bin/fzf"
+  rm -rf "$tmpd"
+  add_path "$HOME/.local/bin"
+}
+
+# tmux does not publish macOS binaries. Build its official release directly
+# against existing Homebrew libraries, avoiding Homebrew's forced upgrades of
+# unrelated stale dependencies on this unsupported platform.
+install_tmux_darwin_source() {
+  local metadata version url expected tmpd dep prefix pkg_path cppflags ldflags jobs
+  for dep in libevent ncurses utf8proc jemalloc; do
+    if ! brew list --versions "$dep" >/dev/null 2>&1; then
+      brew install "$dep" || true
+    fi
+    prefix=$(brew --prefix "$dep" 2>/dev/null) || return 1
+    [ -d "$prefix" ] || { warn "Homebrew dependency $dep is unavailable for tmux"; return 1; }
+  done
+  if ! have pkg-config; then
+    brew install pkgconf || brew install --build-from-source pkgconf || return 1
+  fi
+
+  metadata=$(curl -fsSL 'https://formulae.brew.sh/api/formula/tmux.json') || return 1
+  version=$(printf '%s' "$metadata" | jq -er '.versions.stable') || return 1
+  url=$(printf '%s' "$metadata" | jq -er '.urls.stable.url') || return 1
+  expected=$(printf '%s' "$metadata" | jq -er '.urls.stable.checksum') || return 1
+  tmpd=$(mktemp -d)
+  if ! curl -fsSL "$url" -o "$tmpd/tmux.tar.gz" ||
+     ! verify_sha256 "$tmpd/tmux.tar.gz" "$expected" ||
+     ! tar -C "$tmpd" -xzf "$tmpd/tmux.tar.gz"; then
+    warn "failed to download or verify tmux release $version"
+    rm -rf "$tmpd"
+    return 1
+  fi
+
+  pkg_path=""
+  cppflags=""
+  ldflags=""
+  for dep in libevent ncurses utf8proc jemalloc; do
+    prefix=$(brew --prefix "$dep")
+    pkg_path="${pkg_path:+$pkg_path:}$prefix/lib/pkgconfig"
+    cppflags="${cppflags:+$cppflags }-I$prefix/include"
+    ldflags="${ldflags:+$ldflags }-L$prefix/lib"
+  done
+  jobs=$(sysctl -n hw.logicalcpu 2>/dev/null || printf '2')
+  mkdir -p "$HOME/.local"
+  if ! (
+    cd "$tmpd/tmux-$version"
+    env PKG_CONFIG_PATH="$pkg_path" CPPFLAGS="$cppflags" LDFLAGS="$ldflags" \
+      ./configure --prefix="$HOME/.local" --enable-sixel --enable-utf8proc
+    make -j "$jobs"
+    make install
+  ); then
+    warn "failed to build tmux release $version"
+    rm -rf "$tmpd"
+    return 1
+  fi
+  rm -rf "$tmpd"
+  add_path "$HOME/.local/bin"
+}
+
+install_intel_macos_fallback() {
+  case "$1" in
+    fzf)  install_fzf_darwin_archive ;;
+    go)   install_go_darwin_archive ;;
+    tmux) install_tmux_darwin_source ;;
+    *)    return 1 ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -180,13 +277,12 @@ install_one() {
   # otherwise a healthy tool remains permanently recorded as a failure.
   if ! pm_install "$tool"; then
     # Homebrew's Intel macOS 15 runners are Tier 3 and some formulae no longer
-    # have bottles there. Retry only genuinely missing tools from source; if a
-    # post-install hook returned nonzero after creating the binary, the final
-    # assertion remains authoritative and avoids an unnecessary rebuild.
+    # have bottles there. Use deterministic per-tool fallbacks only when the
+    # normal install did not create the requested executable.
     if ! have "$bin" && [ "$PM" = "brew" ] && [ "$OS" = "darwin" ] && [ "$ARCH" = "x86_64" ]; then
-      warn "Homebrew binary install failed for $tool; retrying from source on Intel macOS"
-      if ! brew_install_from_source "$tool"; then
-        warn "Homebrew source install also failed for $tool"
+      warn "Homebrew binary install failed for $tool; using Intel macOS fallback"
+      if ! install_intel_macos_fallback "$tool"; then
+        warn "Intel macOS fallback also failed for $tool"
       fi
     else
       warn "package manager reported an error while installing $tool"

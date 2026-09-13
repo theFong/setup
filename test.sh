@@ -66,48 +66,53 @@ mkdir -p "$scratch/install-one-bin"
   exit 1
 }
 
-# Homebrew no longer publishes Intel macOS bottles for every formula. A normal
-# install therefore fails before building on that Tier 3 platform; install_one
-# must retry the same formula from source and accept the resulting executable.
-mkdir -p "$scratch/homebrew-source-bin" "$scratch/homebrew-source-tools"
-printf '%s\n' \
-  '#!/bin/sh' \
-  'printf "%s\n" "$*" >> "$SETUP_TEST_BREW_LOG"' \
-  'if [ "$*" = "deps --topological --include-build setup-no-bottle-package" ]; then' \
-  '  printf "%s\n" setup-no-bottle-dependency' \
-  '  exit 0' \
-  'fi' \
-  'if [ "$*" = "list --versions setup-no-bottle-dependency" ]; then' \
-  '  exit 0' \
-  'fi' \
-  'if [ "$*" = "upgrade --build-from-source setup-no-bottle-dependency" ]; then' \
-  '  : > "$SETUP_TEST_DEP_READY"' \
-  '  exit 0' \
-  'fi' \
-  'if [ "$*" = "install --build-from-source setup-no-bottle-package" ] &&' \
-  '   [ -f "$SETUP_TEST_DEP_READY" ]; then' \
-  '  printf "#!/bin/sh\nexit 0\n" > "$SETUP_TEST_BIN/setup-no-bottle-tool"' \
-  '  chmod +x "$SETUP_TEST_BIN/setup-no-bottle-tool"' \
-  '  exit 0' \
-  'fi' \
-  'exit 1' \
-  > "$scratch/homebrew-source-tools/brew"
-chmod +x "$scratch/homebrew-source-tools/brew"
+# Homebrew no longer publishes Intel macOS bottles for every formula, and its
+# unsupported source path can fail on dependency resolution or transient module
+# fetches. The three affected tools must use their deterministic vendor/source
+# fallbacks when the normal bottle install leaves no executable behind.
+mkdir -p "$scratch/intel-fallback-bin"
 (
-  export PATH="$scratch/homebrew-source-tools:$scratch/homebrew-source-bin:$PATH"
-  export SETUP_TEST_BREW_LOG="$scratch/homebrew-source.log"
-  export SETUP_TEST_BIN="$scratch/homebrew-source-bin"
-  export SETUP_TEST_DEP_READY="$scratch/homebrew-source-dependency.ready"
+  export PATH="$scratch/intel-fallback-bin:$PATH"
+  export SETUP_TEST_BIN="$scratch/intel-fallback-bin"
   OS=darwin
   ARCH=x86_64
   PM=brew
   FAILED=""
-  install_one setup-no-bottle-package setup-no-bottle-tool >/dev/null 2>&1
+  have() { [ -x "$SETUP_TEST_BIN/$1" ]; }
+  pm_install() { return 1; }
+  install_fzf_darwin_archive() {
+    printf '#!/bin/sh\nexit 0\n' > "$SETUP_TEST_BIN/fzf"
+    chmod +x "$SETUP_TEST_BIN/fzf"
+  }
+  install_go_darwin_archive() {
+    printf '#!/bin/sh\nexit 0\n' > "$SETUP_TEST_BIN/go"
+    chmod +x "$SETUP_TEST_BIN/go"
+  }
+  install_tmux_darwin_source() {
+    printf '#!/bin/sh\nexit 0\n' > "$SETUP_TEST_BIN/tmux"
+    chmod +x "$SETUP_TEST_BIN/tmux"
+  }
+  install_one fzf >/dev/null 2>&1
+  install_one tmux >/dev/null 2>&1
+  install_one go >/dev/null 2>&1
   [ -z "$FAILED" ]
 ) || {
-  echo "FAIL: install_one did not recover from a missing Intel macOS bottle" >&2
+  echo "FAIL: install_one did not use the Intel macOS tool fallbacks" >&2
   exit 1
 }
+
+# Vendor artifacts must be rejected when their published digest does not match.
+printf 'verified artifact\n' > "$scratch/checksum-fixture"
+checksum=$(shasum -a 256 "$scratch/checksum-fixture" | awk '{print $1}')
+if ! verify_sha256 "$scratch/checksum-fixture" "$checksum"; then
+  echo "FAIL: verify_sha256 rejected a matching artifact digest" >&2
+  exit 1
+fi
+if verify_sha256 "$scratch/checksum-fixture" \
+  '0000000000000000000000000000000000000000000000000000000000000000'; then
+  echo "FAIL: verify_sha256 accepted a mismatched artifact digest" >&2
+  exit 1
+fi
 
 # configure_claude must fail on an unparseable settings file and leave it
 # untouched rather than clobbering it.
