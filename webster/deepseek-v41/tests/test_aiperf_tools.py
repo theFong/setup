@@ -1702,7 +1702,15 @@ class AIPerfToolTests(unittest.TestCase):
                 "  if [[ $1 == --config ]]; then config=$2; shift 2; else shift; fi\n"
                 "done\n"
                 "test -n \"$config\"\n"
-                "test \"$(stat -c %a \"$config\")\" = 600\n"
+                "python3 - \"$config\" <<'PY'\n"
+                "from pathlib import Path\n"
+                "import stat\n"
+                "import sys\n"
+                "raise SystemExit(\n"
+                "    0 if stat.S_IMODE(Path(sys.argv[1]).stat().st_mode) == 0o600 "
+                "else 1\n"
+                ")\n"
+                "PY\n"
                 "cp \"$config\" \"$AIPERF_TEST_CONFIG\"\n"
                 "cp -a \"$AIPERF_OUTPUT_FIXTURE_ROOT/.\" \"$(dirname \"$config\")/\"\n"
                 "printf '%s\\n' '05:31:54.473 NOTICE Phase profiling (profiling) complete | completed=1, cancelled=0, errors=0 | sessions: completed=1, cancelled=0 | elapsed=1.00s (runner.py:1227)'\n",
@@ -1933,7 +1941,7 @@ class AIPerfToolTests(unittest.TestCase):
             self.assertEqual(
                 environment_capture.read_text(encoding="utf-8").splitlines(),
                 [
-                    str(runs_root),
+                    str(runs_root.resolve()),
                     str(fake_aiperf),
                     str(dataset),
                     str(tokenizer),
