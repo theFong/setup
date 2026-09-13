@@ -73,7 +73,16 @@ mkdir -p "$scratch/homebrew-source-bin" "$scratch/homebrew-source-tools"
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$*" >> "$SETUP_TEST_BREW_LOG"' \
-  'if [ "$*" = "install --build-from-source setup-no-bottle-package" ]; then' \
+  'if [ "$*" = "deps --topological --include-build setup-no-bottle-package" ]; then' \
+  '  printf "%s\n" setup-no-bottle-dependency' \
+  '  exit 0' \
+  'fi' \
+  'if [ "$*" = "install --build-from-source setup-no-bottle-dependency" ]; then' \
+  '  : > "$SETUP_TEST_DEP_READY"' \
+  '  exit 0' \
+  'fi' \
+  'if [ "$*" = "install --build-from-source setup-no-bottle-package" ] &&' \
+  '   [ -f "$SETUP_TEST_DEP_READY" ]; then' \
   '  printf "#!/bin/sh\nexit 0\n" > "$SETUP_TEST_BIN/setup-no-bottle-tool"' \
   '  chmod +x "$SETUP_TEST_BIN/setup-no-bottle-tool"' \
   '  exit 0' \
@@ -85,14 +94,13 @@ chmod +x "$scratch/homebrew-source-tools/brew"
   export PATH="$scratch/homebrew-source-tools:$scratch/homebrew-source-bin:$PATH"
   export SETUP_TEST_BREW_LOG="$scratch/homebrew-source.log"
   export SETUP_TEST_BIN="$scratch/homebrew-source-bin"
+  export SETUP_TEST_DEP_READY="$scratch/homebrew-source-dependency.ready"
   OS=darwin
   ARCH=x86_64
   PM=brew
   FAILED=""
   install_one setup-no-bottle-package setup-no-bottle-tool >/dev/null 2>&1
   [ -z "$FAILED" ]
-  [ "$(cat "$SETUP_TEST_BREW_LOG")" = 'install setup-no-bottle-package
-install --build-from-source setup-no-bottle-package' ]
 ) || {
   echo "FAIL: install_one did not recover from a missing Intel macOS bottle" >&2
   exit 1

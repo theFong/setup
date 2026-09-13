@@ -122,6 +122,37 @@ pm_install() {
   esac
 }
 
+# Homebrew's --build-from-source flag applies to the named formula but not to
+# dependencies. On Tier 3 Intel macOS, a dependency without a bottle therefore
+# aborts the source build before it starts. Install declared dependencies in
+# topological order, retrying only unavailable/outdated ones from source, then
+# build the requested formula.
+brew_install_from_source() {
+  local tool="$1" deps dep action
+  if ! deps=$(brew deps --topological --include-build "$tool"); then
+    warn "could not resolve Homebrew dependencies for $tool"
+    return 1
+  fi
+  while IFS= read -r dep; do
+    [ -n "$dep" ] || continue
+    action="install"
+    if brew list --versions "$dep" >/dev/null 2>&1; then
+      if ! brew outdated --quiet "$dep" | grep -q .; then
+        continue
+      fi
+      action="upgrade"
+    fi
+    if ! brew "$action" "$dep"; then
+      warn "Homebrew binary $action failed for $tool dependency $dep; retrying from source"
+      if ! brew "$action" --build-from-source "$dep"; then
+        warn "Homebrew source $action failed for $tool dependency $dep"
+        return 1
+      fi
+    fi
+  done <<< "$deps"
+  brew install --build-from-source "$tool"
+}
+
 # add_path DIR — prepend to current PATH and persist to the user's shell rc.
 add_path() {
   local dir="$1" profile
@@ -157,7 +188,7 @@ install_one() {
     # assertion remains authoritative and avoids an unnecessary rebuild.
     if ! have "$bin" && [ "$PM" = "brew" ] && [ "$OS" = "darwin" ] && [ "$ARCH" = "x86_64" ]; then
       warn "Homebrew binary install failed for $tool; retrying from source on Intel macOS"
-      if ! brew install --build-from-source "$tool"; then
+      if ! brew_install_from_source "$tool"; then
         warn "Homebrew source install also failed for $tool"
       fi
     else
