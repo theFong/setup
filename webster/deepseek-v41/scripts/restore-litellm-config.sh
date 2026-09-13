@@ -24,6 +24,7 @@ done
 
 case "$phase" in alias|publish) ;; *) die "phase must be alias or publish" ;; esac
 validated_root="$(validate_run_root "$run_root")"
+init_run_root "$validated_root"
 rollback_file="$validated_root/rollback.env"
 [[ -f "$rollback_file" && ! -L "$rollback_file" ]] || die "rollback.env is missing"
 [[ "$(stat -c %a "$rollback_file")" == "600" ]] || die "rollback.env mode must be 0600"
@@ -65,6 +66,7 @@ if [[ "${WEBSTER_LITELLM_TEST_MODE:-0}" == "1" ]]; then
   [[ "${TEST_RESTORE_HEALTH:-ok}" == "ok" ]] || die "test restore health failed"
   [[ "${TEST_RESTORE_READINESS:-ok}" == "ok" ]] ||
     die "test restore readiness failed"
+  event "$phase-rollback" GO "hash-verified config restored and ingress checks passed"
   printf 'LiteLLM %s rollback validated in test mode\n' "$phase"
   exit 0
 fi

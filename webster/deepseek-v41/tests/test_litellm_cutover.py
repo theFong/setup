@@ -23,6 +23,7 @@ PACKAGE_ROOT = REPOSITORY_ROOT / "webster" / "deepseek-v41"
 SCRIPTS = PACKAGE_ROOT / "scripts"
 RENDER = SCRIPTS / "render-litellm-cutover.py"
 VERIFY_CONFIG = SCRIPTS / "verify-litellm-config.py"
+VERIFY_CALLBACKS = SCRIPTS / "verify-litellm-callbacks.py"
 VERIFY_CONTAINER = SCRIPTS / "verify-litellm-container.py"
 CONTRACT_PROBE = SCRIPTS / "contract-probe.py"
 GUARD_CALLBACK = "custom_callbacks.glm52_contract_guard.glm52_contract_guard"
@@ -143,6 +144,30 @@ class LiteLLMCutoverTests(unittest.TestCase):
             yaml.safe_dump(before_config(), sort_keys=False), encoding="utf-8"
         )
         os.chmod(self.before, 0o600)
+        self.private_acceptance = self.root / "private-acceptance.json"
+        self.private_acceptance.write_text(
+            json.dumps(
+                {
+                    "decision": "GO",
+                    "publication": {
+                        "public_model_name": "deepseek-v4.1-flash",
+                        "served_model_name": "deepseek-ai/DeepSeek-V4.1-Flash",
+                        "max_context": 1048576,
+                        "station_endpoint": "http://100.73.140.127:8000/v1",
+                        "supports_function_calling": True,
+                        "supports_reasoning": True,
+                        "supports_response_schema": True,
+                        "supports_vision": True,
+                        "input_cost_per_token": 1.3e-8,
+                        "output_cost_per_token": 9.6e-7,
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.private_acceptance, 0o600)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -174,6 +199,107 @@ class LiteLLMCutoverTests(unittest.TestCase):
         )
         return yaml.safe_load(self.candidate.read_text(encoding="utf-8"))
 
+    def test_guard_loader_accepts_only_the_known_sanitizer_before_guard(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "verify_litellm_callbacks", VERIFY_CALLBACKS
+        )
+        if spec is None or spec.loader is None:
+            self.fail("cannot load LiteLLM callback verifier")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sanitizer = (
+            "custom_callbacks.responses_sanitizer."
+            "responses_encrypted_content_sanitizer"
+        )
+        suffix = [
+            "custom_callbacks.session_mapper.session_mapper",
+            "langfuse_otel",
+        ]
+        for callbacks in ([GUARD_CALLBACK, *suffix], [sanitizer, GUARD_CALLBACK, *suffix]):
+            with self.subTest(callbacks=callbacks):
+                module.validate_guard_order({"litellm_settings": {"callbacks": callbacks}})
+        for callbacks in (
+            [suffix[0], GUARD_CALLBACK, suffix[1]],
+            [GUARD_CALLBACK, GUARD_CALLBACK, *suffix],
+            [sanitizer, suffix[0], GUARD_CALLBACK],
+            [sanitizer, *suffix],
+            [],
+            [GUARD_CALLBACK, 7],
+        ):
+            with self.subTest(callbacks=callbacks), self.assertRaises(
+                module.ValidationError
+            ):
+                module.validate_guard_order(
+                    {"litellm_settings": {"callbacks": callbacks}}
+                )
+
+    def test_callback_loader_uses_working_directory_and_sanitizes_failures(self) -> None:
+        runtime = self.root / "runtime"
+        integrations = runtime / "litellm" / "integrations"
+        callbacks_root = runtime / "custom_callbacks"
+        integrations.mkdir(parents=True)
+        callbacks_root.mkdir()
+        for package in (
+            runtime / "litellm",
+            integrations,
+            callbacks_root,
+        ):
+            (package / "__init__.py").write_text("", encoding="utf-8")
+        (integrations / "custom_logger.py").write_text(
+            "class CustomLogger:\n    pass\n", encoding="utf-8"
+        )
+        modules = {
+            "responses_sanitizer.py": (
+                "from litellm.integrations.custom_logger import CustomLogger\n"
+                "responses_encrypted_content_sanitizer = CustomLogger()\n"
+            ),
+            "glm52_contract_guard.py": (
+                "from litellm.integrations.custom_logger import CustomLogger\n"
+                "glm52_contract_guard = CustomLogger()\n"
+            ),
+            "good.py": (
+                "from litellm.integrations.custom_logger import CustomLogger\n"
+                "callback = CustomLogger()\n"
+            ),
+            "bad.py": "callback = object()\n",
+            "explodes.py": "raise RuntimeError('SENTINEL_SECRET')\n",
+        }
+        for name, source in modules.items():
+            (callbacks_root / name).write_text(source, encoding="utf-8")
+
+        sanitizer = (
+            "custom_callbacks.responses_sanitizer."
+            "responses_encrypted_content_sanitizer"
+        )
+
+        def invoke(callbacks: list[str]) -> subprocess.CompletedProcess[str]:
+            config = runtime / "config.yaml"
+            config.write_text(
+                yaml.safe_dump({"litellm_settings": {"callbacks": callbacks}}),
+                encoding="utf-8",
+            )
+            return subprocess.run(
+                [sys.executable, str(VERIFY_CALLBACKS), str(config)],
+                cwd=runtime,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        result = invoke(
+            [sanitizer, GUARD_CALLBACK, "langfuse_otel", "custom_callbacks.good.callback"]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        result = invoke([GUARD_CALLBACK, "custom_callbacks.bad.callback"])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("custom callback is not a CustomLogger", result.stderr)
+
+        result = invoke([GUARD_CALLBACK, "custom_callbacks.explodes.callback"])
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("SENTINEL_SECRET", result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_renderer_changes_only_the_legacy_alias_contract(self) -> None:
         original = self.before.read_bytes()
         candidate = self.render_candidate()
@@ -192,6 +318,7 @@ class LiteLLMCutoverTests(unittest.TestCase):
                 "max_output_tokens": 320000,
                 "supports_function_calling": True,
                 "supports_reasoning": True,
+                "supports_vision": False,
                 "input_cost_per_token": 6.0e-08,
                 "output_cost_per_token": 1.7e-06,
                 "description": (
@@ -576,6 +703,127 @@ vllm:request_success_total{finished_reason=\"stop\"} 1000
             thread.join(timeout=5)
             server.server_close()
         self.assertEqual(totals, {"old": 11.0, "new": 22.0})
+
+    def test_publish_renderer_adds_only_the_qualified_private_canary(self) -> None:
+        api_key_file = self.root / "deepseek-v41.key"
+        api_key_file.write_text("test-publish-backend-key\n", encoding="utf-8")
+        os.chmod(api_key_file, 0o600)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(RENDER),
+                str(self.before),
+                str(self.candidate),
+                "--phase",
+                "publish",
+                "--api-key-file",
+                str(api_key_file),
+                "--private-acceptance",
+                str(self.private_acceptance),
+            ],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("test-publish-backend-key", result.stdout + result.stderr)
+        candidate = yaml.safe_load(self.candidate.read_text(encoding="utf-8"))
+        self.assertEqual(candidate["model_list"][:-1], before_config()["model_list"])
+        published = candidate["model_list"][-1]
+        self.assertEqual(published["model_name"], "deepseek-v4.1-flash")
+        self.assertEqual(
+            published["litellm_params"],
+            {
+                "model": "hosted_vllm/deepseek-ai/DeepSeek-V4.1-Flash",
+                "api_base": "http://100.73.140.127:8000/v1",
+                "api_key": "test-publish-backend-key",
+            },
+        )
+        self.assertEqual(
+            published["model_info"],
+            {
+                "mode": "chat",
+                "max_input_tokens": 1048576,
+                "max_output_tokens": 1048576,
+                "supports_function_calling": True,
+                "supports_reasoning": True,
+                "supports_response_schema": True,
+                "supports_vision": True,
+                "input_cost_per_token": 1.3e-8,
+                "output_cost_per_token": 9.6e-7,
+                "description": (
+                    "DeepSeek V4.1 Flash on the Shamu/Tilikum station pair; "
+                    "qualified private TP2 profile."
+                ),
+            },
+        )
+        verify = self.run_script(
+            VERIFY_CONFIG,
+            str(self.before),
+            str(self.candidate),
+            "--phase",
+            "publish",
+            expect_success=True,
+        )
+        self.assertIn("publish phase", verify.stdout)
+
+    def test_publish_verifier_rejects_an_existing_model_change(self) -> None:
+        api_key_file = self.root / "deepseek-v41.key"
+        api_key_file.write_text("test-publish-backend-key\n", encoding="utf-8")
+        os.chmod(api_key_file, 0o600)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(RENDER),
+                str(self.before),
+                str(self.candidate),
+                "--phase",
+                "publish",
+                "--api-key-file",
+                str(api_key_file),
+                "--private-acceptance",
+                str(self.private_acceptance),
+            ],
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidate = yaml.safe_load(self.candidate.read_text(encoding="utf-8"))
+        candidate["model_list"][2]["model_info"]["description"] = "mutated"
+        self.candidate.write_text(
+            yaml.safe_dump(candidate, sort_keys=False), encoding="utf-8"
+        )
+        self.run_script(
+            VERIFY_CONFIG,
+            str(self.before),
+            str(self.candidate),
+            "--phase",
+            "publish",
+            expect_success=False,
+        )
+
+    def test_publish_renderer_rejects_caller_values_that_differ_from_acceptance(self) -> None:
+        api_key_file = self.root / "deepseek-v41.key"
+        api_key_file.write_text("test-publish-backend-key\n", encoding="utf-8")
+        os.chmod(api_key_file, 0o600)
+        result = self.run_script(
+            RENDER,
+            str(self.before),
+            str(self.candidate),
+            "--phase",
+            "publish",
+            "--api-key-file",
+            str(api_key_file),
+            "--private-acceptance",
+            str(self.private_acceptance),
+            "--max-context",
+            "320000",
+            expect_success=False,
+        )
+        self.assertIn("accepted publication record", result.stderr)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ if [[ ! -x "$stage_artifacts" ]]; then
 fi
 install_guard="webster/deepseek-v41/scripts/install-glm52-guard.sh"
 restore_config="webster/deepseek-v41/scripts/restore-litellm-config.sh"
+acceptance="webster/deepseek-v41/scripts/acceptance.sh"
+sync_runbook="webster/deepseek-v41/scripts/sync-runbook.sh"
 build_runtime="webster/deepseek-v41/scripts/build-runtime.sh"
 registry_probe="webster/deepseek-v41/scripts/verify-runtime-registry.py"
 lifecycle_scripts=(
@@ -25,7 +27,8 @@ lifecycle_scripts=(
   webster/deepseek-v41/scripts/deepseek-v41-watchdog.sh
 )
 for required_script in \
-  "$install_guard" "$restore_config" "$build_runtime" "$registry_probe" \
+  "$install_guard" "$restore_config" "$acceptance" "$sync_runbook" \
+  "$build_runtime" "$registry_probe" \
   "${lifecycle_scripts[@]}"; do
   if [[ ! -x "$required_script" ]]; then
     echo "FAIL: missing executable $required_script" >&2
@@ -44,7 +47,9 @@ for command in ssh docker curl systemctl sha256sum nvidia-smi; do
   command_path="$fake_bin/$command"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'printf "%s %s\\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' \
+    'display=("$@")' \
+    'if [[ "$(basename "$0")" == ssh && "${display[0]:-}" == -o && "${display[1]:-}" == ForwardAgent=no ]]; then display=("${display[@]:2}"); fi' \
+    'printf "%s %s\\n" "$(basename "$0")" "${display[*]}" >>"$TEST_LOG"' \
     'if [[ "$(basename "$0")" == "ssh" && "$*" == *"df -PB1 /home/alecfong"* && -n "${TEST_SSH_DF_FREE:-}" ]]; then' \
     '  printf "Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/test 1000 1 %s 1%% /home/alecfong\\n" "$TEST_SSH_DF_FREE"' \
     'fi' \
@@ -54,6 +59,12 @@ for command in ssh docker curl systemctl sha256sum nvidia-smi; do
     'if [[ "$(basename "$0")" == "ssh" && "$*" == *"stat -c %a:%U:%s"* && -n "${TEST_SSH_CREDENTIAL_METADATA:-}" ]]; then' \
     '  printf "%s\\n" "$TEST_SSH_CREDENTIAL_METADATA"' \
     'fi' \
+    'if [[ "$(basename "$0")" == "ssh" && "$*" == *".glm52-guard-stage-"*"/glm52_contract_guard.py"* && -n "${TEST_SSH_GUARD_HASH:-}" ]]; then' \
+    '  printf "%s\\n" "$TEST_SSH_GUARD_HASH"' \
+    'fi' \
+    'if [[ "$(basename "$0")" == "ssh" && "$*" == *".glm52-guard-stage-"*"/tokenizer"*"sha256sum tokenizer.json"* && -n "${TEST_SSH_TOKENIZER_MANIFEST:-}" ]]; then' \
+    '  /bin/cat "$TEST_SSH_TOKENIZER_MANIFEST"' \
+    'fi' \
     'if [[ "$(basename "$0")" == "ssh" && "${TEST_SSH_HANG:-0}" == "1" ]]; then' \
     '  sleep 30' \
     'fi' \
@@ -62,7 +73,9 @@ for command in ssh docker curl systemctl sha256sum nvidia-smi; do
 done
 printf '%s\n' \
   '#!/usr/bin/env bash' \
-  'printf "%s %s\n" "$(basename "$0")" "$*" >>"$TEST_LOG"' \
+  'display=("$@")' \
+  'if [[ "${display[0]:-}" == -o && "${display[1]:-}" == ForwardAgent=no ]]; then display=("${display[@]:2}"); fi' \
+  'printf "%s %s\n" "$(basename "$0")" "${display[*]}" >>"$TEST_LOG"' \
   '[[ "${TEST_SCP_FAIL:-0}" != "1" ]] || exit 9' \
   'exit 0' >"$fake_bin/scp"
 chmod +x "$fake_bin/scp"
@@ -86,6 +99,17 @@ expect_failure() {
 }
 
 valid_root="/home/ubuntu/deepseek-v41-runs/20990101T000000Z"
+publish_root="$scratch/runs/20990101T000001Z"
+mkdir -p "$publish_root"
+printf '%s\n' '{"decision":"GO"}' >"$publish_root/private-acceptance.json"
+chmod 0600 "$publish_root/private-acceptance.json"
+publish_verifier="$scratch/verify-private-acceptance"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "private-acceptance-verifier %s\n" "$*" >>"$TEST_LOG"' \
+  '[[ "${TEST_PRIVATE_ACCEPTANCE_VERIFY_FAIL:-0}" != "1" ]]' \
+  >"$publish_verifier"
+chmod +x "$publish_verifier"
 valid_inspect="$scratch/litellm-inspect-valid.json"
 bad_inspect="$scratch/litellm-inspect-bad.json"
 printf '%s\n' \
@@ -106,7 +130,36 @@ export TEST_LITELLM_INSPECT="$valid_inspect"
   grep -qx sentinel "$local_root/events.tsv"
   [[ "$(stat -c %a "$local_root")" == "700" ]]
   [[ "$(stat -c %a "$local_root/manifest.env")" == "600" ]]
+  capture repeated-evidence /bin/sh -c 'printf "first\n"'
+  capture repeated-evidence /bin/sh -c 'printf "second\n"'
+  grep -qx first "$local_root/logs/repeated-evidence.log"
+  grep -qx second "$local_root/logs/repeated-evidence-2.log"
 )
+
+custom_runs_root="$scratch/custom-runs"
+mkdir -p "$custom_runs_root"
+(
+  unset WEBSTER_PREFLIGHT_TEST_MODE WEBSTER_STAGE_TEST_MODE
+  unset WEBSTER_RUNTIME_TEST_MODE WEBSTER_LIFECYCLE_TEST_MODE
+  unset WEBSTER_WEKA_TEST_MODE WEBSTER_ACCEPTANCE_TEST_MODE TEST_RUNS_ROOT
+  export WEBSTER_RUNS_ROOT="$custom_runs_root"
+  source webster/deepseek-v41/scripts/common.sh
+  [[ "$RUNS_ROOT" == "$(realpath -e "$custom_runs_root")" ]]
+)
+
+: >"$TEST_LOG"
+local_shamu_output="$(
+  export TEST_RUNS_ROOT="$scratch/runs"
+  export WEBSTER_LOCAL_SHAMU=1
+  export WEBSTER_WEKA_TEST_MODE=1
+  source webster/deepseek-v41/scripts/common.sh
+  ssh shamu /usr/bin/printf '%s' local-rank0
+)"
+[[ "$local_shamu_output" == local-rank0 ]]
+if grep -q '^ssh ' "$TEST_LOG"; then
+  echo "FAIL: local Shamu mode still traversed SSH for rank 0" >&2
+  exit 1
+fi
 
 : >"$TEST_LOG"
 (
@@ -163,6 +216,38 @@ expect_failure model_probe_failure \
   env TEST_CURRENT_MODEL_PROBE_STATUS=failed \
     "$preflight" --phase baseline --run-root "$valid_root"
 
+# Publication is only safe after DeepSeek is the exclusive station owner.  This
+# catches a preflight that accidentally retains the pre-cutover GLM requirement.
+expect_failure publish_wrong_station_owner \
+  env TEST_RUNS_ROOT="$scratch/runs" \
+    TEST_PRIVATE_ACCEPTANCE_VERIFIER="$publish_verifier" \
+    TEST_PREFLIGHT_GLM_SHAMU_RUNNING=true \
+    TEST_PREFLIGHT_GLM_TILIKUM_RUNNING=true \
+    TEST_PREFLIGHT_DEEPSEEK_SHAMU_RUNNING=false \
+    TEST_PREFLIGHT_DEEPSEEK_TILIKUM_RUNNING=false \
+    "$preflight" --phase publish --run-root "$publish_root"
+
+expect_failure publish_invalid_private_acceptance \
+  env TEST_RUNS_ROOT="$scratch/runs" \
+    TEST_PRIVATE_ACCEPTANCE_VERIFIER="$publish_verifier" \
+    TEST_PRIVATE_ACCEPTANCE_VERIFY_FAIL=1 \
+    TEST_PREFLIGHT_GLM_SHAMU_RUNNING=false \
+    TEST_PREFLIGHT_GLM_TILIKUM_RUNNING=false \
+    TEST_PREFLIGHT_DEEPSEEK_SHAMU_RUNNING=true \
+    TEST_PREFLIGHT_DEEPSEEK_TILIKUM_RUNNING=true \
+    "$preflight" --phase publish --run-root "$publish_root"
+
+env TEST_RUNS_ROOT="$scratch/runs" \
+  TEST_PRIVATE_ACCEPTANCE_VERIFIER="$publish_verifier" \
+  TEST_PREFLIGHT_GLM_SHAMU_RUNNING=false \
+  TEST_PREFLIGHT_GLM_TILIKUM_RUNNING=false \
+  TEST_PREFLIGHT_DEEPSEEK_SHAMU_RUNNING=true \
+  TEST_PREFLIGHT_DEEPSEEK_TILIKUM_RUNNING=true \
+  "$preflight" --phase publish --run-root "$publish_root"
+grep -Fxq \
+  "private-acceptance-verifier --run-root $publish_root --acceptance $publish_root/private-acceptance.json --max-age-seconds 21600" \
+  "$TEST_LOG"
+
 expect_failure malformed_station_free \
   env TEST_VALIDATE_STATION_FREE=1 TEST_SSH_DF_FREE=not-an-integer \
     "$preflight" --phase baseline --run-root "$valid_root"
@@ -176,6 +261,152 @@ cmp "$scratch/first-success.log" "$TEST_LOG"
 
 TEST_FREE_BYTES=805306367999 expect_failure stage_low_free \
   "$stage_artifacts" --node shamu --run-root "$valid_root"
+
+acceptance_root="$scratch/runs/20990101T000008Z"
+WEBSTER_ACCEPTANCE_TEST_MODE=1 TEST_RUNS_ROOT="$scratch/runs" \
+  "$acceptance" --run-root "$acceptance_root"
+grep -Fq $'\tpublication-acceptance\tGO\t' "$acceptance_root/events.tsv"
+expect_failure acceptance_rejects_rank_failure \
+  env WEBSTER_ACCEPTANCE_TEST_MODE=1 TEST_RUNS_ROOT="$scratch/runs" \
+    TEST_ACCEPTANCE_DEEPSEEK_TILIKUM_RUNNING=false \
+    "$acceptance" --run-root "$acceptance_root"
+expect_failure acceptance_rejects_unrelated_prometheus_activity \
+  env WEBSTER_ACCEPTANCE_TEST_MODE=1 TEST_RUNS_ROOT="$scratch/runs" \
+    TEST_ACCEPTANCE_PROMETHEUS_ROUTE=unrelated \
+    "$acceptance" --run-root "$acceptance_root"
+expect_failure acceptance_rejects_unrelated_langfuse_trace \
+  env WEBSTER_ACCEPTANCE_TEST_MODE=1 TEST_RUNS_ROOT="$scratch/runs" \
+    TEST_ACCEPTANCE_LANGFUSE_PROBE=unrelated \
+    "$acceptance" --run-root "$acceptance_root"
+expect_failure acceptance_rejects_baker_semantic_drift \
+  env WEBSTER_ACCEPTANCE_TEST_MODE=1 TEST_RUNS_ROOT="$scratch/runs" \
+    TEST_ACCEPTANCE_BAKER_EQUAL=drifted \
+    "$acceptance" --run-root "$acceptance_root"
+
+sync_root="$scratch/sync"
+webster_sync_source="$sync_root/sources/webster-cluster"
+migration_sync_source="$sync_root/sources/migrating-webster-models"
+mkdir -p "$webster_sync_source/reference" "$migration_sync_source/references"
+printf '%s\n' \
+  '---' \
+  'name: webster-cluster' \
+  'description: Webster test source.' \
+  '---' \
+  'canonical-webster-source-marker' \
+  >"$webster_sync_source/SKILL.md"
+printf '%s\n' 'canonical-webster-reference-marker' \
+  >"$webster_sync_source/reference/topology.md"
+printf '%s\n' \
+  '---' \
+  'name: migrating-webster-models' \
+  'description: Migration test source.' \
+  '---' \
+  'repository-migration-source-marker' \
+  >"$migration_sync_source/SKILL.md"
+printf '%s\n' 'repository-migration-reference-marker' \
+  >"$migration_sync_source/references/playbook.md"
+WEBSTER_SYNC_TEST_MODE=1 \
+  WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+  WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+  TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+  TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+  TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+  TEST_SYNC_STATE_FILE="$sync_root/state" \
+  "$sync_runbook"
+for consumer in claude codex hermes; do
+  test -f "$sync_root/$consumer/webster-cluster/SKILL.md"
+  test -f "$sync_root/$consumer/migrating-webster-models/SKILL.md"
+done
+grep -Fq 'canonical-webster-source-marker' \
+  "$sync_root/claude/webster-cluster/SKILL.md"
+grep -Fq 'repository-migration-source-marker' \
+  "$sync_root/codex/migrating-webster-models/SKILL.md"
+grep -Fq 'metadata:' "$sync_root/hermes/migrating-webster-models/SKILL.md"
+WEBSTER_SYNC_TEST_MODE=1 \
+  WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+  WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+  TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+  TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+  TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+  TEST_SYNC_STATE_FILE="$sync_root/state" \
+  "$sync_runbook" --check
+
+printf 'consumer-local-edit\n' \
+  >>"$sync_root/codex/migrating-webster-models/SKILL.md"
+expect_failure sync_refuses_divergent_regular_destination \
+  env WEBSTER_SYNC_TEST_MODE=1 \
+    WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+    WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+    TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+    TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+    TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+    TEST_SYNC_STATE_FILE="$sync_root/state" \
+    "$sync_runbook"
+grep -Fq 'consumer-local-edit' \
+  "$sync_root/codex/migrating-webster-models/SKILL.md"
+WEBSTER_SYNC_TEST_MODE=1 \
+  WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+  WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+  TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+  TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+  TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+  TEST_SYNC_STATE_FILE="$sync_root/state" \
+  "$sync_runbook" --force
+if grep -Fq 'consumer-local-edit' \
+  "$sync_root/codex/migrating-webster-models/SKILL.md"; then
+  echo "FAIL: --force did not restore the regular destination" >&2
+  exit 1
+fi
+
+printf 'hermes-reference-drift\n' \
+  >>"$sync_root/hermes/migrating-webster-models/references/playbook.md"
+expect_failure sync_check_detects_exact_hermes_drift \
+  env WEBSTER_SYNC_TEST_MODE=1 \
+    WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+    WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+    TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+    TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+    TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+    TEST_SYNC_STATE_FILE="$sync_root/state" \
+    "$sync_runbook" --check
+expect_failure sync_refuses_divergent_hermes_destination \
+  env WEBSTER_SYNC_TEST_MODE=1 \
+    WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+    WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+    TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+    TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+    TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+    TEST_SYNC_STATE_FILE="$sync_root/state" \
+    "$sync_runbook"
+WEBSTER_SYNC_TEST_MODE=1 \
+  WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+  WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+  TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+  TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+  TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+  TEST_SYNC_STATE_FILE="$sync_root/state" \
+  "$sync_runbook" --force
+WEBSTER_SYNC_TEST_MODE=1 \
+  WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+  WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+  TEST_SYNC_CLAUDE_ROOT="$sync_root/claude" \
+  TEST_SYNC_CODEX_ROOT="$sync_root/codex" \
+  TEST_SYNC_HERMES_ROOT="$sync_root/hermes" \
+  TEST_SYNC_STATE_FILE="$sync_root/state" \
+  "$sync_runbook" --check
+
+# Production's canonical Webster source is also the Claude destination.  The
+# synchronizer must treat that tree as authoritative and never rsync it onto itself.
+WEBSTER_SYNC_TEST_MODE=1 \
+  WEBSTER_CLUSTER_SOURCE="$webster_sync_source" \
+  WEBSTER_MIGRATION_SOURCE="$migration_sync_source" \
+  TEST_SYNC_CLAUDE_ROOT="$sync_root/sources" \
+  TEST_SYNC_CODEX_ROOT="$sync_root/self-source-codex" \
+  TEST_SYNC_HERMES_ROOT="$sync_root/self-source-hermes" \
+  TEST_SYNC_STATE_FILE="$sync_root/self-source-state" \
+  "$sync_runbook"
+grep -Fq 'canonical-webster-source-marker' "$webster_sync_source/SKILL.md"
+grep -Fq 'repository-migration-source-marker' "$migration_sync_source/SKILL.md"
 
 expect_failure stage_invalid_node \
   "$stage_artifacts" --node baker-spark-1 --run-root "$valid_root"
@@ -249,6 +480,31 @@ if ! grep -F 'for path in '\''/home/nvidia/litellm/energy-pricing/.glm52-guard-s
   exit 1
 fi
 
+guard_hash="$(sha256sum webster/deepseek-v41/litellm/glm52_contract_guard.py | awk '{print $1}')"
+tokenizer_manifest="$scratch/tokenizer.manifest"
+(
+  cd "$tokenizer_source"
+  sha256sum tokenizer.json tokenizer_config.json chat_template.jinja | sort
+) >"$tokenizer_manifest"
+: >"$TEST_LOG"
+TEST_SSH_GUARD_HASH="$guard_hash" \
+TEST_SSH_TOKENIZER_MANIFEST="$tokenizer_manifest" \
+TEST_RUNS_ROOT="$test_runs_root" \
+TEST_TOKENIZER_SOURCE="$tokenizer_source" \
+  "$install_guard" --candidate --run-root "$test_run_root" \
+    --candidate-config "$candidate_config"
+grep -Fq \
+  "verify-litellm-callbacks.py spark-1:/home/nvidia/litellm/energy-pricing/.glm52-guard-offline-" \
+  "$TEST_LOG"
+grep -Fq -- "-v '/home/nvidia/litellm/energy-pricing:/app/custom_callbacks:ro'" \
+  "$TEST_LOG"
+grep -Fq -- '-w /app' "$TEST_LOG"
+grep -Fq '/work/verify-litellm-callbacks.py /work/config.yaml' "$TEST_LOG"
+if grep -Fq 'docker restart litellm' "$TEST_LOG"; then
+  echo "FAIL: guard installer restarted LiteLLM" >&2
+  exit 1
+fi
+
 install_test_env=(
   env
   WEBSTER_LITELLM_TEST_MODE=1
@@ -310,6 +566,7 @@ restore_test_env=(
 )
 "${restore_test_env[@]}" "$restore_config" --phase alias --run-root "$test_run_root"
 grep -qx 'restored: true' "$test_litellm_root/config.yaml"
+grep -Fq $'\talias-rollback\tGO\t' "$test_run_root/events.tsv"
 first_restart_count="$(grep -c '^docker restart litellm$' "$TEST_LOG" || true)"
 "${restore_test_env[@]}" "$restore_config" --phase alias --run-root "$test_run_root"
 second_restart_count="$(grep -c '^docker restart litellm$' "$TEST_LOG" || true)"
@@ -545,17 +802,130 @@ if grep -Fq '/home/alecfong/serve_glm52.sh' "$TEST_LOG"; then
   echo "FAIL: healthy GLM re-run relaunched ranks" >&2
   exit 1
 fi
+: >"$TEST_LOG"
+expect_failure glm_existing_wrong_profile \
+  env "${lifecycle_test_env[@]:1}" \
+    TEST_LIFECYCLE_GLM_SHAMU_RUNNING=true \
+    TEST_LIFECYCLE_GLM_TILIKUM_RUNNING=true \
+    TEST_LIFECYCLE_GLM_PROFILE_MATCH=0 \
+    "$start_glm" --run-root "$lifecycle_run_root"
+if grep -Eq 'serve_glm52\.sh|docker stop' "$TEST_LOG"; then
+  echo "FAIL: mismatched running GLM ranks were mutated before rejection" >&2
+  exit 1
+fi
+: >"$TEST_LOG"
+expect_failure glm_existing_split_generation \
+  env "${lifecycle_test_env[@]:1}" \
+    TEST_LIFECYCLE_GLM_SHAMU_RUNNING=true \
+    TEST_LIFECYCLE_GLM_TILIKUM_RUNNING=true \
+    TEST_LIFECYCLE_GLM_GENERATION_MATCH=0 \
+    "$start_glm" --run-root "$lifecycle_run_root"
+if grep -Eq 'serve_glm52\.sh|docker stop' "$TEST_LOG"; then
+  echo "FAIL: split-generation GLM ranks were mutated before rejection" >&2
+  exit 1
+fi
 
 : >"$TEST_LOG"
 "${lifecycle_test_env[@]}" "$start_deepseek" --run-root "$lifecycle_run_root"
+prior_shamu_line="$(grep -n 'ssh shamu .*docker inspect.*deepseek-v41-flash-tp2.*docker logs' "$TEST_LOG" | head -1 | cut -d: -f1)"
+prior_tilikum_line="$(grep -n 'ssh tilikum .*docker inspect.*deepseek-v41-flash-tp2.*docker logs' "$TEST_LOG" | head -1 | cut -d: -f1)"
+rank0_launch_line="$(grep -n 'ssh shamu .*docker rm -f deepseek-v41-flash-tp2' "$TEST_LOG" | head -1 | cut -d: -f1)"
+rank1_launch_line="$(grep -n 'ssh tilikum .*docker rm -f deepseek-v41-flash-tp2' "$TEST_LOG" | head -1 | cut -d: -f1)"
+[[ -n "$prior_shamu_line" && "$prior_shamu_line" -lt "$rank0_launch_line" ]]
+[[ -n "$prior_tilikum_line" && "$prior_tilikum_line" -lt "$rank1_launch_line" ]]
 grep -Fq -- '--tensor-parallel-size 2 --pipeline-parallel-size 1' "$TEST_LOG"
 grep -Fq -- '--engram-config {"cpu_offload":true,"embedding_across_dp":false}' "$TEST_LOG"
 grep -Fq -- '--enforce-eager --max-model-len 131072 --max-num-seqs 1' "$TEST_LOG"
 grep -Fq -- '--host 100.73.140.127 --port 8000' "$TEST_LOG"
 grep -Fq -- '--headless' "$TEST_LOG"
+rank0_launch="$(grep 'ssh shamu .*deepseek-v41-flash-tp2' "$TEST_LOG")"
 rank1_launch="$(grep 'ssh tilikum .*deepseek-v41-flash-tp2' "$TEST_LOG")"
 [[ "$rank1_launch" != *'--env-file'* ]]
 [[ "$rank1_launch" != *'VLLM_API_KEY='* ]]
+rank0_generation="$(sed -n 's/.*--label ai\.webster\.generation=\([^ ]*\).*/\1/p' <<<"$rank0_launch")"
+rank1_generation="$(sed -n 's/.*--label ai\.webster\.generation=\([^ ]*\).*/\1/p' <<<"$rank1_launch")"
+[[ -n "$rank0_generation" && "$rank0_generation" == "$rank1_generation" ]]
+grep -Eq -- '--label ai\.webster\.profile-sha256=[0-9a-f]{64}' <<<"$rank0_launch"
+grep -Eq -- '--label ai\.webster\.profile-sha256=[0-9a-f]{64}' <<<"$rank1_launch"
+
+profile_file="$lifecycle_run_root/profile-graphs-320k.env"
+printf '%s\n' \
+  'PROFILE_NAME=graphs-320k' \
+  'MAX_MODEL_LEN=320000' \
+  'MAX_NUM_SEQS=2' \
+  'GPU_MEMORY_UTILIZATION=0.90' \
+  'ENFORCE_EAGER=0' \
+  'ENABLE_PREFIX_CACHING=1' \
+  'MAX_NUM_BATCHED_TOKENS=8192' \
+  'ENABLE_EXPERT_PARALLEL=0' \
+  >"$profile_file"
+chmod 0600 "$profile_file"
+: >"$TEST_LOG"
+"${lifecycle_test_env[@]}" "$start_deepseek" \
+  --run-root "$lifecycle_run_root" --profile-file "$profile_file"
+grep -Fq $'\tstart-deepseek-v41\tSTART\tprofile graphs-320k TP2/PP1 canary' \
+  "$lifecycle_run_root/events.tsv"
+grep -Fq $'\tstart-deepseek-v41\tGO\tprofile graphs-320k authenticated; rank 1 headless/keyless; NCCL HCA pinned' \
+  "$lifecycle_run_root/events.tsv"
+grep -Fq -- '--max-model-len 320000 --max-num-seqs 2' "$TEST_LOG"
+grep -Fq -- '--gpu-memory-utilization 0.90' "$TEST_LOG"
+grep -Fq -- '--enable-prefix-caching' "$TEST_LOG"
+grep -Fq -- '--max-num-batched-tokens 8192' "$TEST_LOG"
+if grep -Fq -- '--enforce-eager' "$TEST_LOG"; then
+  echo "FAIL: graph profile retained enforce-eager" >&2
+  exit 1
+fi
+
+dspark_profile_file="$lifecycle_run_root/profile-dspark-128k.env"
+printf '%s\n' \
+  'PROFILE_NAME=dspark-128k' \
+  'MAX_MODEL_LEN=131072' \
+  'MAX_NUM_SEQS=1' \
+  'GPU_MEMORY_UTILIZATION=0.90' \
+  'ENFORCE_EAGER=0' \
+  'ENABLE_PREFIX_CACHING=1' \
+  'MAX_NUM_BATCHED_TOKENS=16384' \
+  'ENABLE_EXPERT_PARALLEL=0' \
+  'SPECULATIVE_METHOD=dspark' \
+  'NUM_SPECULATIVE_TOKENS=5' \
+  'DRAFT_SAMPLE_METHOD=greedy' \
+  'REJECTION_SAMPLE_METHOD=standard' \
+  'ENABLE_FLASHINFER_AUTOTUNE=0' \
+  >"$dspark_profile_file"
+chmod 0600 "$dspark_profile_file"
+: >"$TEST_LOG"
+"${lifecycle_test_env[@]}" "$start_deepseek" \
+  --run-root "$lifecycle_run_root" --profile-file "$dspark_profile_file"
+grep -Fq -- \
+  "--speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"standard\"}'" \
+  "$TEST_LOG"
+grep -Fq -- '--no-enable-flashinfer-autotune' "$TEST_LOG"
+grep -Fq $'\tstart-deepseek-v41\tGO\tprofile dspark-128k authenticated; rank 1 headless/keyless; NCCL HCA pinned' \
+  "$lifecycle_run_root/events.tsv"
+invalid_autotune_profile="$lifecycle_run_root/profile-dspark-invalid-autotune.env"
+sed 's/^ENABLE_FLASHINFER_AUTOTUNE=0$/ENABLE_FLASHINFER_AUTOTUNE=2/' \
+  "$dspark_profile_file" >"$invalid_autotune_profile"
+chmod 0600 "$invalid_autotune_profile"
+expect_failure deepseek_dspark_invalid_autotune \
+  "${lifecycle_test_env[@]}" "$start_deepseek" \
+    --run-root "$lifecycle_run_root" --profile-file "$invalid_autotune_profile"
+invalid_dspark_profile="$lifecycle_run_root/profile-dspark-invalid-block.env"
+sed 's/^NUM_SPECULATIVE_TOKENS=5$/NUM_SPECULATIVE_TOKENS=4/' \
+  "$dspark_profile_file" >"$invalid_dspark_profile"
+chmod 0600 "$invalid_dspark_profile"
+expect_failure deepseek_dspark_block_size \
+  "${lifecycle_test_env[@]}" "$start_deepseek" \
+    --run-root "$lifecycle_run_root" --profile-file "$invalid_dspark_profile"
+
+chmod 0644 "$profile_file"
+expect_failure deepseek_profile_mode \
+  "${lifecycle_test_env[@]}" "$start_deepseek" \
+    --run-root "$lifecycle_run_root" --profile-file "$profile_file"
+chmod 0600 "$profile_file"
+printf 'UNREVIEWED_FLAG=1\n' >>"$profile_file"
+expect_failure deepseek_profile_unknown_field \
+  "${lifecycle_test_env[@]}" "$start_deepseek" \
+    --run-root "$lifecycle_run_root" --profile-file "$profile_file"
 
 : >"$TEST_LOG"
 env "${lifecycle_test_env[@]:1}" \
@@ -564,6 +934,43 @@ env "${lifecycle_test_env[@]:1}" \
   "$start_deepseek" --run-root "$lifecycle_run_root"
 if grep -Fq 'docker run -d --name deepseek-v41-flash-tp2' "$TEST_LOG"; then
   echo "FAIL: healthy DeepSeek re-run relaunched ranks" >&2
+  exit 1
+fi
+: >"$TEST_LOG"
+expect_failure deepseek_verify_only_requires_healthy_pair \
+  env "${lifecycle_test_env[@]:1}" \
+    TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=false \
+    TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=false \
+    "$start_deepseek" --run-root "$lifecycle_run_root" \
+      --profile-file "$dspark_profile_file" --verify-only
+grep -Fq 'not already healthy for the requested profile' \
+  "$scratch/deepseek_verify_only_requires_healthy_pair.stderr"
+if grep -Eq 'docker (run|stop)' "$TEST_LOG"; then
+  echo "FAIL: verify-only DeepSeek check mutated the serving pair" >&2
+  exit 1
+fi
+: >"$TEST_LOG"
+expect_failure deepseek_existing_wrong_profile \
+  env "${lifecycle_test_env[@]:1}" \
+    TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=true \
+    TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=true \
+    TEST_LIFECYCLE_DEEPSEEK_PROFILE_MATCH=0 \
+    "$start_deepseek" --run-root "$lifecycle_run_root" \
+      --profile-file "$dspark_profile_file"
+if grep -Eq 'docker (run|stop)' "$TEST_LOG"; then
+  echo "FAIL: mismatched running DeepSeek ranks were mutated before rejection" >&2
+  exit 1
+fi
+: >"$TEST_LOG"
+expect_failure deepseek_existing_split_generation \
+  env "${lifecycle_test_env[@]:1}" \
+    TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=true \
+    TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=true \
+    TEST_LIFECYCLE_DEEPSEEK_GENERATION_MATCH=0 \
+    "$start_deepseek" --run-root "$lifecycle_run_root" \
+      --profile-file "$dspark_profile_file"
+if grep -Eq 'docker (run|stop)' "$TEST_LOG"; then
+  echo "FAIL: split-generation DeepSeek ranks were mutated before rejection" >&2
   exit 1
 fi
 
@@ -589,6 +996,25 @@ expect_failure watchdog_rank_skew \
     TEST_WATCHDOG_NO_RECOVERY=1 \
     "$watchdog" --run-root "$lifecycle_run_root"
 
+for watchdog_case in \
+  TEST_LIFECYCLE_DEEPSEEK_IMAGE_MATCH \
+  TEST_LIFECYCLE_DEEPSEEK_PROFILE_MATCH \
+  TEST_LIFECYCLE_DEEPSEEK_RUNTIME_MATCH \
+  TEST_LIFECYCLE_DEEPSEEK_RESTARTS_OK \
+  TEST_LIFECYCLE_DEEPSEEK_GENERATION_MATCH \
+  TEST_LIFECYCLE_DEEPSEEK_MOUNTS_OK \
+  TEST_LIFECYCLE_DEEPSEEK_ULIMITS_OK \
+  TEST_LIFECYCLE_DEEPSEEK_FABRIC_OK \
+  TEST_LIFECYCLE_AUTH_SEQUENCE_OK; do
+  expect_failure "watchdog_rejects_${watchdog_case,,}" \
+    env "${lifecycle_test_env[@]:1}" \
+      TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=true \
+      TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=true \
+      TEST_WATCHDOG_NO_RECOVERY=1 \
+      "$watchdog_case"=0 \
+      "$watchdog" --run-root "$lifecycle_run_root"
+done
+
 : >"$TEST_LOG"
 env "${lifecycle_test_env[@]:1}" \
   TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=true \
@@ -597,6 +1023,184 @@ env "${lifecycle_test_env[@]:1}" \
   "$watchdog" --run-root "$lifecycle_run_root"
 if grep -Eq 'docker (stop|run).*deepseek-v41-flash-tp2' "$TEST_LOG"; then
   echo "FAIL: watchdog restarted inside the 20-minute startup grace" >&2
+  exit 1
+fi
+
+init_watchdog_test_root() {
+  local test_root="$1"
+  (
+    export WEBSTER_PREFLIGHT_TEST_MODE=1
+    export TEST_RUNS_ROOT="$lifecycle_runs_root"
+    source webster/deepseek-v41/scripts/common.sh
+    init_run_root "$test_root"
+  )
+  sed -i \
+    's#^VLLM_IMAGE_ID=.*#VLLM_IMAGE_ID=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#' \
+    "$test_root/manifest.env"
+}
+
+watchdog_regression_failures=0
+record_watchdog_failure() {
+  echo "FAIL: $*" >&2
+  watchdog_regression_failures=$((watchdog_regression_failures + 1))
+}
+
+watchdog_verify_race_root="$lifecycle_runs_root/20990101T000011Z"
+init_watchdog_test_root "$watchdog_verify_race_root"
+watchdog_verify_race_profile="$watchdog_verify_race_root/profile-dspark-128k.env"
+cp "$dspark_profile_file" "$watchdog_verify_race_profile"
+chmod 0600 "$watchdog_verify_race_profile"
+: >"$TEST_LOG"
+if env "${lifecycle_test_env[@]:1}" \
+  TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=true \
+  TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=true \
+  TEST_WATCHDOG_VERIFY_SHAMU_RUNNING=false \
+  TEST_WATCHDOG_VERIFY_TILIKUM_RUNNING=false \
+  TEST_WATCHDOG_NO_RECOVERY=1 \
+  "$watchdog" --run-root "$watchdog_verify_race_root" \
+    --profile-file "$watchdog_verify_race_profile"; then
+  record_watchdog_failure "watchdog verification ignored a serving-state race"
+fi
+if ! grep -Fq $'\tdeepseek-v41-watchdog\tBREACH\timmutable-runtime-profile' \
+  "$watchdog_verify_race_root/events.tsv"; then
+  record_watchdog_failure "watchdog did not classify the raced verification failure"
+fi
+if grep -Eq 'docker (stop|run).*deepseek-v41-flash-tp2' "$TEST_LOG"; then
+  record_watchdog_failure "watchdog verification relaunched the raced serving pair"
+fi
+
+watchdog_lock_root="$lifecycle_runs_root/20990101T000004Z"
+init_watchdog_test_root "$watchdog_lock_root"
+watchdog_lock_events_before="$(wc -l <"$watchdog_lock_root/events.tsv")"
+: >"$TEST_LOG"
+exec {watchdog_lock_fd}>"$watchdog_lock_root/watchdog.lock"
+flock -n "$watchdog_lock_fd"
+if ! env "${lifecycle_test_env[@]:1}" \
+  TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=false \
+  TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=false \
+  TEST_LIFECYCLE_START_AGE_SECONDS=invalid \
+  "$watchdog" --run-root "$watchdog_lock_root"; then
+  record_watchdog_failure "contending watchdog invocation did not exit cleanly"
+fi
+flock -u "$watchdog_lock_fd"
+exec {watchdog_lock_fd}>&-
+if [[ "$(wc -l <"$watchdog_lock_root/events.tsv")" != "$watchdog_lock_events_before" ]]; then
+  record_watchdog_failure "contending watchdog invocation recorded an event"
+fi
+if [[ -s "$TEST_LOG" || -e "$watchdog_lock_root/watchdog.last-recovery" ]]; then
+  record_watchdog_failure "contending watchdog invocation attempted recovery"
+fi
+
+watchdog_missing_profile_root="$lifecycle_runs_root/20990101T000005Z"
+init_watchdog_test_root "$watchdog_missing_profile_root"
+: >"$TEST_LOG"
+if env "${lifecycle_test_env[@]:1}" \
+  TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=false \
+  TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=false \
+  TEST_LIFECYCLE_START_AGE_SECONDS=1200 \
+  "$watchdog" --run-root "$watchdog_missing_profile_root" \
+  >"$scratch/watchdog_missing_profile.stdout" \
+  2>"$scratch/watchdog_missing_profile.stderr"; then
+  record_watchdog_failure "unhealthy watchdog recovered without a profile file"
+fi
+if grep -Eq 'docker (stop|run).*deepseek-v41-flash-tp2' "$TEST_LOG" ||
+  [[ -e "$watchdog_missing_profile_root/watchdog.last-recovery" ]]; then
+  record_watchdog_failure "missing watchdog profile was detected after recovery began"
+fi
+
+watchdog_unsafe_profile_root="$lifecycle_runs_root/20990101T000006Z"
+init_watchdog_test_root "$watchdog_unsafe_profile_root"
+unsafe_watchdog_profile="$watchdog_unsafe_profile_root/profile-dspark-128k.env"
+ln -s "$dspark_profile_file" "$unsafe_watchdog_profile"
+: >"$TEST_LOG"
+if env "${lifecycle_test_env[@]:1}" \
+  TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=false \
+  TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=false \
+  TEST_LIFECYCLE_START_AGE_SECONDS=1200 \
+  "$watchdog" --run-root "$watchdog_unsafe_profile_root" \
+    --profile-file "$unsafe_watchdog_profile" \
+  >"$scratch/watchdog_unsafe_profile.stdout" \
+  2>"$scratch/watchdog_unsafe_profile.stderr"; then
+  record_watchdog_failure "watchdog accepted a symlinked profile outside its run root"
+fi
+if ! grep -Fq 'profile file' "$scratch/watchdog_unsafe_profile.stderr"; then
+  record_watchdog_failure "watchdog did not identify the unsafe profile"
+fi
+if grep -Eq 'docker (stop|run).*deepseek-v41-flash-tp2' "$TEST_LOG" ||
+  [[ -e "$watchdog_unsafe_profile_root/watchdog.last-recovery" ]]; then
+  record_watchdog_failure "unsafe watchdog profile was detected after recovery began"
+fi
+
+expect_watchdog_profile_rejection_before_stop() {
+  local name="$1" test_root="$2" tested_profile="$3"
+  : >"$TEST_LOG"
+  if env "${lifecycle_test_env[@]:1}" \
+    TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=false \
+    TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=false \
+    TEST_LIFECYCLE_START_AGE_SECONDS=1200 \
+    "$watchdog" --run-root "$test_root" --profile-file "$tested_profile" \
+    >"$scratch/$name.stdout" 2>"$scratch/$name.stderr"; then
+    record_watchdog_failure "watchdog accepted $name"
+  fi
+  if grep -Eq 'docker (stop|run).*deepseek-v41-flash-tp2' "$TEST_LOG" ||
+    [[ -e "$test_root/watchdog.last-recovery" ]]; then
+    record_watchdog_failure "$name was detected after recovery began"
+  fi
+}
+
+watchdog_bad_mode_root="$lifecycle_runs_root/20990101T000008Z"
+init_watchdog_test_root "$watchdog_bad_mode_root"
+watchdog_bad_mode_profile="$watchdog_bad_mode_root/profile-dspark-128k.env"
+cp "$dspark_profile_file" "$watchdog_bad_mode_profile"
+chmod 0644 "$watchdog_bad_mode_profile"
+expect_watchdog_profile_rejection_before_stop \
+  "mode-0644 watchdog profile" "$watchdog_bad_mode_root" \
+  "$watchdog_bad_mode_profile"
+
+watchdog_bad_owner_root="$lifecycle_runs_root/20990101T000009Z"
+init_watchdog_test_root "$watchdog_bad_owner_root"
+watchdog_bad_owner_profile="$watchdog_bad_owner_root/profile-dspark-128k.env"
+cp "$dspark_profile_file" "$watchdog_bad_owner_profile"
+chmod 0600 "$watchdog_bad_owner_profile"
+sudo -n chown 65534 "$watchdog_bad_owner_profile"
+expect_watchdog_profile_rejection_before_stop \
+  "foreign-owner watchdog profile" "$watchdog_bad_owner_root" \
+  "$watchdog_bad_owner_profile"
+
+watchdog_outside_profile_root="$lifecycle_runs_root/20990101T000010Z"
+init_watchdog_test_root "$watchdog_outside_profile_root"
+expect_watchdog_profile_rejection_before_stop \
+  "profile from another run root" "$watchdog_outside_profile_root" \
+  "$dspark_profile_file"
+
+watchdog_recovery_root="$lifecycle_runs_root/20990101T000007Z"
+init_watchdog_test_root "$watchdog_recovery_root"
+watchdog_recovery_profile="$watchdog_recovery_root/profile-dspark-128k.env"
+cp "$dspark_profile_file" "$watchdog_recovery_profile"
+chmod 0600 "$watchdog_recovery_profile"
+: >"$TEST_LOG"
+if ! env "${lifecycle_test_env[@]:1}" \
+  TEST_LIFECYCLE_DEEPSEEK_SHAMU_RUNNING=false \
+  TEST_LIFECYCLE_DEEPSEEK_TILIKUM_RUNNING=false \
+  TEST_LIFECYCLE_START_AGE_SECONDS=1200 \
+  "$watchdog" --run-root "$watchdog_recovery_root" \
+    --profile-file "$watchdog_recovery_profile"; then
+  record_watchdog_failure "watchdog rejected a safe DSpark recovery profile"
+fi
+if ! grep -Fq 'ssh shamu docker stop --time 120 deepseek-v41-flash-tp2' "$TEST_LOG" ||
+  ! grep -Fq 'ssh tilikum sudo -n docker stop --time 120 deepseek-v41-flash-tp2' "$TEST_LOG" ||
+  ! grep -Fq -- \
+    '--speculative-config '\''{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"greedy","rejection_sample_method":"standard"}'\''' \
+    "$TEST_LOG"; then
+  record_watchdog_failure "watchdog did not perform coordinated DSpark recovery"
+fi
+if ! grep -Fq $'\tdeepseek-v41-watchdog\tRECOVERED\tcoordinated stop/start completed' \
+  "$watchdog_recovery_root/events.tsv"; then
+  record_watchdog_failure "watchdog did not record successful DSpark recovery"
+fi
+
+if (( watchdog_regression_failures > 0 )); then
+  echo "FAIL: $watchdog_regression_failures watchdog regression test(s) failed" >&2
   exit 1
 fi
 

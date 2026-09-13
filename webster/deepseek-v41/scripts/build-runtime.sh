@@ -658,7 +658,7 @@ else
   copy_log="$remote_root/copy.log"
   copy_pid="$remote_root/copy.pid"
   ssh shamu "rm -f '$copy_status'; nohup setsid bash -c 'set -o pipefail; \
-    rsync --archive --checksum --bwlimit=250000 \"$image_tar\" \"10.10.1.2:$tilikum_dir/\"; \
+    env -u SSH_AUTH_SOCK rsync --archive --checksum --bwlimit=250000 \"$image_tar\" \"10.10.1.2:$tilikum_dir/\"; \
     s=\$?; printf \"EXIT=%s\\n\" \"\$s\" >\"$copy_status\"; exit \"\$s\"' \
     >'$copy_log' 2>&1 </dev/null & printf '%s\\n' \$! >'$copy_pid'"
   monitor_runtime_job shamu "$copy_status" "$copy_pid" runtime-copy

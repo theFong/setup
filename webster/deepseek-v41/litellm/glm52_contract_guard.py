@@ -18,13 +18,31 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
-    from fastapi import HTTPException
+    from litellm.proxy._types import ProxyException
 except ImportError:  # pragma: no cover - exercised by the dependency-light local suite
-    class HTTPException(Exception):
-        def __init__(self, status_code: int, detail: Any):
-            self.status_code = status_code
-            self.detail = detail
-            super().__init__(str(detail))
+    class ProxyException(Exception):
+        def __init__(
+            self,
+            message: str,
+            type: str,
+            param: str | None,
+            code: int | str,
+            openai_code: str | None = None,
+        ) -> None:
+            self.message = message
+            self.type = type
+            self.param = param
+            self.code = str(code)
+            self.openai_code = openai_code or str(code)
+            super().__init__(message)
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "message": self.message,
+                "type": self.type,
+                "param": self.param,
+                "code": self.code,
+            }
 
 
 try:
@@ -37,6 +55,34 @@ except ImportError:  # pragma: no cover - exact-image tests require the real bas
 PUBLIC_MODEL = "glm-5.2"
 LEGACY_CONTEXT_TOKENS = 320_000
 DEFAULT_TOKENIZER_DIR = Path("/app/custom_callbacks/glm52-tokenizer")
+VISION_CONTENT_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
+class GLM52ContractError(ProxyException):
+    """Keep the OpenAI error code distinct from LiteLLM's HTTP status field."""
+
+    def __init__(self, code: str, message: str, param: str | None) -> None:
+        self.status_code = 400
+        self.detail = {
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": param,
+                "code": code,
+            }
+        }
+        super().__init__(
+            message=message,
+            type="invalid_request_error",
+            param=param,
+            code=self.status_code,
+            openai_code=code,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload["code"] = self.openai_code
+        return payload
 
 
 def _plain(value: Any) -> Any:
@@ -180,18 +226,10 @@ class GLM52ContractGuard(CustomLogger):
         self._renderer_lock = threading.Lock()
 
     @staticmethod
-    def _error(code: str, message: str, param: str | None = None) -> HTTPException:
-        return HTTPException(
-            status_code=400,
-            detail={
-                "error": {
-                    "message": message,
-                    "type": "invalid_request_error",
-                    "param": param,
-                    "code": code,
-                }
-            },
-        )
+    def _error(
+        code: str, message: str, param: str | None = None
+    ) -> GLM52ContractError:
+        return GLM52ContractError(code, message, param)
 
     def _get_renderer(self) -> Any:
         if self._renderer is None:
@@ -227,6 +265,26 @@ class GLM52ContractGuard(CustomLogger):
         return normalized
 
     @staticmethod
+    def _contains_vision(messages: Any) -> bool:
+        if not isinstance(messages, list):
+            return False
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                part = _plain(part)
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in VISION_CONTENT_TYPES:
+                    return True
+                if "image_url" in part:
+                    return True
+        return False
+
+    @staticmethod
     def _output_field(data: dict[str, Any], call_type: str) -> str:
         if call_type in ("responses", "aresponses") or (
             "input" in data and "messages" not in data
@@ -249,6 +307,12 @@ class GLM52ContractGuard(CustomLogger):
 
         try:
             count_data = self._count_data(data, call_type)
+            if self._contains_vision(count_data.get("messages")):
+                raise self._error(
+                    "unsupported_vision",
+                    "The legacy glm-5.2 contract does not support image input.",
+                    "messages" if "messages" in data else "input",
+                )
             if self._counter is None:
                 prompt_tokens = await asyncio.to_thread(self._count_prompt, count_data)
             else:
@@ -259,7 +323,7 @@ class GLM52ContractGuard(CustomLogger):
                 raise RuntimeError("prompt counter did not return an integer")
             if prompt_tokens < 0:
                 raise RuntimeError("prompt counter returned a negative value")
-        except HTTPException:
+        except GLM52ContractError:
             raise
         except Exception as error:
             raise self._error(

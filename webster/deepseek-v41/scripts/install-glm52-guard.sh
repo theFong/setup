@@ -38,9 +38,12 @@ init_run_root "$validated_root"
 
 module_source="${TEST_GUARD_SOURCE:-$package_dir/litellm/glm52_contract_guard.py}"
 test_source="$package_dir/litellm/test_glm52_contract_guard.py"
+verifier_source="$script_dir/verify-litellm-callbacks.py"
 fixture_source="$package_dir/tests/fixtures"
 tokenizer_source="${TEST_TOKENIZER_SOURCE:-$RUN_ROOT/baseline/glm52-tokenizer}"
 [[ -f "$module_source" && ! -L "$module_source" ]] || die "guard module is missing"
+[[ -f "$verifier_source" && ! -L "$verifier_source" ]] ||
+  die "callback verifier is missing"
 for name in tokenizer.json tokenizer_config.json chat_template.jinja; do
   [[ -f "$tokenizer_source/$name" && ! -L "$tokenizer_source/$name" ]] ||
     die "legacy tokenizer asset is missing: $name"
@@ -198,6 +201,7 @@ done"
 
 ssh spark-1 "set -eu; test ! -e '$remote_offline'; mkdir -p '$remote_offline/litellm' '$remote_offline/tests/fixtures'"
 scp "$test_source" "spark-1:$remote_offline/litellm/test_glm52_contract_guard.py"
+scp "$verifier_source" "spark-1:$remote_offline/verify-litellm-callbacks.py"
 scp "$candidate_config" "spark-1:$remote_offline/config.yaml"
 scp "$fixture_source/chat.json" "$fixture_source/reasoning-none.json" \
   "$fixture_source/tools.json" "$fixture_source/tool-result.json" \
@@ -212,7 +216,7 @@ docker run --rm --network none --entrypoint python \
   -v '$remote_parent:/app/custom_callbacks:ro' \
   -v '$remote_offline:/work:ro' \
   -w /app \
-  \"\$image_id\" -c \"import importlib, yaml; from litellm.integrations.custom_logger import CustomLogger; guard='custom_callbacks.glm52_contract_guard.glm52_contract_guard'; data=yaml.safe_load(open('/work/config.yaml')); callbacks=data.get('litellm_settings',{}).get('callbacks',[]); assert callbacks and callbacks[0] == guard; custom=[item for item in callbacks if isinstance(item,str) and item.startswith('custom_callbacks.')]; assert custom; [(_ for _ in ()).throw(AssertionError(item)) if not isinstance(getattr(importlib.import_module(item.rsplit('.',1)[0]),item.rsplit('.',1)[1]),CustomLogger) else None for item in custom]\"
+  \"\$image_id\" /work/verify-litellm-callbacks.py /work/config.yaml
 docker run --rm --network none --entrypoint python \
   -e GLM52_TOKENIZER_DIR=/app/custom_callbacks/glm52-tokenizer \
   -e LITELLM_LOCAL_MODEL_COST_MAP=true \

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Migrating Webster Models"
+  short_description: "Plan bounded-downtime model cutovers"
+  default_prompt: "Use $migrating-webster-models to plan and execute a safe Webster model migration."

@@ -1,6 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Cluster commands must never inherit or forward an operator's SSH agent.  The
+# wrappers cover direct calls from every package script; composed remote paths
+# additionally scrub the remote shell before starting their nested transport.
+unset SSH_AUTH_SOCK
+ssh() {
+  if [[ "${WEBSTER_LOCAL_SHAMU:-0}" == 1 && "${1:-}" == shamu ]]; then
+    if [[ "${WEBSTER_WEKA_TEST_MODE:-0}" != 1 && "$(hostname -s)" != shamu ]]; then
+      printf 'ERROR: local Shamu command mode may run only on shamu\n' >&2
+      return 1
+    fi
+    shift
+    if (( $# == 1 )); then
+      env -u SSH_AUTH_SOCK bash -c "$1"
+    else
+      env -u SSH_AUTH_SOCK "$@"
+    fi
+    return
+  fi
+  env -u SSH_AUTH_SOCK "$(type -P ssh)" -o ForwardAgent=no "$@"
+}
+scp() {
+  env -u SSH_AUTH_SOCK "$(type -P scp)" -o ForwardAgent=no "$@"
+}
+rsync() {
+  env -u SSH_AUTH_SOCK "$(type -P rsync)" "$@"
+}
+brev() {
+  env -u SSH_AUTH_SOCK "$(type -P brev)" "$@"
+}
+
 SHAMU_NETBIRD="100.73.140.127"
 SHAMU_LAN="192.168.1.75"
 SHAMU_RAIL="10.10.1.1"
@@ -26,14 +56,27 @@ VLLM_ARM64_ARCH_LIST="9.0 10.0 11.0 12.0"
 VLLM_MAX_WHEEL_SIZE_MB="700"
 PROMETHEUS_URL="http://100.73.140.127:9095"
 GLM_METRICS_INSTANCE="100.73.140.127:8000"
+BAKER_RANK0_HOST="baker-spark-1"
+BAKER_RANK1_HOST="baker-spark-2"
+BAKER_RANK0_NETBIRD="100.73.127.129"
+BAKER_API_PORT="8888"
+BAKER_CONTAINER="deepseek-v4-flash-vllm-dspark-1"
 STAGE_MIN_SUCCESS_RATE="0.99"
 STAGE_LATENCY_MULTIPLIER="2.0"
 STAGE_BASELINE_MIN_REQUESTS="20"
 if [[ "${WEBSTER_PREFLIGHT_TEST_MODE:-0}" == "1" ||
   "${WEBSTER_STAGE_TEST_MODE:-0}" == "1" ||
   "${WEBSTER_RUNTIME_TEST_MODE:-0}" == "1" ||
-  "${WEBSTER_LIFECYCLE_TEST_MODE:-0}" == "1" ]]; then
+  "${WEBSTER_LIFECYCLE_TEST_MODE:-0}" == "1" ||
+  "${WEBSTER_WEKA_TEST_MODE:-0}" == "1" ||
+  "${WEBSTER_ACCEPTANCE_TEST_MODE:-0}" == "1" ]]; then
   RUNS_ROOT="${TEST_RUNS_ROOT:-/home/ubuntu/deepseek-v41-runs}"
+elif [[ -n "${WEBSTER_RUNS_ROOT:-}" ]]; then
+  [[ -d "$WEBSTER_RUNS_ROOT" && ! -L "$WEBSTER_RUNS_ROOT" ]] || {
+    printf 'ERROR: Webster runs root override must be an existing non-symlink directory\n' >&2
+    return 1 2>/dev/null || exit 1
+  }
+  RUNS_ROOT="$(realpath -e -- "$WEBSTER_RUNS_ROOT")"
 else
   RUNS_ROOT="/home/ubuntu/deepseek-v41-runs"
 fi
@@ -122,10 +165,14 @@ redact_stream() {
 }
 
 capture() {
-  local name="$1" output temporary status
+  local name="$1" output temporary status suffix=2
   shift
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "unsafe capture name: $name"
   output="$RUN_ROOT/logs/$name.log"
+  while [[ -e "$output" || -L "$output" ]]; do
+    output="$RUN_ROOT/logs/$name-$suffix.log"
+    ((suffix += 1))
+  done
   temporary="$output.tmp.$$"
   set +e
   "$@" >"$temporary" 2>&1

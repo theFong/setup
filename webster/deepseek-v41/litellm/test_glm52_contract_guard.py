@@ -23,7 +23,7 @@ if spec is None or spec.loader is None:
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 GLM52ContractGuard = module.GLM52ContractGuard
-HTTPException = module.HTTPException
+GLM52ContractError = module.GLM52ContractError
 LegacyGLM52Renderer = module.LegacyGLM52Renderer
 
 
@@ -33,13 +33,13 @@ def run_guard(data: dict, *, count: int = 10, call_type: str = "completion") -> 
 
 
 class GLM52ContractGuardTests(unittest.TestCase):
-    def assert_error_code(self, error: HTTPException, code: str) -> None:
+    def assert_error_code(self, error: GLM52ContractError, code: str) -> None:
         self.assertEqual(error.status_code, 400)
         self.assertEqual(error.detail["error"]["code"], code)
 
     def test_prompt_over_limit_is_rejected_before_routing(self) -> None:
         guard = GLM52ContractGuard(counter=lambda _: 320_001)
-        with self.assertRaises(HTTPException) as caught:
+        with self.assertRaises(GLM52ContractError) as caught:
             asyncio.run(
                 guard.async_pre_call_hook(
                     None,
@@ -50,9 +50,44 @@ class GLM52ContractGuardTests(unittest.TestCase):
             )
         self.assert_error_code(caught.exception, "context_length_exceeded")
 
+    def test_legacy_alias_rejects_image_content_before_routing(self) -> None:
+        data = {
+            "model": "glm-5.2",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,iVBORw0KGgo="
+                            },
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 16,
+        }
+        with self.assertRaises(GLM52ContractError) as caught:
+            run_guard(data)
+        self.assert_error_code(caught.exception, "unsupported_vision")
+        self.assertEqual(caught.exception.detail["error"]["param"], "messages")
+
+    def test_contract_error_serializes_public_code_separately_from_http_status(self) -> None:
+        error = GLM52ContractGuard._error(
+            "unsupported_vision",
+            "The legacy glm-5.2 contract does not support image input.",
+            "messages",
+        )
+
+        self.assertEqual(error.status_code, 400)
+        self.assertEqual(getattr(error, "code", None), "400")
+        self.assertEqual(error.to_dict()["code"], "unsupported_vision")
+
     def test_explicit_output_over_remaining_budget_is_rejected_like_old_vllm(self) -> None:
         data = {"model": "glm-5.2", "messages": [], "max_tokens": 500}
-        with self.assertRaises(HTTPException) as caught:
+        with self.assertRaises(GLM52ContractError) as caught:
             run_guard(data, count=319_900)
         self.assert_error_code(caught.exception, "context_length_exceeded")
         self.assertEqual(data["max_tokens"], 500)
@@ -80,7 +115,7 @@ class GLM52ContractGuardTests(unittest.TestCase):
             responses_normalizer=lambda data: normalized,
         )
         data = {"model": "glm-5.2", "input": "hello", "max_output_tokens": 500}
-        with self.assertRaises(HTTPException) as caught:
+        with self.assertRaises(GLM52ContractError) as caught:
             asyncio.run(guard.async_pre_call_hook(None, None, data, "responses"))
         self.assert_error_code(caught.exception, "context_length_exceeded")
 
@@ -89,7 +124,7 @@ class GLM52ContractGuardTests(unittest.TestCase):
         self.assertEqual(result["max_tokens"], 100)
 
     def test_exact_limit_prompt_is_rejected_when_no_output_token_remains(self) -> None:
-        with self.assertRaises(HTTPException) as caught:
+        with self.assertRaises(GLM52ContractError) as caught:
             run_guard({"model": "glm-5.2", "messages": []}, count=320_000)
         self.assert_error_code(caught.exception, "context_length_exceeded")
 
@@ -117,7 +152,7 @@ class GLM52ContractGuardTests(unittest.TestCase):
         for value in (True, False, 0, -1, 1.5, "100", None):
             with self.subTest(value=value):
                 data = {"model": "glm-5.2", "messages": [], "max_tokens": value}
-                with self.assertRaises(HTTPException) as caught:
+                with self.assertRaises(GLM52ContractError) as caught:
                     run_guard(data)
                 self.assert_error_code(caught.exception, "invalid_request_error")
 
@@ -126,7 +161,7 @@ class GLM52ContractGuardTests(unittest.TestCase):
             raise RuntimeError("renderer unavailable")
 
         guard = GLM52ContractGuard(counter=fail)
-        with self.assertRaises(HTTPException) as caught:
+        with self.assertRaises(GLM52ContractError) as caught:
             asyncio.run(
                 guard.async_pre_call_hook(
                     None,
@@ -191,7 +226,7 @@ class GLM52ContractGuardTests(unittest.TestCase):
     def test_missing_tokenizer_files_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             guard = GLM52ContractGuard(tokenizer_dir=Path(temporary))
-            with self.assertRaises(HTTPException) as caught:
+            with self.assertRaises(GLM52ContractError) as caught:
                 asyncio.run(
                     guard.async_pre_call_hook(
                         None,

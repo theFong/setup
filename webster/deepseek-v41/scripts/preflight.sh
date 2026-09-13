@@ -32,6 +32,46 @@ station_free_bytes() {
   printf '%s\n' "$value"
 }
 
+validate_station_owner_state() {
+  local checked_phase="$1" glm_shamu="$2" glm_tilikum="$3"
+  local deepseek_shamu="$4" deepseek_tilikum="$5"
+  case "$checked_phase" in
+    baseline|stage|alias)
+      require_eq "Shamu GLM running" "true" "$glm_shamu"
+      require_eq "Tilikum GLM running" "true" "$glm_tilikum"
+      require_eq "Shamu DeepSeek stopped" "false" "$deepseek_shamu"
+      require_eq "Tilikum DeepSeek stopped" "false" "$deepseek_tilikum"
+      ;;
+    canary)
+      require_eq "Shamu GLM stopped" "false" "$glm_shamu"
+      require_eq "Tilikum GLM stopped" "false" "$glm_tilikum"
+      require_eq "Shamu DeepSeek stopped" "false" "$deepseek_shamu"
+      require_eq "Tilikum DeepSeek stopped" "false" "$deepseek_tilikum"
+      ;;
+    publish)
+      require_eq "Shamu GLM stopped" "false" "$glm_shamu"
+      require_eq "Tilikum GLM stopped" "false" "$glm_tilikum"
+      require_eq "Shamu DeepSeek running" "true" "$deepseek_shamu"
+      require_eq "Tilikum DeepSeek running" "true" "$deepseek_tilikum"
+      ;;
+  esac
+}
+
+validate_publish_acceptance() {
+  [[ "$phase" == "publish" ]] || return 0
+  local verifier="$script_dir/verify-private-acceptance.py"
+  if [[ "${WEBSTER_PREFLIGHT_TEST_MODE:-0}" == "1" &&
+    -n "${TEST_PRIVATE_ACCEPTANCE_VERIFIER:-}" ]]; then
+    verifier="$TEST_PRIVATE_ACCEPTANCE_VERIFIER"
+  fi
+  [[ -f "$validated_root/private-acceptance.json" ]] ||
+    die "publish phase requires private-acceptance.json"
+  "$verifier" \
+    --run-root "$validated_root" \
+    --acceptance "$validated_root/private-acceptance.json" \
+    --max-age-seconds 21600
+}
+
 test_mode_checks() {
   if [[ "$phase" == "stage" ]]; then
     require_ge "free bytes before staging" "$MIN_FREE_BEFORE_STAGE_BYTES" \
@@ -46,6 +86,19 @@ test_mode_checks() {
   "$script_dir/verify-litellm-container.py" "$inspect_path" >/dev/null
   require_eq "current model probe status" "ok" \
     "${TEST_CURRENT_MODEL_PROBE_STATUS:-ok}"
+  local glm_default=true deepseek_default=false
+  if [[ "$phase" == "canary" || "$phase" == "publish" ]]; then
+    glm_default=false
+  fi
+  if [[ "$phase" == "publish" ]]; then
+    deepseek_default=true
+  fi
+  validate_station_owner_state "$phase" \
+    "${TEST_PREFLIGHT_GLM_SHAMU_RUNNING:-$glm_default}" \
+    "${TEST_PREFLIGHT_GLM_TILIKUM_RUNNING:-$glm_default}" \
+    "${TEST_PREFLIGHT_DEEPSEEK_SHAMU_RUNNING:-$deepseek_default}" \
+    "${TEST_PREFLIGHT_DEEPSEEK_TILIKUM_RUNNING:-$deepseek_default}"
+  validate_publish_acceptance
   if [[ "${TEST_VALIDATE_STATION_FREE:-0}" == "1" ]]; then
     station_free_bytes shamu >/dev/null
     station_free_bytes tilikum >/dev/null
@@ -77,10 +130,22 @@ capture git-state bash -c \
 capture brev-instances brev ls
 capture brev-nodes brev ls nodes
 
+station_inspect_format='--format "id={{.Id}} image={{.Image}} started={{.State.StartedAt}} restarts={{.RestartCount}} running={{.State.Running}} args={{json .Args}}"'
+station_inspect_shamu="docker inspect '$GLM_CONTAINER'"
+station_inspect_tilikum="sudo -n docker inspect '$GLM_CONTAINER'"
+if [[ "$phase" == "publish" ]]; then
+  station_inspect_shamu="docker inspect '$DEEPSEEK_CONTAINER'"
+  station_inspect_tilikum="sudo -n docker inspect '$DEEPSEEK_CONTAINER'"
+elif [[ "$phase" == "canary" ]]; then
+  station_inspect_format=""
+  station_inspect_shamu="docker ps -a --filter name='$GLM_CONTAINER' --filter name='$DEEPSEEK_CONTAINER' --format 'id={{.ID}} image={{.Image}} status={{.Status}} names={{.Names}}'"
+  station_inspect_tilikum="sudo -n docker ps -a --filter name='$GLM_CONTAINER' --filter name='$DEEPSEEK_CONTAINER' --format 'id={{.ID}} image={{.Image}} status={{.Status}} names={{.Names}}'"
+fi
+
 capture shamu-host ssh shamu \
-  'set -eu; hostname; date -u +%Y-%m-%dT%H:%M:%SZ; uptime; uname -a; nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader; free -b; df -PB1 /home/alecfong; ip -o addr show; cat /sys/class/infiniband/mlx5_1/ports/1/state; docker inspect glm52-full-mtp --format "id={{.Id}} image={{.Image}} started={{.State.StartedAt}} restarts={{.RestartCount}} running={{.State.Running}} args={{json .Args}}"; ss -lntp'
+  "set -eu; hostname; date -u +%Y-%m-%dT%H:%M:%SZ; uptime; uname -a; nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader; free -b; df -PB1 /home/alecfong; ip -o addr show; cat /sys/class/infiniband/mlx5_1/ports/1/state; $station_inspect_shamu $station_inspect_format; ss -lntp"
 capture tilikum-host ssh tilikum \
-  'set -eu; hostname; date -u +%Y-%m-%dT%H:%M:%SZ; uptime; uname -a; nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader; free -b; df -PB1 /home/alecfong; ip -o addr show; cat /sys/class/infiniband/mlx5_1/ports/1/state; sudo -n docker inspect glm52-full-mtp --format "id={{.Id}} image={{.Image}} started={{.State.StartedAt}} restarts={{.RestartCount}} running={{.State.Running}} args={{json .Args}}"; ss -lntp'
+  "set -eu; hostname; date -u +%Y-%m-%dT%H:%M:%SZ; uptime; uname -a; nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv,noheader; free -b; df -PB1 /home/alecfong; ip -o addr show; cat /sys/class/infiniband/mlx5_1/ports/1/state; $station_inspect_tilikum $station_inspect_format; ss -lntp"
 
 shamu_free="$(station_free_bytes shamu)"
 tilikum_free="$(station_free_bytes tilikum)"
@@ -98,14 +163,14 @@ done
 capture rail-ping-shamu ssh shamu "ping -c 3 -W 2 -I '$NCCL_IFACE' '$TILIKUM_RAIL'"
 capture rail-ping-tilikum ssh tilikum "ping -c 3 -W 2 -I '$NCCL_IFACE' '$SHAMU_RAIL'"
 
-shamu_running="$(ssh shamu "docker inspect glm52-full-mtp --format '{{.State.Running}}'")"
-tilikum_running="$(ssh tilikum "sudo -n docker inspect glm52-full-mtp --format '{{.State.Running}}'")"
-if [[ "$phase" == "canary" ]]; then
-  require_eq "Shamu GLM stopped" "false" "$shamu_running"
-  require_eq "Tilikum GLM stopped" "false" "$tilikum_running"
-else
-  require_eq "Shamu GLM running" "true" "$shamu_running"
-  require_eq "Tilikum GLM running" "true" "$tilikum_running"
+glm_shamu_running="$(ssh shamu "docker inspect glm52-full-mtp --format '{{.State.Running}}' 2>/dev/null || printf false")"
+glm_tilikum_running="$(ssh tilikum "sudo -n docker inspect glm52-full-mtp --format '{{.State.Running}}' 2>/dev/null || printf false")"
+deepseek_shamu_running="$(ssh shamu "docker inspect '$DEEPSEEK_CONTAINER' --format '{{.State.Running}}' 2>/dev/null || printf false")"
+deepseek_tilikum_running="$(ssh tilikum "sudo -n docker inspect '$DEEPSEEK_CONTAINER' --format '{{.State.Running}}' 2>/dev/null || printf false")"
+validate_station_owner_state "$phase" \
+  "$glm_shamu_running" "$glm_tilikum_running" \
+  "$deepseek_shamu_running" "$deepseek_tilikum_running"
+if [[ "$phase" == "baseline" || "$phase" == "stage" || "$phase" == "alias" ]]; then
   ssh shamu "curl -fsS --max-time 5 http://$SHAMU_NETBIRD:$CANARY_PORT/health >/dev/null" ||
     die "GLM rank 0 health check failed"
   ssh tilikum "sudo -n docker inspect glm52-full-mtp --format '{{json .Args}}' | grep -q -- --headless" ||
@@ -155,10 +220,7 @@ capture prometheus-targets curl -fsS --max-time 10 \
 capture langfuse-health curl -fsS --max-time 10 \
   "http://$SHAMU_NETBIRD:3000/api/public/health"
 
-if [[ "$phase" == "publish" ]]; then
-  [[ -f "$RUN_ROOT/private-acceptance.json" ]] ||
-    die "publish phase requires private-acceptance.json"
-fi
+validate_publish_acceptance
 
 event "$phase" GO "all read-only preflight requirements passed"
 printf 'GO phase=%s run_root=%s\n' "$phase" "$RUN_ROOT"
