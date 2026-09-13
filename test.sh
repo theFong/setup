@@ -77,7 +77,10 @@ printf '%s\n' \
   '  printf "%s\n" setup-no-bottle-dependency' \
   '  exit 0' \
   'fi' \
-  'if [ "$*" = "install --build-from-source setup-no-bottle-dependency" ]; then' \
+  'if [ "$*" = "list --versions setup-no-bottle-dependency" ]; then' \
+  '  exit 0' \
+  'fi' \
+  'if [ "$*" = "upgrade --build-from-source setup-no-bottle-dependency" ]; then' \
   '  : > "$SETUP_TEST_DEP_READY"' \
   '  exit 0' \
   'fi' \

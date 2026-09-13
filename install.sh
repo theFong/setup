@@ -137,9 +137,6 @@ brew_install_from_source() {
     [ -n "$dep" ] || continue
     action="install"
     if brew list --versions "$dep" >/dev/null 2>&1; then
-      if ! brew outdated --quiet "$dep" | grep -q .; then
-        continue
-      fi
       action="upgrade"
     fi
     if ! brew "$action" "$dep"; then
