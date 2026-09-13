@@ -66,6 +66,38 @@ mkdir -p "$scratch/install-one-bin"
   exit 1
 }
 
+# Homebrew no longer publishes Intel macOS bottles for every formula. A normal
+# install therefore fails before building on that Tier 3 platform; install_one
+# must retry the same formula from source and accept the resulting executable.
+mkdir -p "$scratch/homebrew-source-bin" "$scratch/homebrew-source-tools"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'printf "%s\n" "$*" >> "$SETUP_TEST_BREW_LOG"' \
+  'if [ "$*" = "install --build-from-source setup-no-bottle-package" ]; then' \
+  '  printf "#!/bin/sh\nexit 0\n" > "$SETUP_TEST_BIN/setup-no-bottle-tool"' \
+  '  chmod +x "$SETUP_TEST_BIN/setup-no-bottle-tool"' \
+  '  exit 0' \
+  'fi' \
+  'exit 1' \
+  > "$scratch/homebrew-source-tools/brew"
+chmod +x "$scratch/homebrew-source-tools/brew"
+(
+  export PATH="$scratch/homebrew-source-tools:$scratch/homebrew-source-bin:$PATH"
+  export SETUP_TEST_BREW_LOG="$scratch/homebrew-source.log"
+  export SETUP_TEST_BIN="$scratch/homebrew-source-bin"
+  OS=darwin
+  ARCH=x86_64
+  PM=brew
+  FAILED=""
+  install_one setup-no-bottle-package setup-no-bottle-tool >/dev/null 2>&1
+  [ -z "$FAILED" ]
+  [ "$(cat "$SETUP_TEST_BREW_LOG")" = 'install setup-no-bottle-package
+install --build-from-source setup-no-bottle-package' ]
+) || {
+  echo "FAIL: install_one did not recover from a missing Intel macOS bottle" >&2
+  exit 1
+}
+
 # configure_claude must fail on an unparseable settings file and leave it
 # untouched rather than clobbering it.
 mkdir -p "$scratch/home/.claude"

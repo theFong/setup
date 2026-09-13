@@ -150,7 +150,20 @@ install_one() {
   # when an unrelated/post-install hook fails (Homebrew ca-certificates has
   # done this on Intel CI). Treat the on-disk assertion below as authoritative;
   # otherwise a healthy tool remains permanently recorded as a failure.
-  if ! pm_install "$tool"; then warn "package manager reported an error while installing $tool"; fi
+  if ! pm_install "$tool"; then
+    # Homebrew's Intel macOS 15 runners are Tier 3 and some formulae no longer
+    # have bottles there. Retry only genuinely missing tools from source; if a
+    # post-install hook returned nonzero after creating the binary, the final
+    # assertion remains authoritative and avoids an unnecessary rebuild.
+    if ! have "$bin" && [ "$PM" = "brew" ] && [ "$OS" = "darwin" ] && [ "$ARCH" = "x86_64" ]; then
+      warn "Homebrew binary install failed for $tool; retrying from source on Intel macOS"
+      if ! brew install --build-from-source "$tool"; then
+        warn "Homebrew source install also failed for $tool"
+      fi
+    else
+      warn "package manager reported an error while installing $tool"
+    fi
+  fi
   assert_installed "$tool" "$bin" "$tool"
 }
 
