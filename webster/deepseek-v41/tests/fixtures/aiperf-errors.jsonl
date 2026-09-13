@@ -1,0 +1,2 @@
+{"request_id":"ok-1","status_code":200,"error":null}
+{"request_id":"bad-1","status_code":500,"error":"EngineDeadError"}

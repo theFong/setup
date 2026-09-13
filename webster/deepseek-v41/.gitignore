@@ -1,0 +1,12 @@
+manifest.env
+*.key
+*.env
+runs/
+artifacts/
+*.tar
+*.tar.zst
+models/
+checkpoints/
+.cache/
+__pycache__/
+*.pyc

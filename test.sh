@@ -66,6 +66,54 @@ mkdir -p "$scratch/install-one-bin"
   exit 1
 }
 
+# Homebrew no longer publishes Intel macOS bottles for every formula, and its
+# unsupported source path can fail on dependency resolution or transient module
+# fetches. The three affected tools must use their deterministic vendor/source
+# fallbacks when the normal bottle install leaves no executable behind.
+mkdir -p "$scratch/intel-fallback-bin"
+(
+  export PATH="$scratch/intel-fallback-bin:$PATH"
+  export SETUP_TEST_BIN="$scratch/intel-fallback-bin"
+  OS=darwin
+  ARCH=x86_64
+  PM=brew
+  FAILED=""
+  have() { [ -x "$SETUP_TEST_BIN/$1" ]; }
+  pm_install() { return 1; }
+  install_fzf_darwin_archive() {
+    printf '#!/bin/sh\nexit 0\n' > "$SETUP_TEST_BIN/fzf"
+    chmod +x "$SETUP_TEST_BIN/fzf"
+  }
+  install_go_darwin_archive() {
+    printf '#!/bin/sh\nexit 0\n' > "$SETUP_TEST_BIN/go"
+    chmod +x "$SETUP_TEST_BIN/go"
+  }
+  install_tmux_darwin_source() {
+    printf '#!/bin/sh\nexit 0\n' > "$SETUP_TEST_BIN/tmux"
+    chmod +x "$SETUP_TEST_BIN/tmux"
+  }
+  install_one fzf >/dev/null 2>&1
+  install_one tmux >/dev/null 2>&1
+  install_one go >/dev/null 2>&1
+  [ -z "$FAILED" ]
+) || {
+  echo "FAIL: install_one did not use the Intel macOS tool fallbacks" >&2
+  exit 1
+}
+
+# Vendor artifacts must be rejected when their published digest does not match.
+printf 'verified artifact\n' > "$scratch/checksum-fixture"
+checksum=$(shasum -a 256 "$scratch/checksum-fixture" | awk '{print $1}')
+if ! verify_sha256 "$scratch/checksum-fixture" "$checksum"; then
+  echo "FAIL: verify_sha256 rejected a matching artifact digest" >&2
+  exit 1
+fi
+if verify_sha256 "$scratch/checksum-fixture" \
+  '0000000000000000000000000000000000000000000000000000000000000000'; then
+  echo "FAIL: verify_sha256 accepted a mismatched artifact digest" >&2
+  exit 1
+fi
+
 # configure_claude must fail on an unparseable settings file and leave it
 # untouched rather than clobbering it.
 mkdir -p "$scratch/home/.claude"
@@ -1425,3 +1473,9 @@ if ! printf '%s' "$claude_help" | grep -q 'WEBSTER_API_KEY'; then
 fi
 
 log "all negative tests passed"
+
+python3 -m unittest discover -s webster/deepseek-v41/tests -p 'test_*.py'
+bash webster/deepseek-v41/tests/test_failure_paths.sh
+if [ -f webster/deepseek-v41/litellm/test_glm52_contract_guard.py ]; then
+  python3 webster/deepseek-v41/litellm/test_glm52_contract_guard.py
+fi

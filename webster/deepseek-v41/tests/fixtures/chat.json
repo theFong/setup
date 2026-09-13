@@ -1,0 +1,9 @@
+{
+  "model": "glm-5.2",
+  "messages": [
+    {"role": "system", "content": "Answer precisely."},
+    {"role": "user", "content": [{"type": "text", "text": "What is 2 + 2?"}]}
+  ],
+  "max_tokens": 32,
+  "temperature": 0
+}

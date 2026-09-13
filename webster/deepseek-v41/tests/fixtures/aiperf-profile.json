@@ -1,0 +1,7 @@
+{
+  "metrics": {
+    "request_throughput_avg": {"mean": 0.25},
+    "time_to_first_token_p90": {"mean": 1200.0},
+    "output_token_throughput_avg": {"mean": 42.5}
+  }
+}

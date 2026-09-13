@@ -1,0 +1,25 @@
+{
+  "model": "glm-5.2",
+  "messages": [
+    {"role": "user", "content": "Return the city and temperature as JSON."}
+  ],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "weather",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string"},
+          "temperature_c": {"type": "number"}
+        },
+        "required": ["city", "temperature_c"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "chat_template_kwargs": {"enable_thinking": false},
+  "max_tokens": 64,
+  "temperature": 0
+}

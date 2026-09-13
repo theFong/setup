@@ -50,6 +50,14 @@ jobs:
           EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
         run: test "$(uname -m)" = "$EXPECTED_ARCHITECTURE"
 
+      - name: Prepare Python test environment
+        run: |
+          test_venv="$RUNNER_TEMP/setup-test-venv"
+          python3 -m venv "$test_venv"
+          "$test_venv/bin/python" -m pip install --disable-pip-version-check \
+            -r webster/deepseek-v41/tests/requirements.txt
+          echo "$test_venv/bin" >> "$GITHUB_PATH"
+
       - name: Check shell syntax
         run: |
           bash -n install.sh
@@ -83,6 +91,7 @@ jobs:
         run: |
           {
             echo "$HOME/.local/bin"
+            echo "$HOME/.local/share/setup/go/current/bin"
             echo "$HOME/.opencode/bin"
             echo "/usr/local/go/bin"
           } >> "$GITHUB_PATH"
