@@ -31,6 +31,46 @@ brev() {
   env -u SSH_AUTH_SOCK "$(type -P brev)" "$@"
 }
 
+canonical_path() {
+  python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).resolve(strict=False))
+PY
+}
+
+canonical_existing_path() {
+  python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+try:
+    print(Path(sys.argv[1]).resolve(strict=True))
+except (OSError, RuntimeError):
+    raise SystemExit(1)
+PY
+}
+
+file_mode() {
+  python3 - "$1" <<'PY'
+from pathlib import Path
+import stat
+import sys
+
+print(f"{stat.S_IMODE(Path(sys.argv[1]).stat().st_mode):o}")
+PY
+}
+
+file_uid() {
+  python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).stat().st_uid)
+PY
+}
+
 SHAMU_NETBIRD="100.73.140.127"
 SHAMU_LAN="192.168.1.75"
 SHAMU_RAIL="10.10.1.1"
@@ -76,7 +116,7 @@ elif [[ -n "${WEBSTER_RUNS_ROOT:-}" ]]; then
     printf 'ERROR: Webster runs root override must be an existing non-symlink directory\n' >&2
     return 1 2>/dev/null || exit 1
   }
-  RUNS_ROOT="$(realpath -e -- "$WEBSTER_RUNS_ROOT")"
+  RUNS_ROOT="$(canonical_existing_path "$WEBSTER_RUNS_ROOT")"
 else
   RUNS_ROOT="/home/ubuntu/deepseek-v41-runs"
 fi
@@ -100,10 +140,6 @@ validate_phase() {
     baseline|stage|alias|canary|publish) ;;
     *) die "invalid phase: ${1:-<empty>}" ;;
   esac
-}
-
-canonical_path() {
-  realpath -m -- "$1"
 }
 
 validate_run_root() {

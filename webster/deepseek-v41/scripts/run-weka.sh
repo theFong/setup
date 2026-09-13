@@ -18,7 +18,7 @@ WEKA_SOURCE_SIZE="1847151435"
 if [[ -n "${WEBSTER_WEKA_RUNS_ROOT:-}" ]]; then
   [[ -d "$WEBSTER_WEKA_RUNS_ROOT" && ! -L "$WEBSTER_WEKA_RUNS_ROOT" ]] ||
     die "Weka runs root override must be an existing non-symlink directory"
-  RUNS_ROOT="$(realpath -e -- "$WEBSTER_WEKA_RUNS_ROOT")"
+  RUNS_ROOT="$(canonical_existing_path "$WEBSTER_WEKA_RUNS_ROOT")"
 fi
 export WEBSTER_RUNS_ROOT="$RUNS_ROOT"
 
@@ -56,12 +56,12 @@ elif [[ -n "$concurrency" ]]; then
   [[ "$concurrency" =~ ^[1-9][0-9]*$ ]] || die "concurrency must be positive"
 fi
 [[ -f "$key_file" && ! -L "$key_file" ]] || die "benchmark key must be a regular file"
-[[ "$(stat -c %a "$key_file")" == 600 ]] || die "benchmark key mode must be 0600"
+[[ "$(file_mode "$key_file")" == 600 ]] || die "benchmark key mode must be 0600"
 [[ -s "$key_file" ]] || die "benchmark key is empty"
 
 manifest="$RUN_ROOT/manifest.env"
 [[ -f "$manifest" && ! -L "$manifest" ]] || die "manifest.env is missing"
-[[ "$(stat -c %a "$manifest")" == 600 ]] || die "manifest.env mode must be 0600"
+[[ "$(file_mode "$manifest")" == 600 ]] || die "manifest.env mode must be 0600"
 manifest_value() {
   local key="$1" value
   value="$(awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$manifest")"
@@ -141,7 +141,7 @@ PY
   fi
 
   if [[ "$preserve_summary" == preserve ]]; then
-    rederived_summary="$(mktemp -p "$artifacts" '.summary-rederived.XXXXXXXX')"
+    rederived_summary="$(mktemp "$artifacts/.summary-rederived.XXXXXXXX")"
     chmod 0600 "$rederived_summary"
     summary_output="$rederived_summary"
   fi
@@ -527,17 +527,17 @@ if [[ "${WEBSTER_WEKA_TEST_MODE:-0}" != 1 ]]; then
 fi
 mkdir -p "$temp_parent"
 chmod 0700 "$temp_parent"
-temporary="$(mktemp -d -p "$temp_parent" "weka-$run_name.XXXXXXXX")"
+temporary="$(mktemp -d "$temp_parent/weka-$run_name.XXXXXXXX")"
 
 cleanup() {
   local status=$?
   trap - EXIT
   unset OPENAI_API_KEY || true
   if [[ -n "${temporary:-}" && -d "$temporary" ]]; then
-    resolved="$(realpath -e "$temporary")"
-    parent="$(realpath -e "$temp_parent")"
+    resolved="$(canonical_existing_path "$temporary")"
+    parent="$(canonical_existing_path "$temp_parent")"
     case "$resolved" in "$parent"/weka-*) ;; *) exit 1 ;; esac
-    [[ "$(stat -c %u "$resolved")" == "$(id -u)" ]] || exit 1
+    [[ "$(file_uid "$resolved")" == "$(id -u)" ]] || exit 1
     rm -rf -- "$resolved"
   fi
   exit "$status"

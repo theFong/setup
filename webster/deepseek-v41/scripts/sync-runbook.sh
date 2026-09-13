@@ -16,6 +16,15 @@ while (( $# )); do
 done
 
 skills=(webster-cluster migrating-webster-models)
+canonical_path() {
+  python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).resolve(strict=False))
+PY
+}
+
 skill_source() {
   case "$1" in
     webster-cluster) printf '%s\n' "$webster_source" ;;
@@ -76,7 +85,7 @@ sync_local() {
   for skill in "${skills[@]}"; do
     source="$(skill_source "$skill")"
     destination_path="$destination/$skill"
-    if [[ "$(realpath -m "$destination_path")" == "$(realpath -m "$source")" ]]; then
+    if [[ "$(canonical_path "$destination_path")" == "$(canonical_path "$source")" ]]; then
       continue
     fi
     if [[ -L "$destination_path" ]]; then

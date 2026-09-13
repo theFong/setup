@@ -201,7 +201,7 @@ validate_recovery_profile() {
   [[ -n "$requested" ]] || die "profile file is required for watchdog recovery"
   [[ -f "$requested" && ! -L "$requested" ]] ||
     die "profile file must be a regular non-symlink"
-  resolved="$(realpath -e -- "$requested")" || die "profile file does not resolve"
+  resolved="$(canonical_existing_path "$requested")" || die "profile file does not resolve"
   case "$resolved" in
     "$RUN_ROOT"/*) ;;
     *) die "profile file must resolve beneath the run root" ;;

@@ -251,6 +251,129 @@ def run_weka_fixture(
 
 
 class AIPerfToolTests(unittest.TestCase):
+    def test_weka_runner_accepts_a_bsd_realpath_without_gnu_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "fixture"
+            write_valid_runner_exports(
+                fixture,
+                readiness={
+                    "ready": True,
+                    "was_cancelled": False,
+                    "partial": False,
+                },
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_realpath = fake_bin / "realpath"
+            fake_realpath.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if [[ ${1:-} == -* ]]; then\n"
+                "  printf 'realpath: illegal option -- %s\\n' \"${1#-}\" >&2\n"
+                "  exit 64\n"
+                "fi\n"
+                "python3 - \"$1\" <<'PY'\n"
+                "import os\n"
+                "import sys\n"
+                "print(os.path.realpath(sys.argv[1]))\n"
+                "PY\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_realpath, 0o700)
+
+            result, destination = run_weka_fixture(
+                root,
+                fixture,
+                profile_name="bsd-realpath",
+                environment_overrides={
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}"
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((destination / "EXIT").read_text(), "EXIT=0\n")
+
+    def test_weka_runner_accepts_a_bsd_stat_without_gnu_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "fixture"
+            write_valid_runner_exports(
+                fixture,
+                readiness={
+                    "ready": True,
+                    "was_cancelled": False,
+                    "partial": False,
+                },
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_stat = fake_bin / "stat"
+            fake_stat.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "if [[ ${1:-} == -c ]]; then\n"
+                "  printf 'stat: illegal option -- c\\n' >&2\n"
+                "  exit 64\n"
+                "fi\n"
+                "exec /usr/bin/stat \"$@\"\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_stat, 0o700)
+
+            result, destination = run_weka_fixture(
+                root,
+                fixture,
+                profile_name="bsd-stat",
+                environment_overrides={
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}"
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((destination / "EXIT").read_text(), "EXIT=0\n")
+
+    def test_weka_runner_accepts_a_bsd_mktemp_without_parent_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "fixture"
+            write_valid_runner_exports(
+                fixture,
+                readiness={
+                    "ready": True,
+                    "was_cancelled": False,
+                    "partial": False,
+                },
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_mktemp = fake_bin / "mktemp"
+            fake_mktemp.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "for argument in \"$@\"; do\n"
+                "  if [[ $argument == -p ]]; then\n"
+                "    printf 'mktemp: illegal option -- p\\n' >&2\n"
+                "    exit 64\n"
+                "  fi\n"
+                "done\n"
+                "exec /usr/bin/mktemp \"$@\"\n",
+                encoding="utf-8",
+            )
+            os.chmod(fake_mktemp, 0o700)
+
+            result, destination = run_weka_fixture(
+                root,
+                fixture,
+                profile_name="bsd-mktemp",
+                environment_overrides={
+                    "PATH": f"{fake_bin}:{os.environ['PATH']}"
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((destination / "EXIT").read_text(), "EXIT=0\n")
+
     def test_weka_runner_rejects_memory_limited_controller_before_aiperf(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

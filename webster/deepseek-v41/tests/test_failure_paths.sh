@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$(uname -s)" != Linux ]]; then
+  printf 'skip: Webster cluster shell integration tests require Linux utilities\n'
+  exit 0
+fi
+
 cd "$(dirname "$0")/../../.."
 
 preflight="webster/deepseek-v41/scripts/preflight.sh"
