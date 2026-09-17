@@ -658,6 +658,12 @@ assert_catalog() {
     for (const model of models) {
       if (!required.has(model.slug)) continue;
       if (model.visibility !== "list" || typeof model.supports_reasoning_summaries !== "boolean") process.exit(1);
+      const levels = model.supported_reasoning_levels;
+      if (
+        typeof model.default_reasoning_level !== "string" ||
+        !Array.isArray(levels) ||
+        !levels.some((level) => level?.effort === model.default_reasoning_level)
+      ) process.exit(1);
       required.delete(model.slug);
     }
     const websterIds = new Set(config.models.map((model) => model.id));

@@ -269,6 +269,37 @@ test("merges Webster models into the Codex model catalog", async (t) => {
   assert.equal(seen.chatGpt[0].url, "/v1/models?client_version=0.148.0");
 });
 
+test("publishes model-specific reasoning levels while preserving generic defaults", async (t) => {
+  const websterModels = normalizeWebsterModels({
+    data: [
+      { id: "future-model-7b" },
+      { id: "deepseek-v4.1-flash" },
+    ],
+  });
+  const { proxyBaseUrl } = await fixture(t, { websterModels });
+  const response = await fetch(`${proxyBaseUrl}/models`, {
+    headers: {
+      authorization: "Bearer chatgpt-secret",
+      "chatgpt-account-id": "account-123",
+    },
+  });
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const deepSeek = body.models.find((model) => model.slug === "deepseek-v4.1-flash");
+  const future = body.models.find((model) => model.slug === "future-model-7b");
+  assert.equal(deepSeek.default_reasoning_level, "high");
+  assert.deepEqual(
+    deepSeek.supported_reasoning_levels.map((level) => level.effort),
+    ["low", "high", "xhigh", "max"],
+  );
+  assert.equal(future.default_reasoning_level, "medium");
+  assert.deepEqual(
+    future.supported_reasoning_levels.map((level) => level.effort),
+    ["low", "medium", "high"],
+  );
+});
+
 test("rejects unauthenticated and unsupported requests", async (t) => {
   const { proxyBaseUrl } = await fixture(t);
   const missingAuth = await fetch(`${proxyBaseUrl}/responses`, {
