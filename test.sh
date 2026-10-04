@@ -17,6 +17,37 @@ source ./install.sh
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 
+# The downloaded Codex installer must receive noninteractive mode. Setting it
+# on curl instead of sh would still leave a terminal-attached bootstrap blocked.
+mkdir -p "$scratch/codex-install-bin"
+(
+  unset CODEX_NON_INTERACTIVE
+  export CODEX_TEST_BIN="$scratch/codex-install-bin/codex"
+  export PATH="$scratch/codex-install-bin:$PATH"
+  PM=apt
+  FAILED=""
+  have() { [ "$1" = codex ] && [ -x "$CODEX_TEST_BIN" ]; }
+  add_path() { :; }
+  curl() {
+    cat <<'EOF'
+set -eu
+[ "${CODEX_NON_INTERACTIVE:-0}" = 1 ] || exit 1
+printf '#!/bin/sh\nexit 0\n' > "$CODEX_TEST_BIN"
+chmod +x "$CODEX_TEST_BIN"
+EOF
+  }
+  install_codex
+  [ -x "$CODEX_TEST_BIN" ] || exit 1
+  [ -z "$FAILED" ] || exit 1
+  [ "${CODEX_NON_INTERACTIVE-unset}" = unset ] || exit 1
+  curl() { echo 'unexpected installer download on re-run' >&2; exit 1; }
+  install_codex
+  [ -z "$FAILED" ] || exit 1
+) || {
+  echo "FAIL: Codex installation was not noninteractive or safe to re-run" >&2
+  exit 1
+}
+
 # assert_installed must fail for a missing command, and summary must then
 # return nonzero rather than reporting a clean bootstrap.
 FAILED=""
