@@ -25,7 +25,7 @@ One line to install everything and link the Claude config:
 curl -fsSL https://raw.githubusercontent.com/theFong/setup/main/install.sh | bash
 ```
 
-This installs **Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode,
+This installs **Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, [Herdr](https://herdr.dev/),
 tmux, git, gh, jq, ripgrep, fzf, wget, curl, htop, Go, and Ookla speedtest**,
 then clones this repo to `~/.setup` and symlinks the Claude config into
 `~/.claude`. It works on macOS (Homebrew) and Linux (apt/dnf/apk), and is safe

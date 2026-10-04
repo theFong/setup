@@ -2,9 +2,9 @@
 #
 # install.sh — bootstrap a new machine with a baseline dev environment.
 #
-# Installs: Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, tmux,
-# git, gh, jq, ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then links
-# this repo's Claude config and agent skills (brev-cli, cluster-ops,
+# Installs: Claude Code, Codex CLI, Brev CLI, Hugging Face CLI, opencode, Herdr,
+# tmux, git, gh, jq, ripgrep, fzf, wget, curl, htop, and the Go toolchain. Then
+# links this repo's Claude config and agent skills (brev-cli, cluster-ops,
 # inference-optimization, brev-hermes-agent) into the
 # supported agent directories.
 #
@@ -332,6 +332,17 @@ install_opencode() {
   assert_installed "opencode" opencode
 }
 
+# Herdr — terminal workspace manager for AI coding agents. Its installer is
+# already checksum-verified and installs the right build for macOS and Linux
+# into ~/.local/bin.
+install_herdr() {
+  if have herdr; then log "herdr already present"; return; fi
+  log "installing Herdr"
+  curl -fsSL https://herdr.dev/install.sh | sh || { warn "failed to install Herdr"; record_failure herdr; }
+  add_path "$HOME/.local/bin"
+  assert_installed "Herdr" herdr
+}
+
 # assert_claude_mode SETTINGS MODE — verify Claude Code's default permission
 # mode actually landed on disk (permissions.defaultMode set, no stale
 # top-level defaultMode key) and record a failure if it did not. The in-script
@@ -628,6 +639,7 @@ verify_toolchain() {
   have hf        && assert_runs "Hugging Face CLI" huggingface-cli \
                       env HF_HUB_DISABLE_UPDATE_CHECK=1 hf version
   have opencode  && assert_runs "opencode" opencode opencode --version
+  have herdr     && assert_runs "Herdr" herdr herdr --version
   have go        && assert_runs "Go" go go version
   have speedtest && assert_runs "Ookla speedtest CLI" speedtest speedtest --version
   return 0
@@ -662,6 +674,7 @@ main() {
   install_brev           || warn "Brev CLI install failed"
   install_huggingface    || warn "Hugging Face CLI install failed"
   install_opencode       || warn "opencode install failed"
+  install_herdr          || warn "Herdr install failed"
   configure_claude       || warn "configuring Claude default mode failed"
   configure_codex        || warn "configuring Codex approval mode failed"
   link_dotfiles          || warn "linking dotfiles failed"
