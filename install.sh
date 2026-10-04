@@ -283,7 +283,8 @@ install_codex() {
   if [ "$PM" = "brew" ]; then
     brew install --cask codex || { warn "failed to install Codex CLI"; record_failure codex; }
   else
-    curl -fsSL https://chatgpt.com/codex/install.sh | sh || { warn "failed to install Codex CLI"; record_failure codex; }
+    # Keep bootstrap unattended, including when the installer can read /dev/tty.
+    curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh || { warn "failed to install Codex CLI"; record_failure codex; }
     add_path "$HOME/.local/bin"
   fi
   assert_installed "Codex CLI" codex
