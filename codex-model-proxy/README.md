@@ -11,6 +11,13 @@ model metadata. Routing and Codex catalog generation use that discovered list,
 so keys with different access receive different pickers and future models are
 picked up on the next re-run.
 
+Webster's `/v1/models` response does not currently advertise reasoning-effort
+capabilities. Catalog generation therefore uses a shared default profile and a
+centralized override only for models with a verified incompatible contract. Do
+not rewrite Responses request bodies to hide a catalog mismatch. If Webster
+adds capability metadata, prefer that owned contract over adding more local
+profiles.
+
 ## Security
 
 - The server binds to `127.0.0.1` by default.

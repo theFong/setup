@@ -209,19 +209,42 @@ function modelTemplate(catalog) {
   );
 }
 
+const DEFAULT_WEBSTER_REASONING_PROFILE = {
+  defaultLevel: "medium",
+  levels: [
+    { effort: "low", description: "Fast responses with lighter reasoning" },
+    { effort: "medium", description: "Balanced reasoning depth" },
+    { effort: "high", description: "Greater reasoning depth for complex tasks" },
+  ],
+};
+
+const WEBSTER_REASONING_PROFILE_OVERRIDES = new Map([
+  [
+    "deepseek-v4.1-flash",
+    {
+      defaultLevel: "high",
+      levels: [
+        { effort: "low", description: "Reasoning budget 25" },
+        { effort: "high", description: "Reasoning budget 50" },
+        { effort: "xhigh", description: "Reasoning budget 75" },
+        { effort: "max", description: "Reasoning budget 100" },
+      ],
+    },
+  ],
+]);
+
 function websterCatalogEntry(definition, template, priority) {
   const entry = structuredClone(template);
   const contextWindow = definition.contextWindow ?? template.context_window;
+  const reasoningProfile =
+    WEBSTER_REASONING_PROFILE_OVERRIDES.get(definition.id) ??
+    DEFAULT_WEBSTER_REASONING_PROFILE;
   Object.assign(entry, {
     slug: definition.id,
     display_name: definition.displayName,
     description: definition.description,
-    default_reasoning_level: "medium",
-    supported_reasoning_levels: [
-      { effort: "low", description: "Fast responses with lighter reasoning" },
-      { effort: "medium", description: "Balanced reasoning depth" },
-      { effort: "high", description: "Greater reasoning depth for complex tasks" },
-    ],
+    default_reasoning_level: reasoningProfile.defaultLevel,
+    supported_reasoning_levels: structuredClone(reasoningProfile.levels),
     shell_type: "default",
     visibility: "list",
     supported_in_api: true,
